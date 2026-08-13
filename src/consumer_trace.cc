@@ -241,11 +241,16 @@ trace_consumer_sources(
 // public API), so each consumer must import the owning modules itself. Unlike
 // trace_consumer_sources this keeps the per-consumer attribution (no merge), so
 // a consumer that never touches a sub-module's internals does not import it.
+// `virtual_sources`, when given, supplies the content to parse for a consumer
+// instead of its on-disk form — used to trace consumers an earlier pass already
+// converted to imports (see demodularize_consumer_source), which no longer
+// parse as they stand.
 export std::map<std::string, std::set<std::string>> trace_consumer_modules(
     const std::vector<std::string> &header_paths,
     const std::vector<std::string> &consumer_sources,
     llvm::StringRef library_name,
-    const std::vector<std::string> &extra_args) {
+    const std::vector<std::string> &extra_args,
+    const std::map<std::string, std::string> *virtual_sources = nullptr) {
 
   std::map<std::string, std::set<std::string>> internal_by_header =
       collect_internal_by_header(header_paths, extra_args, /*verbose=*/false);
@@ -254,7 +259,8 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
       consumer_sources.size());
   std::vector<std::set<std::string>> consumer_defined(consumer_sources.size());
   parallel_parse(
-      consumer_sources, extra_args, /*delayed_template_parsing=*/true,
+      consumer_sources, extra_args,
+      ParseOptions{/*delayed_template_parsing=*/true, virtual_sources},
       [&](std::size_t i, const std::string &) {
         auto &local = partials[i];
         auto &defined = consumer_defined[i];
@@ -298,12 +304,16 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
 // references are traced per consumer (SystemHeaderUsageTracer /
 // SystemHeaderRefFinder), so a consumer that never uses a given C header does
 // not get a redundant include.
+// `virtual_sources` has the same meaning as in trace_consumer_modules.
 export std::map<std::string, std::set<std::string>>
-trace_consumer_system_includes(const std::vector<std::string> &consumer_sources,
-                               const std::vector<std::string> &extra_args) {
+trace_consumer_system_includes(
+    const std::vector<std::string> &consumer_sources,
+    const std::vector<std::string> &extra_args,
+    const std::map<std::string, std::string> *virtual_sources = nullptr) {
   std::vector<std::set<std::string>> partials(consumer_sources.size());
   parallel_parse(
-      consumer_sources, extra_args, /*delayed_template_parsing=*/true,
+      consumer_sources, extra_args,
+      ParseOptions{/*delayed_template_parsing=*/true, virtual_sources},
       [&](std::size_t i, const std::string &) {
         auto &out = partials[i];
         return std::make_unique<SystemHeaderUsageFactory>(out);

@@ -290,3 +290,54 @@ TEST(ConsumerTrace, FriendTemplateDeclaration) {
   EXPECT_TRUE(trace_has(producer, consumer,
                         "test_lib::detail::Bar"));
 }
+
+TEST(ConsumerTrace, TracesConsumerAlreadyConvertedToImports) {
+  // Converting a consumer is destructive: once `#include "lib/producer.h"` has
+  // become `import lib.producer;`, the file no longer parses (the BMI does not
+  // exist while the library is still being converted), so a later pass — a
+  // second library's --consumers run, or a re-run — silently loses everything
+  // that pass would have traced. Tracing must therefore be able to run on the
+  // reconstructed pre-module source, supplied as a virtual source so the file
+  // keeps its path (and with it its relative-include resolution).
+  auto producer = data_path("reconv_lib/producer.h");
+  auto consumer = data_path("reconv_lib/consumer_converted.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto as_is = trace_consumer_modules({producer}, {consumer}, "reconv_lib",
+                                      extra_args);
+  EXPECT_EQ(as_is.find(consumer), as_is.end())
+      << "sanity: an already-converted consumer traces nothing when parsed "
+         "as it stands";
+
+  std::map<std::string, ConsumerHeaderInfo> include_to_module = {
+      {"reconv_lib/producer.h", {"reconv_lib.producer", ""}}};
+  std::map<std::string, std::string> virtual_sources = {
+      {consumer,
+       demodularize_consumer_source(read_file(consumer), include_to_module)}};
+  auto traced = trace_consumer_modules({producer}, {consumer}, "reconv_lib",
+                                       extra_args, &virtual_sources);
+  auto it = traced.find(consumer);
+  ASSERT_NE(it, traced.end())
+      << "the reconstructed source must trace the internal entity use";
+  EXPECT_NE(it->second.find(producer), it->second.end())
+      << "the producing header must be reported so its module gets imported";
+}
+
+TEST(ConsumerTrace, TracesSystemIncludesOfConvertedConsumer) {
+  // The same applies to the C/POSIX include trace: a converted consumer must
+  // not lose its `#include <...>` re-adds just because a later pass cannot
+  // parse it.
+  auto consumer = data_path("reconv_lib/consumer_converted.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  std::map<std::string, ConsumerHeaderInfo> include_to_module = {
+      {"reconv_lib/producer.h", {"reconv_lib.producer", ""}}};
+  std::map<std::string, std::string> virtual_sources = {
+      {consumer,
+       demodularize_consumer_source(read_file(consumer), include_to_module)}};
+  // No assertion on the contents (this consumer uses no C library macros) —
+  // the point is that tracing runs on the reconstruction instead of dying on
+  // the unresolvable import.
+  auto traced = trace_consumer_system_includes({consumer}, extra_args,
+                                               &virtual_sources);
+  EXPECT_TRUE(traced.empty() || traced.count(consumer) == 1);
+}

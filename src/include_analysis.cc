@@ -94,6 +94,27 @@ export std::optional<DirectiveParts> parse_directive(
   return DirectiveParts{std::string(keyword), std::move(after), ns};
 }
 
+// What a preprocessor conditional directive does to the conditional nesting:
+// opens a block (`#if`/`#ifdef`/`#ifndef`), closes one (`#endif`), or switches
+// branch within the current one (`#else`/`#elif`/`#elifdef`/`#elifndef`).
+export enum class PreprocessorConditional { kOpen, kClose, kBranch };
+
+// Classify a line as a preprocessor conditional directive; nullopt for every
+// other line. Callers track conditional nesting depth with it — code at depth
+// zero is compiled unconditionally, code below it is not.
+export std::optional<PreprocessorConditional> preprocessor_conditional_kind(
+    std::string_view line) {
+  auto d = parse_directive(line);
+  if (!d) return std::nullopt;
+  const auto &kw = d->keyword;
+  if (kw == "if" || kw == "ifdef" || kw == "ifndef")
+    return PreprocessorConditional::kOpen;
+  if (kw == "endif") return PreprocessorConditional::kClose;
+  if (kw == "else" || kw == "elif" || kw == "elifdef" || kw == "elifndef")
+    return PreprocessorConditional::kBranch;
+  return std::nullopt;
+}
+
 export struct IncludeRef {
   std::string path;
   bool is_quoted;

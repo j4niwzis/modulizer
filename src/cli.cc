@@ -569,18 +569,32 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
         }
       if (any_library_include) break;
     }
+    // Consumers an earlier pass already converted (a sibling library's
+    // --consumers run, or a re-run of this one) no longer parse: their
+    // `import lib.x;` needs a BMI that does not exist while the library is
+    // still being converted, so the parse would die and this pass would
+    // silently trace nothing for them. Parse a reconstruction of the
+    // pre-module source instead, keyed by the file's own path so relative
+    // includes still resolve.
+    std::map<std::string, std::string> virtual_sources;
+    for (auto &c : consumer_paths) {
+      auto src = read_file(c);
+      auto restored = demodularize_consumer_source(src, cfg.include_to_module);
+      if (restored != src) virtual_sources[c] = std::move(restored);
+    }
+
     if (any_library_include && !header_paths.empty()) {
       auto traced =
           trace_consumer_modules(header_paths, consumer_paths, library_name,
-                                 all_extra);
+                                 all_extra, &virtual_sources);
       for (auto &[c, producers] : traced) {
         std::set<std::string> mods;
         for (auto &hp : producers)
           mods.insert(derive_module_name(hp, library_name));
         traced_modules_by_consumer[c] = std::move(mods);
       }
-      system_includes_by_consumer =
-          trace_consumer_system_includes(consumer_paths, all_extra);
+      system_includes_by_consumer = trace_consumer_system_includes(
+          consumer_paths, all_extra, &virtual_sources);
     }
   }
 
