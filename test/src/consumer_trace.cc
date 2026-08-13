@@ -341,3 +341,58 @@ TEST(ConsumerTrace, TracesSystemIncludesOfConvertedConsumer) {
                                                &virtual_sources);
   EXPECT_TRUE(traced.empty() || traced.count(consumer) == 1);
 }
+
+TEST(ConsumerTrace, VirtualSourceAppliesToRelativeConsumerPaths) {
+  // Consumers arrive as written on the command line, which is normally
+  // relative to the tree being converted, while ClangTool parses them by
+  // absolute path. A virtual source keyed by the path as given would then
+  // never be found and the pass would silently parse the file on disk — the
+  // very file that does not parse. The test binary runs from the project
+  // root, so this exercises the relative form end to end.
+  std::string consumer = "test/data/reconv_lib/consumer_converted.cc";
+  std::string producer = data_path("reconv_lib/producer.h");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  std::map<std::string, ConsumerHeaderInfo> include_to_module = {
+      {"reconv_lib/producer.h", {"reconv_lib.producer", ""}}};
+  std::map<std::string, std::string> virtual_sources = {
+      {consumer,
+       demodularize_consumer_source(read_file(consumer), include_to_module)}};
+  auto traced = trace_consumer_modules({producer}, {consumer}, "reconv_lib",
+                                       extra_args, &virtual_sources);
+  auto it = traced.find(consumer);
+  ASSERT_NE(it, traced.end())
+      << "a virtual source given under a relative path must still be used";
+  EXPECT_NE(it->second.find(producer), it->second.end());
+}
+
+TEST(ConsumerTrace, VirtualSourcesCoverIncludedConsumers) {
+  // Consumers include each other: a shared test helper header converted by an
+  // earlier pass is not parsed as a main file, it is pulled in by other
+  // consumers. Reconstructing only the file being parsed leaves that include
+  // to be read from disk, where it still carries an unresolvable import and
+  // kills the parse of every consumer that uses it. Every reconstruction the
+  // pass holds must therefore be visible to every parse.
+  auto producer = data_path("reconv_lib/producer.h");
+  auto helper = data_path("reconv_lib/helper_converted.h");
+  auto consumer = data_path("reconv_lib/consumer_of_helper.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto as_is = trace_consumer_modules({producer}, {consumer}, "reconv_lib",
+                                      extra_args);
+  EXPECT_EQ(as_is.find(consumer), as_is.end())
+      << "sanity: the converted include breaks the consumer's parse";
+
+  std::map<std::string, ConsumerHeaderInfo> include_to_module = {
+      {"reconv_lib/producer.h", {"reconv_lib.producer", ""}}};
+  // Only the *helper* is reconstructed — the consumer being parsed needs no
+  // reconstruction of its own.
+  std::map<std::string, std::string> virtual_sources = {
+      {helper,
+       demodularize_consumer_source(read_file(helper), include_to_module)}};
+  auto traced = trace_consumer_modules({producer}, {consumer}, "reconv_lib",
+                                       extra_args, &virtual_sources);
+  auto it = traced.find(consumer);
+  ASSERT_NE(it, traced.end())
+      << "a reconstruction of an included consumer must apply to this parse";
+  EXPECT_NE(it->second.find(producer), it->second.end());
+}

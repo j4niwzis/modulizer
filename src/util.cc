@@ -148,14 +148,6 @@ export std::vector<std::string> merge_sets(
   return std::ranges::to<std::vector>(out);
 }
 
-// Parse each path in `paths` in parallel with a FixedCompilationDatabase built
-// from the shared extra args (plus base_compile_flags). `make_factory(i, path)`
-// returns a `std::unique_ptr<clang::tooling::FrontendActionFactory>` for the
-// i-th path, typically constructed over per-index partial state captured by
-// reference (which must outlive the tool.run call — it does, since the factory
-// is used within the same worker iteration). The optional `finalize(i, path)`
-// runs after tool.run inside the same worker, for per-path post-processing
-// (e.g. classifying parsed entities into partial maps).
 // How a `parallel_parse` pass reads its inputs. Constructible from a plain
 // `bool` so existing callers keep passing `/*delayed_template_parsing=*/…`.
 //
@@ -172,16 +164,37 @@ export struct ParseOptions {
   const std::map<std::string, std::string> *virtual_sources = nullptr;
 };
 
-// Apply `opts.virtual_sources` (if any) to a tool about to parse `path`.
-export void apply_virtual_source(clang::tooling::ClangTool &tool,
-                                 const std::string &path,
-                                 const ParseOptions &opts) {
+// Register every virtual source in `opts` with a tool that is about to parse.
+//
+// All of them, not just the file being parsed: sources include each other (a
+// shared test helper header, say), so a file whose on-disk form does not parse
+// breaks every parse that pulls it in, not only its own.
+//
+// Each is registered under the path as the caller wrote it — typically
+// relative to the tree being converted — and under its absolute form, because
+// ClangTool resolves its inputs to absolute paths before opening them and an
+// include resolves to an absolute path too. Without both spellings the lookup
+// misses and the parse quietly falls back to the file on disk.
+export void apply_virtual_sources(clang::tooling::ClangTool &tool,
+                                  const ParseOptions &opts) {
   if (!opts.virtual_sources) return;
-  auto it = opts.virtual_sources->find(path);
-  if (it == opts.virtual_sources->end()) return;
-  tool.mapVirtualFile(path, it->second);
+  for (const auto &[path, content] : *opts.virtual_sources) {
+    tool.mapVirtualFile(path, content);
+    std::error_code ec;
+    auto abs =
+        std::filesystem::absolute(std::filesystem::path(path), ec).string();
+    if (!ec && abs != path) tool.mapVirtualFile(abs, content);
+  }
 }
 
+// Parse each path in `paths` in parallel with a FixedCompilationDatabase built
+// from the shared extra args (plus base_compile_flags). `make_factory(i, path)`
+// returns a `std::unique_ptr<clang::tooling::FrontendActionFactory>` for the
+// i-th path, typically constructed over per-index partial state captured by
+// reference (which must outlive the tool.run call — it does, since the factory
+// is used within the same worker iteration). The optional `finalize(i, path)`
+// runs after tool.run inside the same worker, for per-path post-processing
+// (e.g. classifying parsed entities into partial maps).
 export template <typename MakeFactory>
 void parallel_parse(const std::vector<std::string> &paths,
                     const std::vector<std::string> &extra_args,
@@ -194,7 +207,7 @@ void parallel_parse(const std::vector<std::string> &paths,
     flags.insert(flags.end(), extra_args.begin(), extra_args.end());
     clang::tooling::FixedCompilationDatabase db(".", flags);
     clang::tooling::ClangTool tool(db, sources);
-    apply_virtual_source(tool, path, opts);
+    apply_virtual_sources(tool, opts);
     auto factory = make_factory(i, path);
     tool.run(factory.get());
   });
@@ -212,7 +225,7 @@ void parallel_parse(const std::vector<std::string> &paths,
     flags.insert(flags.end(), extra_args.begin(), extra_args.end());
     clang::tooling::FixedCompilationDatabase db(".", flags);
     clang::tooling::ClangTool tool(db, sources);
-    apply_virtual_source(tool, path, opts);
+    apply_virtual_sources(tool, opts);
     auto factory = make_factory(i, path);
     tool.run(factory.get());
     finalize(i, path);

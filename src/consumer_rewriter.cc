@@ -303,7 +303,14 @@ export std::string demodularize_consumer_source(
         // Any other module: dropped, see above.
       }
     } else if (auto inc = parse_include_line(line_with_nl);
-               inc && inc->is_quoted && macro_headers.count(inc->path)) {
+               inc && inc->is_quoted &&
+               (macro_headers.count(inc->path) ||
+                is_generated_macro_header(inc->path))) {
+      // Both this pass's own generated macro headers and those a pass for
+      // another library left behind: none of them need exist while tracing
+      // runs, and an include of a missing file is fatal to the parse. This
+      // reconstruction only ever feeds a parse, so dropping a consumer's own
+      // same-named header would at worst make that parse less complete.
       dropped = true;
     }
 

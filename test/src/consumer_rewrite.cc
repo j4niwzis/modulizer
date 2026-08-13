@@ -341,6 +341,34 @@ TEST(ConsumerRewrite, DemodularizeRestoresLibraryIncludes) {
       << "the consumer's code must be preserved";
 }
 
+TEST(ConsumerRewrite, DemodularizeDropsAnyGeneratedMacroHeader) {
+  // A consumer shared by two libraries carries the macro headers of both, but
+  // one pass only knows its own library's map. Those headers are an output of
+  // the conversion and need not exist while it runs, so a leftover include of
+  // one is fatal to the parse ("file not found"). The transform recognises the
+  // generated naming (`<stem>-macros.h` / `<stem>_macros.h`) and drops them all.
+  // It only ever feeds a parse, so dropping a same-named header of the
+  // consumer's own would at worst make that parse slightly less complete.
+  std::map<std::string, ConsumerHeaderInfo> map = {
+      {"lib/lib.h", {"lib", "lib-macros.h"}}};
+  std::string converted =
+      "import lib;\n"
+      "#include \"lib-macros.h\"\n"
+      "#include \"other/other-macros.h\"\n"
+      "#include \"sibling/sibling_macros.h\"\n"
+      "#include \"real/header.h\"\n"
+      "int main() { return 0; }\n";
+  auto out = demodularize_consumer_source(converted, map);
+  EXPECT_EQ(out.find("lib-macros.h"), std::string::npos)
+      << "this pass's own macro header must go";
+  EXPECT_EQ(out.find("other/other-macros.h"), std::string::npos)
+      << "a sibling library's macro header must go too";
+  EXPECT_EQ(out.find("sibling/sibling_macros.h"), std::string::npos)
+      << "the underscore naming variant must go as well";
+  EXPECT_NE(out.find("#include \"real/header.h\""), std::string::npos)
+      << "an ordinary quoted include must be kept";
+}
+
 TEST(ConsumerRewrite, DemodularizeDropsUnmappedModuleImports) {
   // Traced internal sub-module imports have no include form of their own (the
   // entities come from the library headers being restored), and a sibling
