@@ -122,29 +122,60 @@ export std::string rewrite_consumer_source(
   }
 
   // Pass 2: rewrite the lines.
+  //
+  // A library include can sit inside a preprocessor conditional (a
+  // platform-guarded header). Such an include is replaced in place, so its
+  // import keeps the guard that decided whether the header was included at
+  // all. Everything that is needed regardless of any guard — the std import
+  // (or the standard include block), traced imports and re-added C headers —
+  // plus the imports of file-scope includes go into a single block anchored at
+  // a position no conditional governs, so a build where a guard is false does
+  // not lose them.
   std::vector<std::string> pending_imports;
   std::vector<std::string> pending_macros;
   std::vector<std::string> out;
   std::optional<std::size_t> insert_at;
   {
     std::size_t pos = 0;
+    // Depth of open #if/#ifdef/#ifndef blocks, and where the outermost
+    // currently-open one started in `out` (the last unconditional position).
+    int cond_depth = 0;
+    std::size_t outermost_cond_start = 0;
     while (pos < src.size()) {
       std::size_t nl = 0;
       auto sv = line_at(pos, nl);
       std::string line(sv);
       if (nl < src.size()) line += '\n';  // preserve the trailing newline
+      if (auto dir = preprocessor_conditional_kind(sv)) {
+        if (*dir == PreprocessorConditional::kOpen) {
+          if (cond_depth == 0) outermost_cond_start = out.size();
+          ++cond_depth;
+        } else if (*dir == PreprocessorConditional::kClose && cond_depth > 0) {
+          --cond_depth;
+        }
+      }
       if (auto inc = parse_include_line(line)) {
         auto it = options.include_to_module.find(inc->path);
         if (it != options.include_to_module.end()) {
-          if (!insert_at) insert_at = out.size();
           auto &mod = it->second.module;
-          if (!existing_imports.count(mod) &&
-              !std::ranges::contains(pending_imports, mod))
-            pending_imports.push_back(mod);
           auto &mh = it->second.macro_header;
-          if (!mh.empty() && !existing_quoted_includes.count(mh) &&
-              !std::ranges::contains(pending_macros, mh))
-            pending_macros.push_back(mh);
+          bool have_import = existing_imports.count(mod) ||
+                             std::ranges::contains(pending_imports, mod);
+          bool have_macro = mh.empty() || existing_quoted_includes.count(mh) ||
+                            std::ranges::contains(pending_macros, mh);
+          if (cond_depth > 0) {
+            // Guarded include: replace it where it stands so the import is
+            // subject to the same condition.
+            if (!insert_at) insert_at = outermost_cond_start;
+            if (!have_import) out.push_back(std::format("import {};\n", mod));
+            if (!have_macro) out.push_back(std::format("#include \"{}\"\n", mh));
+            pos = nl + 1;
+            if (pos >= src.size()) break;
+            continue;
+          }
+          if (!insert_at) insert_at = out.size();
+          if (!have_import) pending_imports.push_back(mod);
+          if (!have_macro) pending_macros.push_back(mh);
           pos = nl + 1;
           if (pos >= src.size()) break;
           continue;
@@ -203,6 +234,84 @@ export std::string rewrite_consumer_source(
   std::string result;
   for (auto &l : out) result += l;
   return result;
+}
+
+// Inverse of `rewrite_consumer_source`, for parsing only: reconstruct the
+// pre-module form of a consumer that an earlier pass already converted.
+//
+// A converted consumer cannot be parsed while the library is still being
+// converted — `import lib;` needs a BMI that does not exist yet — so every
+// later pass over that file (a second library's pass, or a re-run) would lose
+// its traced imports and traced system includes to a "module not found" fatal
+// error. Tracing therefore runs on this reconstruction:
+//
+//   * an `import` of a module in `include_to_module` becomes the include the
+//     consumer originally wrote (the map is the same one the conversion used),
+//   * `import std;` / `import std.compat;` becomes the standard include block,
+//     which is what the consumer had before conversion dropped those includes,
+//   * any other `import` is dropped: traced internal sub-modules and sibling
+//     libraries have no include form of their own here, and their declarations
+//     come back with the library headers being restored,
+//   * generated macro-header includes are dropped, since those headers are an
+//     output of the conversion and need not exist when tracing runs.
+//
+// A consumer that was never converted has no imports and no generated macro
+// includes, so it passes through unchanged.
+export std::string demodularize_consumer_source(
+    const std::string &src,
+    const std::map<std::string, ConsumerHeaderInfo> &include_to_module) {
+  // module name → the include form that produces it, and the set of generated
+  // macro headers the conversion may have added.
+  std::map<std::string, std::string> include_of_module;
+  std::set<std::string> macro_headers;
+  for (const auto &[inc, info] : include_to_module) {
+    include_of_module.emplace(info.module, inc);
+    if (!info.macro_header.empty()) macro_headers.insert(info.macro_header);
+  }
+
+  std::string out;
+  bool restored_std = false;
+  std::size_t pos = 0;
+  while (pos < src.size()) {
+    auto nl = src.find('\n', pos);
+    auto end = nl == std::string::npos ? src.size() : nl;
+    std::string_view line(src);
+    line = line.substr(pos, end - pos);
+    std::string line_with_nl(line);
+    if (nl != std::string::npos) line_with_nl += '\n';
+
+    auto ns = line.find_first_not_of(" \t");
+    bool dropped = false;
+    if (ns != std::string_view::npos && line.substr(ns).starts_with("import ")) {
+      auto rest = line.substr(ns + 7);
+      auto semi = rest.find(';');
+      if (semi != std::string_view::npos) {
+        auto mod = rest.substr(0, semi);
+        auto e = mod.find_last_not_of(" \t");
+        std::string name(e == std::string_view::npos ? mod
+                                                     : mod.substr(0, e + 1));
+        dropped = true;
+        if (auto it = include_of_module.find(name);
+            it != include_of_module.end()) {
+          out += std::format("#include \"{}\"\n", it->second);
+        } else if (name == "std" || name == "std.compat") {
+          if (!restored_std) {
+            restored_std = true;
+            for (auto &h : kStdIncludes) out += std::format("#include <{}>\n", h);
+          }
+        }
+        // Any other module: dropped, see above.
+      }
+    } else if (auto inc = parse_include_line(line_with_nl);
+               inc && inc->is_quoted && macro_headers.count(inc->path)) {
+      dropped = true;
+    }
+
+    if (!dropped) out += line_with_nl;
+    if (nl == std::string::npos) break;
+    pos = nl + 1;
+  }
+  return out;
 }
 
 // Build the include-path → module map for a library's headers. The include form

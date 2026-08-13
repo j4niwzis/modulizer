@@ -156,18 +156,45 @@ export std::vector<std::string> merge_sets(
 // is used within the same worker iteration). The optional `finalize(i, path)`
 // runs after tool.run inside the same worker, for per-path post-processing
 // (e.g. classifying parsed entities into partial maps).
+// How a `parallel_parse` pass reads its inputs. Constructible from a plain
+// `bool` so existing callers keep passing `/*delayed_template_parsing=*/…`.
+//
+// `virtual_sources` maps a path to the content to parse *instead of* the file
+// on disk, keeping the path itself intact so `#include "sibling.h"` and any
+// other path-relative resolution behaves exactly as for the real file. It is
+// what lets a pass parse a reconstruction of a file whose on-disk form is not
+// parseable on its own (see demodularize_consumer_source).
+export struct ParseOptions {
+  ParseOptions(bool dtp = false) : delayed_template_parsing(dtp) {}
+  ParseOptions(bool dtp, const std::map<std::string, std::string> *vs)
+      : delayed_template_parsing(dtp), virtual_sources(vs) {}
+  bool delayed_template_parsing = false;
+  const std::map<std::string, std::string> *virtual_sources = nullptr;
+};
+
+// Apply `opts.virtual_sources` (if any) to a tool about to parse `path`.
+export void apply_virtual_source(clang::tooling::ClangTool &tool,
+                                 const std::string &path,
+                                 const ParseOptions &opts) {
+  if (!opts.virtual_sources) return;
+  auto it = opts.virtual_sources->find(path);
+  if (it == opts.virtual_sources->end()) return;
+  tool.mapVirtualFile(path, it->second);
+}
+
 export template <typename MakeFactory>
 void parallel_parse(const std::vector<std::string> &paths,
                     const std::vector<std::string> &extra_args,
-                    bool delayed_template_parsing,
+                    ParseOptions opts,
                     MakeFactory make_factory) {
   parallel_for(paths.size(), [&](std::size_t i) {
     auto &path = paths[i];
     std::vector<std::string> sources = {path};
-    auto flags = base_compile_flags(delayed_template_parsing);
+    auto flags = base_compile_flags(opts.delayed_template_parsing);
     flags.insert(flags.end(), extra_args.begin(), extra_args.end());
     clang::tooling::FixedCompilationDatabase db(".", flags);
     clang::tooling::ClangTool tool(db, sources);
+    apply_virtual_source(tool, path, opts);
     auto factory = make_factory(i, path);
     tool.run(factory.get());
   });
@@ -176,15 +203,16 @@ void parallel_parse(const std::vector<std::string> &paths,
 export template <typename MakeFactory, typename Finalize>
 void parallel_parse(const std::vector<std::string> &paths,
                     const std::vector<std::string> &extra_args,
-                    bool delayed_template_parsing, MakeFactory make_factory,
+                    ParseOptions opts, MakeFactory make_factory,
                     Finalize finalize) {
   parallel_for(paths.size(), [&](std::size_t i) {
     auto &path = paths[i];
     std::vector<std::string> sources = {path};
-    auto flags = base_compile_flags(delayed_template_parsing);
+    auto flags = base_compile_flags(opts.delayed_template_parsing);
     flags.insert(flags.end(), extra_args.begin(), extra_args.end());
     clang::tooling::FixedCompilationDatabase db(".", flags);
     clang::tooling::ClangTool tool(db, sources);
+    apply_virtual_source(tool, path, opts);
     auto factory = make_factory(i, path);
     tool.run(factory.get());
     finalize(i, path);
