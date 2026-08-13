@@ -17,6 +17,16 @@ export InternalMode parse_internal_mode(llvm::StringRef s) {
   return InternalMode::kBoth;
 }
 
+// True for the name of a macro header this tool generates: `<stem>-macros.h`
+// (--hyphen-macros) or `<stem>_macros.h`. Used to recognise the tool's own
+// output in a source it is asked to read back, where the file may not exist
+// yet — the macro headers are produced by the header rewrite, which can run
+// after (or independently of) a consumers pass.
+export bool is_generated_macro_header(llvm::StringRef include_path) {
+  return include_path.ends_with("-macros.h") ||
+         include_path.ends_with("_macros.h");
+}
+
 export std::string macro_prefix(llvm::StringRef module_name) {
   auto mapped = module_name | std::views::transform([](char c) -> char {
     if (c == '.' || c == '-' || c == ':') return '_';
