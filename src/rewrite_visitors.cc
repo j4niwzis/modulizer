@@ -1,0 +1,711 @@
+module;
+
+export module modulizer.rewrite_visitors;
+import modulizer.astutil;
+import modulizer.rewrite_util;
+import modulizer.util;
+import libtooling;
+import std;
+
+// AST visitors that annotate a header/interface unit: export markers, forward-
+// declaration handling, used-headers collection, and friend-of-extern-C++
+// targets. The header-rewrite consumer (modulizer.rewrite_export) drives them.
+
+export class HeaderVisitor : public NsPathVisitor<HeaderVisitor> {
+public:
+  HeaderVisitor(clang::SourceManager &sm, std::vector<ModPoint> &mods,
+                const std::regex &internal_re,
+                std::string_view export_macro,
+                const std::vector<std::string> &reachable_fqns,
+                std::vector<std::string> &internal_fqns,
+                bool no_internal_filter = false,
+                const std::vector<std::string> &defined_fqns = {},
+                bool extern_cxx = false,
+                const std::vector<std::string> &fwd_declared_fqns = {},
+                const std::set<std::string> &friend_extern_fqns = {},
+                const std::set<std::string> &same_module_free_fqns = {},
+                const std::set<std::string> *library_headers = nullptr,
+                std::map<std::string, std::vector<ModPoint>> *
+                    external_macro_mods = nullptr)
+      : sm(sm), mods(mods),
+        internal_re(internal_re), export_macro(export_macro),
+        reachable_fqns(reachable_fqns), internal_fqns(internal_fqns),
+        no_internal_filter(no_internal_filter), defined_fqns(defined_fqns),
+        extern_cxx(extern_cxx), fwd_declared_fqns(fwd_declared_fqns),
+        friend_extern_fqns(friend_extern_fqns),
+        same_module_free_fqns(same_module_free_fqns),
+        library_headers(library_headers),
+        external_macro_mods(external_macro_mods) {}
+
+  bool shouldVisitTemplateInstantiations() const { return false; }
+  bool shouldVisitImplicitCode() const { return false; }
+
+  bool is_internal_ns(const std::string &name) {
+    return is_internal(name) || std::regex_match(name, internal_re);
+  }
+
+  // Action for a forward declaration (class or function) whose definition
+  // lives in another library module:
+  //  kNone        — definition in this same file, or the entity is not defined
+  //                 by any library header (opaque type): export normally.
+  //  kDelete      — the definition is reachable in this TU via an included
+  //                 header that becomes an import: the redundant forward
+  //                 declaration is removed entirely.
+  //  kKeepPrivate — defined by another library module that this file does not
+  //                 include: keep the declaration but do not export it.
+  enum class FwdAction { kNone, kDelete, kKeepPrivate };
+  FwdAction fwd_action(llvm::StringRef name, clang::Decl *def) {
+    if (def && isMainFile(def)) return FwdAction::kNone;
+    // The definition is visible in this TU through an included library header
+    // that becomes an import (e.g. a header fwd-declares `mylib::Foo`, whose
+    // definition lives in another header → its own module).
+    // The redundant forward declaration must be removed; exporting it would
+    // collide with the imported module's entity.
+    if (def) return FwdAction::kDelete;
+    if (defined_fqns.empty()) return FwdAction::kNone;
+    auto fqn = fqn_of(ns_path_, name.str());
+    // A declaration whose definition lives in THIS module's implementation
+    // unit (a same-stem source file) is a normal module entity: export it and
+    // let the impl unit provide the definition. It must not be kept private or
+    // made `extern "C++"`, which would make it a distinct global-module entity.
+    for (auto &d : same_module_free_fqns) {
+      if (matches_reachable(fqn, d)) return FwdAction::kNone;
+    }
+    for (auto &d : defined_fqns) {
+      if (matches_reachable(fqn, d)) return FwdAction::kKeepPrivate;
+    }
+    return FwdAction::kNone;
+  }
+
+  // Apply a forward-declaration action. kDelete removes the declaration
+  // (including its trailing newline); kKeepPrivate leaves it as-is (the caller
+  // then returns without exporting).
+  void apply_fwd_action(clang::Decl *d, FwdAction action) {
+    if (action != FwdAction::kDelete) return;
+    auto begin = sm.getExpansionLoc(d->getBeginLoc());
+    auto end = sm.getExpansionLoc(d->getEndLoc());
+    unsigned begin_off = sm.getFileOffset(begin);
+    // For a class/function template forward declaration the begin location
+    // points at `class`/`struct`, not at the leading `template <...>` header;
+    // back up over any preceding template headers so the whole declaration is
+    // removed (not just the `class X;` part).
+    auto fid = sm.getFileID(begin);
+    auto buf = sm.getBufferData(fid);
+    if (begin_off > 0) {
+      auto p = begin_off;
+      while (p > 0 && (buf[p - 1] == ' ' || buf[p - 1] == '\t' ||
+                       buf[p - 1] == '\n' || buf[p - 1] == '\r'))
+        --p;
+      if (p > 0 && buf[p - 1] == '>') {
+        auto new_off = template_header_start(buf, p);
+        if (new_off != p) begin_off = new_off;
+      }
+    }
+    unsigned semi_off = sm.getFileOffset(end);
+    while (semi_off < buf.size() && buf[semi_off] != ';') ++semi_off;
+    unsigned del_end = semi_off + 1;
+    while (del_end < buf.size() &&
+           (buf[del_end] == ' ' || buf[del_end] == '\t' ||
+            buf[del_end] == '\r'))
+      ++del_end;
+    if (del_end < buf.size() && buf[del_end] == '\n') ++del_end;
+    mods.push_back({begin_off, del_end - begin_off, ""});
+  }
+
+  // Prefix a forward declaration with `extern "C++"` so it attaches to the
+  // global module and merges with the entity's definition in another module.
+  // For templates the declaration starts at `template`, not at the struct/class
+  // keyword.
+  void make_extern_cxx(clang::Decl *d) {
+    if (auto *td = d->getDescribedTemplate()) d = td;
+    auto begin = d->getBeginLoc();
+    // Same macro-body handling as addExport: an entity inside a macro body must
+    // get the marker at its spelling location so the macro expansion carries it.
+    auto loc = begin.isMacroID() ? sm.getSpellingLoc(begin)
+                                 : sm.getExpansionLoc(begin);
+    if (!loc.isValid()) return;
+    if (!sm.isInMainFile(loc)) loc = sm.getExpansionLoc(begin);
+    if (!loc.isValid()) return;
+    unsigned off = sm.getFileOffset(loc);
+    auto fid = sm.getFileID(loc);
+    auto src = sm.getBufferData(fid);
+    if (off > 0) {
+      // Skip a leading attribute list or attribute macro (e.g. LIB_API_).
+      // Attribute macros sit on the same line as the declaration.
+      auto p = off - 1;
+      while (p > 0 && (src[p] == ' ' || src[p] == '\t')) --p;
+      if (p >= 1 && src[p] == ']' && src[p - 1] == ']') {
+        while (p > 0 && (src[p] != '[' || src[p - 1] != '[')) --p;
+        if (p > 0) off = p - 1;
+      } else if (d->hasAttrs() && p > 0 && is_ident_char(src[p])) {
+        while (p > 0 && is_ident_char(src[p - 1])) --p;
+        off = p;
+      }
+    }
+    // For an out-of-line member-template definition the marker must precede the
+    // OUTERMOST `template` header. `getBeginLoc()` of the member's template
+    // points at its own header (e.g. `template <typename U>`), but the class
+    // template's header (`template <typename T>`) comes first; inserting
+    // between the two headers is ill-formed. Scan backward over any number of
+    // preceding `template <...>` headers.
+    if (off > 0) {
+      // `pos` points just past a `>` that closes a template parameter list.
+      // Find the matching `<`, then check that `template` precedes it.
+      while (off > 0) {
+        // Move left past whitespace to the character before the marker.
+        auto p = off;
+        while (p > 0 && (src[p - 1] == ' ' || src[p - 1] == '\t' ||
+                         src[p - 1] == '\n' || src[p - 1] == '\r'))
+          --p;
+        if (p == 0 || src[p - 1] != '>') break;
+        auto new_off = template_header_start(src, p);
+        if (new_off == p) break;
+        off = new_off;
+      }
+    }
+    mods.push_back({off, 0, "extern \"C++\" "});
+  }
+
+  // Remove the `static` storage-class keyword from a function definition so it
+  // gains external linkage (used for consumer-reachable static function
+  // templates that must be re-homed in the global module).
+  void strip_static(clang::FunctionDecl *fd) {
+    auto begin = sm.getExpansionLoc(fd->getBeginLoc());
+    if (!begin.isValid()) return;
+    auto fid = sm.getFileID(begin);
+    auto src = sm.getBufferData(fid);
+    unsigned off = sm.getFileOffset(begin);
+    // Scan forward for the `static` keyword before the function body.
+    auto text = std::string_view(src.data() + off, src.size() - off);
+    auto brace = text.find('{');
+    if (brace == std::string_view::npos) brace = text.size();
+    auto prefix = text.substr(0, brace);
+    auto kw = prefix.find("static");
+    while (kw != std::string_view::npos) {
+      // Confirm a whole token: delimiter before, whitespace after.
+      bool boundary_before = kw == 0 || !is_ident_char(prefix[kw - 1]);
+      bool boundary_after = kw + 6 < prefix.size() &&
+          (prefix[kw + 6] == ' ' || prefix[kw + 6] == '\t' ||
+           prefix[kw + 6] == '\n' || prefix[kw + 6] == '\r');
+      if (boundary_before && boundary_after) break;
+      kw = prefix.find("static", kw + 6);
+    }
+    if (kw == std::string_view::npos) return;
+    unsigned start = off + static_cast<unsigned>(kw);
+    unsigned end = start + 6;
+    while (end < src.size() &&
+           (src[end] == ' ' || src[end] == '\t' || src[end] == '\n'))
+      ++end;
+    mods.push_back({start, end - start, ""});
+  }
+
+  // True when this module declares `name` (forward-declared) but does not
+  // define it; the definition lives in another module, so both this module's
+  // declaration and that definition need `extern "C++"`.
+  bool cross_module_fwd_declared(llvm::StringRef name) {
+    if (fwd_declared_fqns.empty()) return false;
+    auto fqn = fqn_of(ns_path_, name.str());
+    for (auto &d : fwd_declared_fqns) {
+      if (matches_reachable(fqn, d)) return true;
+    }
+    return false;
+  }
+
+  // True when this entity must be `extern "C++"`: either it is declared in a
+  // module that does not define it, or it is friend-declared inside an
+  // extern "C++" class (which attaches the declaration to the global module).
+  bool is_extern_cxx_entity(llvm::StringRef name) {
+    if (cross_module_fwd_declared(name)) return true;
+    if (friend_extern_fqns.empty()) return false;
+    auto fqn = fqn_of(ns_path_, name.str());
+    for (auto &f : friend_extern_fqns) {
+      if (matches_reachable(fqn, f)) return true;
+    }
+    return false;
+  }
+
+  bool VisitCXXRecordDecl(clang::CXXRecordDecl *rd) {
+    if (!rd || rd->isImplicit() || !isMainFile(rd)) return true;
+    if (llvm::isa<clang::CXXRecordDecl>(rd->getDeclContext())) return true;
+    if (llvm::isa<clang::FunctionDecl>(rd->getDeclContext())) return true;
+    if (rd->getFriendObjectKind() != clang::Decl::FOK_None) return true;
+    // A friend class TEMPLATE (`template <typename T> friend class X;`) marks
+    // its described ClassTemplateDecl as the friend, not the inner record; the
+    // record's own friend kind is FOK_None. Such a declaration inside a class
+    // body must never be exported or wrapped.
+    if (auto *ct = rd->getDescribedClassTemplate())
+      if (ct->getFriendObjectKind() != clang::Decl::FOK_None) return true;
+    if (!rd->isCompleteDefinition()) {
+      // A primary class template forward declaration whose partial
+      // specialization is defined in THIS file (e.g. `template <typename T>
+      // struct Function;` + `template <typename R, typename...> struct
+      // Function<R(Args...)>`). The primary itself is never "complete", but
+      // this module owns the specialization, so the primary must be exported
+      // for consumers to name `Function<X>`. Without this check, defined_fqns
+      // (which includes the specialization's FQN) would classify the primary
+      // as defined-elsewhere and keep it private.
+      auto *ct = rd->getDescribedClassTemplate();
+      if (ct) {
+        bool spec_in_file = false;
+        llvm::SmallVector<clang::ClassTemplatePartialSpecializationDecl *, 4>
+            partial_specs;
+        ct->getPartialSpecializations(partial_specs);
+        for (auto *spec : partial_specs) {
+          if (spec->isCompleteDefinition() && isMainFile(spec)) {
+            spec_in_file = true;
+            break;
+          }
+        }
+        if (spec_in_file) {
+          bool need_extern = !extern_cxx &&
+                             is_extern_cxx_entity(rd->getNameAsString());
+          addExport(rd, need_extern);
+          return true;
+        }
+      }
+      // Forward declaration of a class fully defined by another library module.
+      auto action = fwd_action(rd->getNameAsString(), rd->getDefinition());
+      apply_fwd_action(rd, action);
+      if (action == FwdAction::kDelete) return true;
+      if (action == FwdAction::kKeepPrivate) {
+        // The defining module is not imported here: keep the declaration as a
+        // global-module entity so it merges with the definition.
+        if (!extern_cxx) make_extern_cxx(rd);
+        return true;  // not exported
+      }
+    }
+    bool need_extern = !extern_cxx &&
+                       is_extern_cxx_entity(rd->getNameAsString());
+    if (no_internal_filter) { addExport(rd, need_extern); return true; }
+    if (is_internal(rd->getNameAsString())) {
+      // A forward-declared internal entity that the consumer defines itself
+      // (e.g. a library's `ListenerAccessor`) must be declared
+      // `extern "C++"` so it lands in the global module: the consumer's
+      // definition then merges with it and the module's friend declarations
+      // keep granting access to the private members. A complete internal
+      // definition stays a module entity.
+      if (!rd->isCompleteDefinition() && !extern_cxx) {
+        make_extern_cxx(rd);
+        return true;
+      }
+      // An internal-namespace class whose members are defined in another
+      // module is `extern "C++"`; it must also be exported so the defining
+      // impl unit can see its declaration.
+      if (need_extern) addExport(rd, /*need_extern_cxx=*/true);
+      return true;
+    }
+    addExport(rd, need_extern);
+    return true;
+  }
+
+  bool VisitFunctionDecl(clang::FunctionDecl *fd) {
+    if (!fd || fd->isImplicit() || !isMainFile(fd)) return true;
+    if (llvm::isa<clang::CXXMethodDecl>(fd)) {
+      // Out-of-line member definition in this header: when the class is
+      // `extern "C++"`, the definition must be too, or it would be a distinct
+      // module entity conflicting with the class's global-module declaration.
+      auto *md = llvm::dyn_cast<clang::CXXMethodDecl>(fd);
+      if (!md->isThisDeclarationADefinition()) return true;
+      if (llvm::isa<clang::CXXRecordDecl>(md->getLexicalDeclContext()))
+        return true;  // in-class definition, covered by the class
+      auto *cls = llvm::dyn_cast<clang::CXXRecordDecl>(md->getDeclContext());
+      if (!cls) return true;
+      if (!extern_cxx && is_extern_cxx_entity(cls->getNameAsString()))
+        make_extern_cxx(fd);
+      return true;
+    }
+    if (fd->getFriendObjectKind() != clang::Decl::FOK_None) return true;
+    // A namespace-scope `static` function has internal linkage and can never be
+    // exported or given `extern "C++"`. When consumers (impl units) use it,
+    // however, it must be re-homed in the global module: strip the `static`
+    // and export it so impls importing the module can use it. (In the interface
+    // unit the definition exists exactly once, so there is no ODR risk.)
+    if (fd->getStorageClass() == clang::SC_Static) {
+      bool reachable = false;
+      auto fqn = fqn_of(ns_path_, fd->getNameAsString());
+      for (auto &r : reachable_fqns) {
+        if (matches_reachable(fqn, r)) { reachable = true; break; }
+      }
+      if (!reachable) return true;
+      strip_static(fd);
+      addExport(fd);
+      return true;
+    }
+    if (!fd->isThisDeclarationADefinition()) {
+      // Forward declaration of a function defined by another library module.
+      auto action = fwd_action(fd->getNameAsString(), fd->getDefinition());
+      apply_fwd_action(fd, action);
+      if (action == FwdAction::kDelete) return true;
+      if (action == FwdAction::kKeepPrivate) {
+        // The defining module is not imported here: keep the declaration as a
+        // global-module entity so it merges with the definition.
+        if (!extern_cxx) make_extern_cxx(fd);
+        return true;  // not exported
+      }
+    }
+    bool need_extern = !extern_cxx &&
+                       is_extern_cxx_entity(fd->getNameAsString());
+    if (is_internal(fd->getNameAsString())) {
+      // An internal-namespace function declared in this header but defined in
+      // another module is `extern "C++"`; it must also be exported so the
+      // defining impl unit can see its declaration.
+      if (need_extern) addExport(fd, /*need_extern_cxx=*/true);
+      return true;
+    }
+    addExport(fd, need_extern);
+    return true;
+  }
+
+  bool VisitEnumDecl(clang::EnumDecl *ed) {
+    if (!ed || ed->isImplicit() || !isMainFile(ed)) return true;
+    if (llvm::isa<clang::CXXRecordDecl>(ed->getDeclContext())) return true;
+    if (no_internal_filter) { addExport(ed); return true; }
+    if (is_internal(ed->getNameAsString())) {
+      // An internal enum whose *value* is reachable (e.g. `kFatal` named
+      // by a public macro) must be exported so impl units and consumers can
+      // name the enumerator. Enumerators are declared in the enum's enclosing
+      // namespace, so a reachable FQN like `internal::kFatal` can never
+      // match the enum decl by name; fall back to matching each enumerator.
+      bool reachable_value = false;
+      for (auto *en : ed->enumerators()) {
+        auto fqn = fqn_of(ns_path_, en->getNameAsString());
+        for (auto &r : reachable_fqns) {
+          if (r == fqn || fqn.ends_with("::" + r)) {
+            reachable_value = true;
+            break;
+          }        }
+        if (reachable_value) break;
+      }
+      if (!reachable_value) return true;
+    }
+    addExport(ed);
+    return true;
+  }
+
+  bool VisitTypedefDecl(clang::TypedefDecl *td) {
+    if (!td || td->isImplicit() || !isMainFile(td)) return true;
+    if (llvm::isa<clang::CXXRecordDecl>(td->getDeclContext())) return true;
+    if (llvm::isa<clang::FunctionDecl>(td->getDeclContext())) return true;
+    if (is_internal(td->getNameAsString())) return true;
+    addExport(td);
+    return true;
+  }
+
+  bool VisitTypeAliasDecl(clang::TypeAliasDecl *ta) {
+    if (!ta || ta->isImplicit() || !isMainFile(ta)) return true;
+    if (llvm::isa<clang::CXXRecordDecl>(ta->getDeclContext())) return true;
+    if (llvm::isa<clang::FunctionDecl>(ta->getDeclContext())) return true;
+    if (is_internal(ta->getNameAsString())) return true;
+    addExport(ta);
+    return true;
+  }
+
+  bool VisitTypeAliasTemplateDecl(clang::TypeAliasTemplateDecl *tat) {
+    if (!tat || tat->isImplicit() || !isMainFile(tat)) return true;
+    if (auto *ta = tat->getTemplatedDecl()) {
+      if (llvm::isa<clang::CXXRecordDecl>(ta->getDeclContext())) return true;
+      if (llvm::isa<clang::FunctionDecl>(ta->getDeclContext())) return true;
+    }
+    // A cross-module alias template (e.g. `IsConvertible`
+    // referenced inside another module's template bodies) must be `extern
+    // "C++"` on BOTH sides so the injected copy in the using module and this
+    // definition stay one shared entity.
+    if (is_extern_cxx_entity(tat->getNameAsString())) {
+      make_extern_cxx(tat);
+      return true;
+    }
+    if (is_internal(tat->getNameAsString())) return true;
+    addExport(tat);
+    return true;
+  }
+
+  bool VisitVarDecl(clang::VarDecl *vd) {
+    if (!vd || vd->isImplicit() || !isMainFile(vd)) return true;
+    if (vd->isLocalVarDeclOrParm() || vd->isStaticDataMember()) return true;
+    if (vd->isStaticLocal()) return true;
+    if (is_internal(vd->getNameAsString())) return true;
+    // A variable declared in this header but defined in another module must be
+    // `extern "C++"` on both sides to stay a single shared entity.
+    bool need_extern = !extern_cxx &&
+                       is_extern_cxx_entity(vd->getNameAsString());
+    addExport(vd, need_extern);
+    return true;
+  }
+
+  bool VisitUsingDecl(clang::UsingDecl *ud) {
+    // A namespace-scope `using` declaration (e.g. `using internal::Widget;`)
+    // hoists a name for consumers. It is a reachable entity and must be
+    // exported so the module exposes the name.
+    if (!ud || ud->isImplicit() || !isMainFile(ud)) return true;
+    if (llvm::isa<clang::CXXRecordDecl>(ud->getDeclContext())) return true;
+    if (llvm::isa<clang::FunctionDecl>(ud->getDeclContext())) return true;
+    addExport(ud);
+    return true;
+  }
+
+  bool VisitUsingDirectiveDecl(clang::UsingDirectiveDecl *udd) {
+    // A namespace-scope `using namespace X;` directive (e.g. a library's
+    // `using namespace detail;` inside `namespace lib`) makes X's members
+    // visible in the enclosing namespace. It must be exported so consumers
+    // resolve names like `lib::Foo` (which lives in `lib::detail`)
+    // through the directive.
+    if (!udd || udd->isImplicit() || !isMainFile(udd)) return true;
+    if (llvm::isa<clang::CXXRecordDecl>(udd->getDeclContext())) return true;
+    if (llvm::isa<clang::FunctionDecl>(udd->getDeclContext())) return true;
+    addExport(udd);
+    return true;
+  }
+
+private:
+  const clang::SourceManager &sm;
+  std::vector<ModPoint> &mods;
+  const std::regex &internal_re;
+  std::string_view export_macro;
+  const std::vector<std::string> &reachable_fqns;
+  bool no_internal_filter = false;
+  std::vector<std::string> &internal_fqns;
+  const std::vector<std::string> &defined_fqns;
+  bool extern_cxx = false;
+  const std::vector<std::string> &fwd_declared_fqns;
+  const std::set<std::string> &friend_extern_fqns;
+  const std::set<std::string> &same_module_free_fqns;
+  // Library headers being rewritten in this run (absolute paths). When an
+  // entity is defined inside a macro body whose definition lives in one of
+  // these OTHER headers (e.g. a macro defined in matchers.h
+  // but invoked in more-matchers.h), the export marker must be routed
+  // into that header's macros file instead of exported at the invocation.
+  const std::set<std::string> *library_headers = nullptr;
+  std::map<std::string, std::vector<ModPoint>> *external_macro_mods = nullptr;
+
+  bool is_internal(const std::string &entity_name) const {
+    if (no_internal_filter) return false;
+    if (internal_depth_ == 0) return false;
+    auto fqn = fqn_of(ns_path_, entity_name);
+    for (auto &r : reachable_fqns) {
+      if (matches_reachable(fqn, r)) return false;
+    }
+    internal_fqns.push_back(fqn);
+    return true;
+  }
+
+  bool isMainFile(clang::Decl *d) const {
+    if (!d) return false;
+    auto loc = d->getLocation();
+    return loc.isValid() && sm.isInMainFile(loc);
+  }
+
+  void addExport(clang::Decl *d, bool need_extern_cxx = false) {
+    if (auto *rd = llvm::dyn_cast<clang::CXXRecordDecl>(d)) {
+      if (rd->getFriendObjectKind() != clang::Decl::FOK_None) return;
+      if (auto *ct = rd->getDescribedClassTemplate())
+        if (ct->getFriendObjectKind() != clang::Decl::FOK_None) return;
+      if (llvm::isa<clang::CXXRecordDecl>(rd->getLexicalDeclContext())) return;
+    }
+    if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(d)) {
+      if (fd->getFriendObjectKind() != clang::Decl::FOK_None) return;
+      if (llvm::isa<clang::CXXRecordDecl>(fd->getLexicalDeclContext())) return;
+    }
+    if (auto *td = d->getDescribedTemplate()) d = td;
+    auto begin = d->getBeginLoc();
+    // An entity defined inside a macro body (`#define MACRO(x) ... class Foo
+    // { x };`) has a begin location whose expansion point is the macro
+    // invocation. Insert the marker at the macro-body spelling location so the
+    // class itself carries the export wherever the macro expands, instead of
+    // exporting the whole invocation.
+    auto loc = begin.isMacroID() ? sm.getSpellingLoc(begin)
+                                 : sm.getExpansionLoc(begin);
+    if (!loc.isValid()) return;
+    // When the macro body lives in ANOTHER library header being rewritten
+    // (e.g. a macro defined in matchers.h but invoked in
+    // more-matchers.h), the marker must be routed into that header's
+    // macros file (so the macro body bakes the export in wherever it expands),
+    // not exported at the invocation in this file. Variables are exempt: a
+    // shared DECLARE macro (e.g. `DECLARE_FLAG_`) expands to a
+    // single `extern` variable whose linkage differs per use (module-local in
+    // some modules, `extern "C++"` cross-module in others); baking the marker
+    // into the shared body would force one linkage on every expansion. Such
+    // entities keep the invocation-level export.
+    std::string route_to;
+    if (!sm.isInMainFile(loc) && external_macro_mods && library_headers &&
+        !llvm::isa<clang::VarDecl>(d)) {
+      auto fn = sm.getFilename(loc);
+      if (!fn.empty()) {
+        auto canon =
+            std::filesystem::weakly_canonical(std::filesystem::path(fn.str()))
+                .string();
+        if (library_headers->count(canon)) route_to = canon;
+      }
+    }
+    if (route_to.empty() && !sm.isInMainFile(loc)) loc = sm.getExpansionLoc(begin);
+    if (!loc.isValid()) return;
+    unsigned off = sm.getFileOffset(loc);
+    // Move before leading [[]] attributes which getBeginLoc skips
+    auto fid = sm.getFileID(loc);
+    auto src = sm.getBufferData(fid);
+    if (off > 0) {
+      auto p = off - 1;
+      while (p > 0 && (src[p] == ' ' || src[p] == '\t' || src[p] == '\n'))
+        --p;
+      if (p >= 1 && src[p] == ']' && src[p - 1] == ']') {
+        while (p > 0 && (src[p] != '[' || src[p - 1] != '[')) --p;
+        if (p > 0) off = p - 1;
+      } else if (d->hasAttrs()) {
+        // A leading attribute *macro* (e.g. LIB_API_ → `[[gnu::visibility]]`)
+        // makes getBeginLoc point past it. Place the export before the macro so
+        // the attribute list doesn't precede `export extern "C++"`. Attribute
+        // macros sit on the same line as the declaration, so only skip spaces
+        // and tabs (never a newline, which could be a `#if` line above).
+        auto q = off;
+        while (q > 0 && (src[q - 1] == ' ' || src[q - 1] == '\t'))
+          --q;
+        if (q > 0 && is_ident_char(src[q - 1])) {
+          while (q > 0 && is_ident_char(src[q - 1])) --q;
+          off = q;
+        }
+      }
+    }
+    std::string prefix = std::format("{} ", export_macro);
+    if (need_extern_cxx) {
+      // A variable declared `extern int x;` already carries the storage-class
+      // specifier that `extern "C++"` makes redundant; drop it so the result is
+      // a clean single `extern "C++" int x;`. The declaration may be
+      // `extern int x;` or, when preceded by an attribute macro,
+      // `LIB_API_ extern int x;` — find_extern_spec tries `extern` right
+      // away, then skips a leading attribute-macro identifier and retries
+      // (keeping the macro).
+      if (auto *vd = llvm::dyn_cast<clang::VarDecl>(d))
+        if (vd->getStorageClass() == clang::SC_Extern) {
+          unsigned ex_start = 0, ex_end = 0;
+          if (find_extern_spec(src, off, ex_start, ex_end)) {
+            ModPoint m{ex_start, ex_end - ex_start, ""};
+            if (!route_to.empty())
+              (*external_macro_mods)[route_to].push_back(std::move(m));
+            else
+              mods.push_back(std::move(m));
+          }
+        }
+      prefix += "extern \"C++\" ";
+    }
+    ModPoint m{off, 0, std::move(prefix)};
+    if (!route_to.empty())
+      (*external_macro_mods)[route_to].push_back(std::move(m));
+    else
+      mods.push_back(std::move(m));
+  }
+};
+
+// Collects the resolved files of declarations referenced by the main file.
+// Template instantiations are visited so usages inside template bodies are
+// caught; this runs separately from the export visitor so instantiated decls
+// never receive duplicate export annotations.
+export class UsedHeadersVisitor : public clang::RecursiveASTVisitor<UsedHeadersVisitor> {
+public:
+  UsedHeadersVisitor(const clang::SourceManager &sm, std::set<std::string> &used)
+      : sm(sm), used(used) {}
+
+  bool shouldVisitTemplateInstantiations() const { return true; }
+  bool shouldVisitImplicitCode() const { return false; }
+
+private:
+  void record(clang::Decl *d) {
+    if (!d) return;
+    auto loc = d->getLocation();
+    if (!loc.isValid()) return;
+    auto f = sm.getFilename(loc);
+    if (f.empty() || sm.isInMainFile(loc)) return;
+    used.insert(f.str());
+    // Also record the include chain: a used declaration may live in a header
+    // that a forwarding header pulls in via `#include_next` (libc++
+    // `<cstdio>`/`<stdio.h>` forward to musl's `<stdio.h>`). The GMF keeps the
+    // header the source textually included, so every header between the decl
+    // and the main file is marked used.
+    auto fid = sm.getFileID(loc);
+    unsigned guard = 0;
+    while (++guard < 64) {
+      auto inc_loc = sm.getIncludeLoc(fid);
+      if (!inc_loc.isValid()) break;
+      auto inc_f = sm.getFilename(inc_loc);
+      if (inc_f.empty() || sm.isInMainFile(inc_loc)) break;
+      used.insert(inc_f.str());
+      fid = sm.getFileID(inc_loc);
+    }
+  }
+
+  bool in_main(clang::SourceLocation loc) const {
+    return loc.isValid() && sm.isInMainFile(loc);
+  }
+
+public:
+  bool VisitDeclRefExpr(clang::DeclRefExpr *e) {
+    if (e && in_main(e->getLocation())) record(e->getDecl());
+    return true;
+  }
+
+  bool VisitMemberExpr(clang::MemberExpr *e) {
+    if (e && in_main(e->getMemberLoc())) record(e->getMemberDecl());
+    return true;
+  }
+
+  bool VisitCallExpr(clang::CallExpr *e) {
+    if (e && in_main(e->getExprLoc())) record(e->getCalleeDecl());
+    return true;
+  }
+
+  bool VisitCXXConstructExpr(clang::CXXConstructExpr *e) {
+    if (e && in_main(e->getExprLoc())) record(e->getConstructor());
+    return true;
+  }
+
+  bool VisitTypeLoc(clang::TypeLoc tl) {
+    if (!tl || !in_main(tl.getBeginLoc())) return true;
+    auto *t = tl.getTypePtr();
+    if (!t) return true;
+    if (auto *td = t->getAsTagDecl()) { record(td); return true; }
+    if (auto *tst = llvm::dyn_cast<clang::TemplateSpecializationType>(t)) {
+      if (auto *td = tst->getTemplateName().getAsTemplateDecl()) record(td);
+    }
+    return true;
+  }
+
+private:
+  const clang::SourceManager &sm;
+  std::set<std::string> &used;
+};
+
+// Collects friend-declaration targets of extern "C++" classes. A friend
+// declaration inside an extern "C++" class attaches to the global module, so
+// the friend target's own definition must also be `extern "C++"` (even when it
+// lives in the same module) or it would be a distinct module entity that
+// conflicts with the friend's global-module declaration.
+export class FriendExternCxxCollector
+    : public clang::RecursiveASTVisitor<FriendExternCxxCollector> {
+public:
+  FriendExternCxxCollector(const clang::SourceManager &sm,
+                           const std::set<std::string> &fwd_declared_fqns,
+                           std::set<std::string> &out)
+      : sm(sm), fwd_declared_fqns(fwd_declared_fqns), out(out) {}
+
+  bool shouldVisitTemplateInstantiations() const { return false; }
+  bool shouldVisitImplicitCode() const { return false; }
+
+  bool VisitFriendDecl(clang::FriendDecl *f) {
+    if (!f) return true;
+    auto *cls =
+        llvm::dyn_cast_or_null<clang::CXXRecordDecl>(f->getDeclContext());
+    if (!cls) return true;
+    auto loc = cls->getLocation();
+    if (!loc.isValid() || !sm.isInMainFile(loc)) return true;
+    if (!fwd_declared_fqns.count(cls->getQualifiedNameAsString())) return true;
+    if (auto *tsi = f->getFriendType())
+      if (auto *td = tsi->getType()->getAsTagDecl())
+        out.insert(td->getQualifiedNameAsString());
+    if (auto *nd = llvm::dyn_cast_or_null<clang::NamedDecl>(f->getFriendDecl()))
+      out.insert(nd->getQualifiedNameAsString());
+    return true;
+  }
+
+private:
+  const clang::SourceManager &sm;
+  const std::set<std::string> &fwd_declared_fqns;
+  std::set<std::string> &out;
+};
