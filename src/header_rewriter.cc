@@ -337,7 +337,8 @@ std::string assemble_interface_cc(
     const std::vector<std::string> &purview_imports,
     const std::vector<std::pair<std::vector<std::string>, std::string>>
         &fwd_decls,
-    const std::string &hdr, llvm::StringRef header_path) {
+    const std::string &hdr, llvm::StringRef header_path,
+    const std::vector<std::string> &redefined_macros = {}) {
   std::string cc;
   if (!header_comment.empty()) cc += header_comment + "\n\n";
   cc += "module;\n";
@@ -428,6 +429,16 @@ std::string assemble_interface_cc(
     if (body.starts_with("#pragma once\n")) body.remove_prefix(13);
     cc += std::string(body);
   } else {
+    // Macros the macros file defines AND the header defines again for itself.
+    // The macros file is included at the top of the global module fragment, so
+    // that guard conditions on the GMF includes resolve — but that is before
+    // the standard library has been included, so anything derived from a
+    // feature-test macro (`#if defined(__cpp_lib_three_way_comparison)`) is
+    // computed there against the wrong answer. The header's own definition,
+    // reached after those includes, is the correct one; drop the early copy so
+    // it wins outright instead of redefining it.
+    for (auto &name : redefined_macros)
+      cc += std::format("#undef {}\n", name);
     // The form a consumer writes, not the bare filename: the rewritten header
     // is installed under the include prefix its original had
     // (`gtest/gtest.h`), which is not the directory the interface unit ends up
@@ -700,11 +711,36 @@ export HeaderRewriteResult rewrite_header(
   // would redefine struct stat).
   filter_subsumed_transitive(gmf_incs, header_path, options.extra_args);
 
+  // Macros the macros file carries a copy of AND the header still defines for
+  // itself: those need dropping before the header is included (see
+  // assemble_interface_cc).
+  std::vector<std::string> redefined_macros;
+  if (!result.macros_content.empty()) {
+    for (auto &m : export_macros) {
+      if (m.name.empty()) continue;
+      auto needle = std::format("#define {}", m.name);
+      for (std::size_t pos = hdr.find(needle); pos != std::string::npos;
+           pos = hdr.find(needle, pos + 1)) {
+        // A definition of this very macro, not of one whose name merely starts
+        // with it, and at the start of a line.
+        auto after = pos + needle.size();
+        if (after < hdr.size() && (is_ident_char(hdr[after]) || hdr[after] == '_'))
+          continue;
+        auto ls = hdr.rfind('\n', pos);
+        auto first = hdr.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1);
+        if (first != pos) continue;
+        redefined_macros.push_back(m.name);
+        break;
+      }
+    }
+  }
+
   result.cc_content = assemble_interface_cc(
       module_name, header_comment, use_modules_macro, std_import_guard,
       std_use_guard, macros_name,
       !export_macros.empty() || !extra_macro_includes.empty(), options,
-      gmf_incs, purview_imports, fwd_decls, hdr, header_path);
+      gmf_incs, purview_imports, fwd_decls, hdr, header_path,
+      redefined_macros);
 
   return result;
 }
