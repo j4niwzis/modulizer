@@ -298,9 +298,10 @@ export void extract_textual_macros(const std::string &original,
                         (unsigned)c.start, (unsigned)c.end});
       return;
     }
-    // `children` is innermost-closed-first; source order is the reverse.
-    for (auto it = c.children.rbegin(); it != c.children.rend(); ++it)
-      self(self, *it);
+    // Siblings are recorded as they close, which for siblings is source order —
+    // and source order is what has to be kept, since a macro used in a later
+    // conditional's `#if` must already be defined by an earlier one.
+    for (auto child : c.children) self(self, child);
   };
   for (auto idx : roots) emit(emit, idx);
 }

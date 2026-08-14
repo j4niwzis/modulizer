@@ -416,3 +416,42 @@ TEST(MacroAnalysis, KeepsGuardOfConditionalNestedInAnIncludeGuard) {
   EXPECT_EQ(block->body.find("namespace lib"), std::string::npos)
       << "the enclosing include guard mixes in code and must not be emitted";
 }
+
+TEST(MacroAnalysis, EmitsConditionalBlocksInSourceOrder) {
+  // Order is load-bearing: a macro used in a later conditional's `#if` has to
+  // be defined by an earlier one, so the blocks must come out in the order
+  // they were written, not the order they happen to be collected in.
+  std::string src =
+      "#ifndef LIB_DEFS_H_\n"
+      "#define LIB_DEFS_H_\n"
+      "\n"
+      "#ifdef __has_attribute\n"
+      "#define LIB_HAVE_ATTRIBUTE(x) __has_attribute(x)\n"
+      "#else\n"
+      "#define LIB_HAVE_ATTRIBUTE(x) 0\n"
+      "#endif\n"
+      "\n"
+      "#if LIB_HAVE_ATTRIBUTE(format)\n"
+      "#define LIB_PRINTF __attribute__((format(printf, 1, 2)))\n"
+      "#else\n"
+      "#define LIB_PRINTF\n"
+      "#endif\n"
+      "\n"
+      "namespace lib { inline int use() { return 1; } }\n"
+      "\n"
+      "#endif  // LIB_DEFS_H_\n";
+
+  std::vector<MacroRec> macros;
+  extract_textual_macros(src, macros);
+
+  std::string emitted;
+  for (const auto &m : macros)
+    if (m.name.empty()) emitted += m.body;
+
+  auto have = emitted.find("#define LIB_HAVE_ATTRIBUTE(x) __has_attribute(x)");
+  auto printf_use = emitted.find("#if LIB_HAVE_ATTRIBUTE(format)");
+  ASSERT_NE(have, std::string::npos);
+  ASSERT_NE(printf_use, std::string::npos);
+  EXPECT_LT(have, printf_use)
+      << "the macro must be defined before the conditional that tests it";
+}
