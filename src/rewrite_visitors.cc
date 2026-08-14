@@ -499,7 +499,11 @@ private:
     // or explicit specialization. A specialization is exported together with
     // its primary template, so the marker is simply omitted. (clang accepts
     // the marker; gcc rejects it, and the standard is on gcc's side.)
-    if (is_specialization(d)) return;
+    // The `extern "C++"` is still required: a specialization of a template
+    // attached to the global module must be attached to it as well, or it
+    // specializes a different entity.
+    const bool specialization = is_specialization(d);
+    if (specialization && !need_extern_cxx) return;
     if (auto *rd = llvm::dyn_cast<clang::CXXRecordDecl>(d)) {
       if (rd->getFriendObjectKind() != clang::Decl::FOK_None) return;
       if (auto *ct = rd->getDescribedClassTemplate())
@@ -581,7 +585,8 @@ private:
         if (ls_loc.isValid() && sm.getFileID(ls_loc) == fid)
           off = sm.getFileOffset(ls_loc);
       }
-    std::string prefix = std::format("{} ", export_macro);
+    std::string prefix =
+        specialization ? std::string() : std::format("{} ", export_macro);
     if (need_extern_cxx) {
       // A variable declared `extern int x;` already carries the storage-class
       // specifier that `extern "C++"` makes redundant; drop it so the result is

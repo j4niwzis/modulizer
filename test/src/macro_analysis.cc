@@ -187,7 +187,7 @@ TEST(MacroAnalysis, ExpandTransitiveTypesAddsReturnType) {
   m.tokens = {"detail", "::", "make", "(", ")"};
   model.macros.push_back(m);
   model.items.push_back({EntityItem::kFunction, "make", {"detail"},
-                         "", "", true, {"detail::Factory"}});
+                         "", "", true, false, {"detail::Factory"}});
   model.items.push_back({EntityItem::kClass, "Factory", {"detail"}});
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);
@@ -208,7 +208,7 @@ TEST(MacroAnalysis, ExpandTransitiveTypesReachesMethodReturnTypes) {
   m.tokens = {"detail", "::", "Holder"};
   model.macros.push_back(m);
   model.items.push_back({EntityItem::kClass, "Holder", {"detail"},
-                         "", "", true, {"detail::Factory"}});
+                         "", "", true, false, {"detail::Factory"}});
   model.items.push_back({EntityItem::kClass, "Factory", {"detail"}});
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);
@@ -230,9 +230,9 @@ TEST(MacroAnalysis, ExpandTransitiveTypesTerminatesOnCycles) {
   m.tokens = {"detail", "::", "A"};
   model.macros.push_back(m);
   model.items.push_back({EntityItem::kClass, "A", {"detail"},
-                         "", "", true, {"detail::B"}});
+                         "", "", true, false, {"detail::B"}});
   model.items.push_back({EntityItem::kClass, "B", {"detail"},
-                         "", "", true, {"detail::A"}});
+                         "", "", true, false, {"detail::A"}});
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);
   expand_transitive_types(r, model);
@@ -256,9 +256,9 @@ TEST(MacroAnalysis, ExpandTransitiveTypesThroughPublicIntermediates) {
   m.tokens = {"detail", "::", "start"};
   model.macros.push_back(m);
   model.items.push_back({EntityItem::kFunction, "start", {"detail"},
-                         "", "", true, {"pub::Mid"}});
+                         "", "", true, false, {"pub::Mid"}});
   model.items.push_back({EntityItem::kClass, "Mid", {"pub"},
-                         "", "", true, {"detail::Leaf"}});
+                         "", "", true, false, {"detail::Leaf"}});
   model.items.push_back({EntityItem::kClass, "Leaf", {"detail"}});
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);

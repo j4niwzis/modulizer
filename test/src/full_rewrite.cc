@@ -428,12 +428,16 @@ TEST(FullRewrite, InjectedSameModuleForwardDeclGetsExternCxx) {
   // definition here is `extern "C++"`, so the injected forward declaration
   // must be `extern "C++"` too — a plain `export class Baz;` would be a
   // distinct module entity and leave the body's definition unreachable.
+  // It must also be exported: this module defines and exports Baz, and
+  // [module.interface]/6 only implicitly exports redeclarations of an entity
+  // *introduced* by an exported declaration, so the injected declaration
+  // preceding the exported definition has to carry the export itself.
   auto r = rewrite_header(data_path("fwd_lib/n.h"), "fwd_lib.n", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Baz"}, .fwd_declared_fqns = {"fwd_lib::Baz"}});
   EXPECT_NE(r.cc_content.find(
-                "namespace fwd_lib {\nextern \"C++\" class Baz;\n}"),
+                "namespace fwd_lib {\nexport extern \"C++\" class Baz;\n}"),
             std::string::npos)
       << "injected forward declaration of a same-module-defined entity that is "
-         "also declared by another module must be extern \"C++\"";
+         "also declared by another module must be exported extern \"C++\"";
   EXPECT_EQ(r.cc_content.find("namespace fwd_lib {\nexport class Baz;\n}"),
             std::string::npos)
       << "a plain exported forward declaration would not merge with the "
@@ -465,10 +469,14 @@ TEST(FullRewrite, TemplateDefinitionGetsExternCxx) {
             std::string::npos)
       << "definition of a cross-module forward-declared class template must be "
          "extern \"C++\"";
-  EXPECT_NE(r.h_content.find("TPL_LIB_EXPORT extern \"C++\" template <>\nstruct Foo<int>"),
+  EXPECT_NE(r.h_content.find("extern \"C++\" template <>\nstruct Foo<int>"),
             std::string::npos)
       << "explicit specialization of a cross-module forward-declared class "
          "template must also be extern \"C++\"";
+  EXPECT_EQ(r.h_content.find("TPL_LIB_EXPORT extern \"C++\" template <>"),
+            std::string::npos)
+      << "[module.interface]/3: the explicit specialization must not be "
+         "exported; it is exported with its primary template";
 }
 
 TEST(FullRewrite, ImplUnitExternCxxMemberDefinition) {

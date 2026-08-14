@@ -165,6 +165,40 @@ export std::optional<IncludeRef> parse_include_line(
                     is_quoted, d->hash_pos};
 }
 
+// The C++ standard library headers: the exact set a program may include
+// directly. Everything else a standard-library header pulls in is that
+// implementation's private business (`bits/…`, `__algorithm/…`). Also the
+// headers `import std;` provides: with --import-std a consumer's `#include`
+// lines for them are dropped and replaced by a single `import std;`.
+export const std::set<std::string> kStdHeaders = {
+    "algorithm",      "any",            "array",        "atomic",
+    "barrier",        "bit",            "bitset",       "charconv",
+    "chrono",         "cassert",        "ccomplex",     "cctype",
+    "cerrno",         "cfenv",          "cfloat",       "cinttypes",
+    "ciso646",        "climits",        "clocale",      "cmath",
+    "codecvt",        "compare",        "complex",      "concepts",
+    "coroutine",      "csetjmp",        "csignal",      "cstdarg",
+    "cstdbool",       "cstddef",        "cstdint",      "cstdio",
+    "cstdlib",        "cstring",        "ctgmath",      "ctime",
+    "cuchar",         "cwchar",         "cwctype",      "deque",
+    "exception",      "expected",       "filesystem",   "format",
+    "forward_list",   "fstream",        "functional",   "future",
+    "initializer_list", "iomanip",      "ios",          "iosfwd",
+    "iostream",       "istream",        "iterator",     "latch",
+    "limits",         "list",           "locale",       "map",
+    "memory",         "memory_resource", "mutex",       "new",
+    "numbers",        "numeric",        "optional",     "ostream",
+    "queue",          "random",         "ranges",       "ratio",
+    "regex",          "scoped_allocator", "semaphore",  "set",
+    "shared_mutex",   "source_location", "span",        "spanstream",
+    "sstream",        "stack",          "stdexcept",    "stop_token",
+    "streambuf",      "string",         "string_view",  "syncstream",
+    "system_error",   "thread",         "tuple",        "type_traits",
+    "typeindex",      "typeinfo",       "unordered_map", "unordered_set",
+    "utility",        "valarray",       "variant",      "vector",
+    "version",
+};
+
 export struct IncludeDirective {
   unsigned offset;
   unsigned end_offset;
@@ -403,7 +437,9 @@ export void expand_include_closure(
     const std::vector<std::string> &extra_args) {
   std::set<std::string> visited;
   for (std::size_t idx = 0; idx < includes.size(); ++idx) {
-    auto &inc = includes[idx];
+    // By value: the loop appends to `includes` below, and a reference into the
+    // vector would dangle as soon as that reallocates.
+    auto inc = includes[idx];
     if (is_xmacro_include(inc.path)) continue;
     if (inc.path.contains("/custom/")) continue;
     if (!visited.insert(inc.path).second) continue;
@@ -413,7 +449,9 @@ export void expand_include_closure(
     auto dep_includes = parse_includes(dep_text);
     annotate_guards(dep_text, dep_includes);
     // Everything reached from inside a standard-library/system header is that
-    // library's own business: its private headers and private guard conditions
+    // library's own business, unless it is itself a public standard header
+    // (`<string>` through `<iostream>` is one a program may include and so
+    // stays a candidate). Private headers and private guard conditions
     // (`<bits/alltypes.h>`, `<__algorithm/sort.h>`, `#if __building_module(std)`)
     // must never be emitted, or the output is pinned to the exact libc++ /
     // libstdc++ / musl it was generated against. They are still walked, because
@@ -425,7 +463,7 @@ export void expand_include_closure(
       if (is_xmacro_include(di.path)) continue;
       di.transitive = true;
       di.parent_resolved = resolved;
-      if (inside_system) {
+      if (inside_system && !kStdHeaders.count(di.path)) {
         di.system_internal = true;
         di.public_ancestor = inc.system_internal ? inc.public_ancestor : resolved;
       }

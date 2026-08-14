@@ -165,16 +165,18 @@ TEST(WrapperGen, ImportWrapperImportsAllLibraryModules) {
 
 TEST(WrapperGen, ExportsGlobalNamespaceEntities) {
   // An entity in the global namespace (e.g. a test-runner entry point, formerly
-  // a macro) is re-exported outside any namespace block, so its `using`
-  // declaration must carry `export` — otherwise consumers importing the wrapper
-  // cannot see it.
+  // a macro) is re-exported outside any namespace block. The whole wrapper body
+  // sits in an `export extern "C++" { … }` block, so the `using` declaration is
+  // exported by that block; it must land inside it rather than before it.
   EntityModel model;
   model.items.push_back({EntityItem::kFunction, "RunAll", {}});
   model.items.push_back({EntityItem::kClass, "Public", {"wraplib"}});
   auto out = generate_import_wrapper_cc(
       "wraplib", "wraplib.umbrella", model, kDefaultInternalFilter);
-  EXPECT_NE(out.find("export using ::RunAll;\n"), std::string::npos)
-      << "a global-namespace re-export must be exported";
+  EXPECT_NE(out.find("export extern \"C++\" {\nusing ::RunAll;\n"),
+            std::string::npos)
+      << "a global-namespace re-export must sit inside the exported "
+         "extern \"C++\" block";
   EXPECT_NE(out.find("using ::wraplib::Public;"), std::string::npos)
       << "namespace-scope re-exports stay plain `using` inside the exported "
          "namespace";
