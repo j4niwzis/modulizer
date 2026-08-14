@@ -7,38 +7,6 @@ import modulizer.util;
 import libtooling;
 import std;
 
-// Standard-library headers that `import std;` provides. When --import-std is
-// set, a consumer's `#include <...>` lines for these headers are dropped and
-// replaced by a single `import std;`.
-export const std::set<std::string> kStdHeaders = {
-    "algorithm",      "any",            "array",        "atomic",
-    "barrier",        "bit",            "bitset",       "charconv",
-    "chrono",         "cassert",        "ccomplex",     "cctype",
-    "cerrno",         "cfenv",          "cfloat",       "cinttypes",
-    "ciso646",        "climits",        "clocale",      "cmath",
-    "codecvt",        "compare",        "complex",      "concepts",
-    "coroutine",      "csetjmp",        "csignal",      "cstdarg",
-    "cstdbool",       "cstddef",        "cstdint",      "cstdio",
-    "cstdlib",        "cstring",        "ctgmath",      "ctime",
-    "cuchar",         "cwchar",         "cwctype",      "deque",
-    "exception",      "expected",       "filesystem",   "format",
-    "forward_list",   "fstream",        "functional",   "future",
-    "initializer_list", "iomanip",      "ios",          "iosfwd",
-    "iostream",       "istream",        "iterator",     "latch",
-    "limits",         "list",           "locale",       "map",
-    "memory",         "memory_resource", "mutex",       "new",
-    "numbers",        "numeric",        "optional",     "ostream",
-    "queue",          "random",         "ranges",       "ratio",
-    "regex",          "scoped_allocator", "semaphore",  "set",
-    "shared_mutex",   "source_location", "span",        "spanstream",
-    "sstream",        "stack",          "stdexcept",    "stop_token",
-    "streambuf",      "string",         "string_view",  "syncstream",
-    "system_error",   "thread",         "tuple",        "type_traits",
-    "typeindex",      "typeinfo",       "unordered_map", "unordered_set",
-    "utility",        "valarray",       "variant",      "vector",
-    "version",
-};
-
 namespace {
 
 // The block of standard headers a consumer needs once the library headers no

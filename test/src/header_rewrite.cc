@@ -892,6 +892,25 @@ TEST(HeaderRewrite, FwdDeclKeepsReferencedSystemHeaderInGmf) {
       << "the GMF must keep <string> for the injected fwd decl's return type";
 }
 
+TEST(HeaderRewrite, CreditsStdlibPrivateHeaderUseToItsPublicHeader) {
+  // The injected forward declaration's `std::string` is *declared* in a
+  // private libstdc++/libc++ header (`bits/basic_string.h`, `__string/…`),
+  // reached only from inside `<string>`. Emitting that private header would
+  // pin the output to the standard library it was generated against, so the
+  // use is credited to the public header that owns it: `<string>` is kept and
+  // no implementation-detail header appears in the GMF.
+  std::map<std::string, std::string> include_map = {
+    {"fwdstr_lib/dep.h", "fwdstr_lib.internal.dep"},
+  };
+  auto r = rewrite_header(data_path("fwdstr_lib/consumer.h"), "fwdstr_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwdstr_lib::foo"}, .fwd_declared_fqns = {"fwdstr_lib::foo"}});
+  EXPECT_NE(r.cc_content.find("#include <string>"), std::string::npos)
+      << "the public header owning the used declaration must be kept";
+  EXPECT_EQ(r.cc_content.find("#include <bits/"), std::string::npos)
+      << "a libstdc++ private header must never be emitted";
+  EXPECT_EQ(r.cc_content.find("#include <__"), std::string::npos)
+      << "a libc++ private header must never be emitted";
+}
+
 TEST(HeaderRewrite, InjectsFwdDeclExactlyOnce) {
   // dep.h forward-declares fwddup_lib::internal::Secret; use.h never references
   // it, so the injection happens via the fwd_declared_fqns sweep. When that
