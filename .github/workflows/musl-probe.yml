@@ -1,0 +1,78 @@
+name: musl probe
+
+# Dispatch-only. Answers, in one run, the questions the ssize_t failure on musl
+# leaves open — CI is the only musl available, and it is slow, so this asks
+# everything at once instead of guessing a fix and iterating.
+#
+# The failure: googletest-printers-test.cc uses ssize_t and includes no header
+# that declares it. Upstream it compiles because gtest's headers leak the POSIX
+# declaration textually into the test's translation unit; converted to modules
+# that leak stops, and on musl — which gates types behind __NEED_* macros —
+# nothing else provides it.
+#
+# Q1. Does `import std.compat;` expose ::ssize_t on musl at all? If it does,
+#     the converted consumer needs nothing and the bug is elsewhere.
+# Q2. Which include fixes the converted test: <cstdio> (a C++ wrapper the
+#     consumer rewriter already keeps when it sees one) or <sys/types.h> (the
+#     POSIX header that actually owns the type)? That decides what the fix has
+#     to emit.
+# Q3. Is ssize_t the only such declaration in the corpus, or does the test hit
+#     more once it gets past this one?
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: musl — what provides ssize_t
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe
+        run: |
+          docker run --rm -v "$PWD:/src" alpine:edge sh -euxc '
+            apk add --no-cache clang22 clang22-extra-tools binutils g++ cmake \
+              ninja-build ninja-is-really-ninja git musl-dev linux-headers
+
+            echo "=== Q1: does import std.compat expose ::ssize_t on musl?"
+            mkdir -p /q1 && cd /q1
+            cat > CMakeLists.txt <<EOF
+          cmake_minimum_required(VERSION 4.3 FATAL_ERROR)
+          set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "451f2fe2-a8a2-47c3-bc32-94786d8fc91b")
+          set(CMAKE_CXX_MODULE_STD 1)
+          project(q1 LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 23)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_library(q1 STATIC q1.cc)
+          target_compile_features(q1 PRIVATE cxx_std_23)
+          EOF
+            printf "import std.compat;\nssize_t probe() { return -2; }\n" > q1.cc
+            if cmake -S . -B b -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang >/dev/null 2>&1 \
+               && cmake --build b >/tmp/q1.log 2>&1; then
+              echo "RESULT Q1: import std.compat DOES provide ::ssize_t"
+            else
+              echo "RESULT Q1: import std.compat does NOT provide ::ssize_t"
+              tail -5 /tmp/q1.log || true
+            fi
+
+            echo "=== Q2/Q3: which include lets the converted test compile?"
+            git clone --depth 1 https://github.com/j4niwzis/googletest-modules.git /gt
+            cmake -S /gt -B /gt/b -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_GMOCK=ON -Dgtest_build_tests=ON -Dgmock_build_tests=ON \
+              -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+
+            T=/gt/googletest/test/googletest-printers-test.cc
+            cp "$T" /tmp/orig.cc
+            for inc in "<cstdio>" "<sys/types.h>"; do
+              cp /tmp/orig.cc "$T"
+              # After the last include, before the first use.
+              sed -i "0,/^#include \"gtest\\/gtest-printers.h\"/s||#include $inc\n#include \"gtest/gtest-printers.h\"|" "$T"
+              if cmake --build /gt/b --target googletest-printers-test >/tmp/q2.log 2>&1; then
+                echo "RESULT Q2: #include $inc COMPILES the converted test"
+              else
+                echo "RESULT Q2: #include $inc does not fix it"
+                grep -m5 "error:" /tmp/q2.log || true
+              fi
+            done
+          '
