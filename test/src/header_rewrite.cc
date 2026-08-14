@@ -437,8 +437,12 @@ TEST(HeaderRewrite, WrapsAllIncludesWithGuard) {
   };
   auto r = rewrite_header(data_path("header_with_includes.h"), "test_lib", RewriteOptions{.combined_macros = false, .include_to_module = include_map});
   auto guard = "TEST_LIB_USE_MODULES";
-  // All includes wrapped, adjacent blocks merged
-  auto ndef = r.h_content.find(std::format("#ifndef {}", guard));
+  // All includes wrapped, adjacent blocks merged. Anchor on the guard opening
+  // that precedes the first wrapped include: the header also carries its own
+  // guarded macros-file include above them, for the non-module build.
+  auto first_inc = r.h_content.find("#include \"macro_test.h\"");
+  ASSERT_NE(first_inc, std::string::npos);
+  auto ndef = r.h_content.rfind(std::format("#ifndef {}", guard), first_inc);
   EXPECT_NE(ndef, std::string::npos);
   auto endf = r.h_content.find("#endif", ndef);
   EXPECT_NE(endf, std::string::npos);
@@ -574,8 +578,11 @@ TEST(HeaderRewrite, MultiFileDotsExample) {
   EXPECT_NE(ra.export_h_content.find("MY_LIB_USE_MODULES"), std::string::npos);
   EXPECT_NE(ra.export_h_content.find("#pragma once"), std::string::npos);
 
-  // Merged guard block in b.h
-  auto ndef = rb.h_content.find("#ifndef MY_LIB_USE_MODULES");
+  // Merged guard block in b.h (anchored on the guard that wraps the includes,
+  // below the header's own guarded macros-file include).
+  auto first_inc = rb.h_content.find("#include \"multi_a.h\"");
+  ASSERT_NE(first_inc, std::string::npos);
+  auto ndef = rb.h_content.rfind("#ifndef MY_LIB_USE_MODULES", first_inc);
   auto endf = rb.h_content.find("#endif", ndef);
   auto block = rb.h_content.substr(ndef, endf - ndef);
   EXPECT_NE(block.find("#include \"multi_a.h\""), std::string::npos);
@@ -892,6 +899,19 @@ TEST(HeaderRewrite, FwdDeclKeepsReferencedSystemHeaderInGmf) {
       << "the GMF must keep <string> for the injected fwd decl's return type";
 }
 
+TEST(HeaderRewrite, InterfaceUnitIncludesTheHeaderByItsIncludeForm) {
+  // The interface unit ends up in the library's source directory while the
+  // rewritten header keeps the include prefix its original had, so the include
+  // has to be the form a consumer writes (`linkage_lib/api.h`). A bare
+  // filename only resolves when the two happen to sit side by side.
+  auto r = rewrite_header(data_path("linkage_lib/api.h"), "linkage_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.cc_content.find("#include \"linkage_lib/api.h\""),
+            std::string::npos)
+      << "the interface unit must include its header by include form";
+  EXPECT_EQ(r.cc_content.find("#include \"api.h\""), std::string::npos)
+      << "a filename-only include would not resolve from the source directory";
+}
+
 TEST(HeaderRewrite, CreditsStdlibPrivateHeaderUseToItsPublicHeader) {
   // The injected forward declaration's `std::string` is *declared* in a
   // private libstdc++/libc++ header (`bits/basic_string.h`, `__string/…`),
@@ -1203,7 +1223,7 @@ TEST(HeaderRewrite, ExternCxxBlockWrapsHeaderInclude) {
   // block: no premature close before it (which produced an extraneous `}`).
   auto r = rewrite_header(data_path("cconly_lib/api.h"), "cconly_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
   auto open = r.cc_content.find("extern \"C++\" {");
-  auto inc = r.cc_content.find("#include \"api.h\"");
+  auto inc = r.cc_content.find("#include \"cconly_lib/api.h\"");
   auto first_close = r.cc_content.find("}  // extern \"C++\"", open);
   EXPECT_NE(open, std::string::npos);
   EXPECT_NE(inc, std::string::npos);

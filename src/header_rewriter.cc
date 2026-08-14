@@ -428,8 +428,17 @@ std::string assemble_interface_cc(
     if (body.starts_with("#pragma once\n")) body.remove_prefix(13);
     cc += std::string(body);
   } else {
-    cc += std::format("#include \"{}\"\n",
-        std::filesystem::path(header_path.str()).filename().string());
+    // The form a consumer writes, not the bare filename: the rewritten header
+    // is installed under the include prefix its original had
+    // (`gtest/gtest.h`), which is not the directory the interface unit ends up
+    // in, so a filename-only include does not resolve. Matches what the
+    // generated macro-header include already emits. With no include directory
+    // to be relative to, include_form hands back the path as given — fall back
+    // to the filename there rather than baking in an absolute path.
+    auto form = include_form(header_path, options.extra_args);
+    if (form == header_path.str())
+      form = std::filesystem::path(header_path.str()).filename().string();
+    cc += std::format("#include \"{}\"\n", form);
   }
 
   if (options.extern_cxx) {
@@ -647,6 +656,14 @@ export HeaderRewriteResult rewrite_header(
         export_macros, extra_macro_includes, block_defined_names, original,
         mods, export_include);
     result.macros_name = macros_name;
+    // The macro definitions moved out of the header into the macros file, and
+    // the body still uses them (`GTEST_INTERNAL_HAS_INCLUDE(<span>)`). The
+    // interface unit supplies them from its global module fragment, but a
+    // classic (non-module) build includes this header and nothing else, so the
+    // header has to bring its own macros along in that case.
+    hdr.insert(post_guard_pos,
+               std::format("#ifndef {}\n#include \"{}.h\"\n#endif\n",
+                           use_modules_macro, macros_name));
   }
 
   // Reproduce the source file's license/copyright header at the very top of the

@@ -147,6 +147,32 @@ TEST(ConsumerTrace, AliasTemplateReferencedViaDependentMemberAccess) {
       << "the alias's underlying template must also be traced";
 }
 
+TEST(ConsumerTrace, ReferenceInTheConsumersOwnHeaderIsTraced) {
+  // The consumer source names nothing of the library: the reference to
+  // `internal::Elem` is written in helper.h, the consumer's own header. That
+  // is a real use — the consumer reaches the library through the same imports
+  // whichever of its files does the naming — so the entity must be exported.
+  // (This is how gmock uses gtest's `internal::ElemFromList`: in
+  // gmock/internal/gmock-internal-utils.h, not in the .cc passed as the
+  // consumer source.)
+  auto producer = data_path("consumerhdr_lib/producer.h");
+  auto consumer = data_path("consumerhdr_lib/consumer.cc");
+  auto reachable =
+      trace_consumer_sources({producer}, {consumer}, "consumerhdr_lib",
+                             {"-I", gDataDir});
+  auto it = reachable.find(producer);
+  ASSERT_NE(it, reachable.end())
+      << "a reference in the consumer's own header must reach the producer";
+  EXPECT_TRUE(std::find(it->second.begin(), it->second.end(),
+                        "consumerhdr_lib::internal::Elem") != it->second.end())
+      << "an entity used only from the consumer's own header must be traced";
+  EXPECT_TRUE(std::find(it->second.begin(), it->second.end(),
+                        "consumerhdr_lib::internal::OnlyUsedInternally") ==
+              it->second.end())
+      << "an entity used only inside the producer header is not a consumer "
+         "use and must stay internal";
+}
+
 TEST(ConsumerTrace, ForwardDeclaredOnlyEntityNotExported) {
   // The library forward-declares `Foo` (a consumer defines it itself). It must
   // NOT be traced/exported: exporting the module's forward declaration would

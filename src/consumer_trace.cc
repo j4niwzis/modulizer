@@ -312,6 +312,21 @@ trace_consumer_sources(
   std::map<std::string, std::set<std::string>> internal_by_header =
       collect_internal_by_header(header_paths, extra_args, /*verbose=*/false);
 
+  // The headers being rewritten, so a reference written in one of them is not
+  // mistaken for a consumer's use of it. Everything else a consumer pulls in
+  // — its own helper headers, and another library's headers when several are
+  // converted in one run (gmock's, while gtest is the producer) — is consumer
+  // code: it reaches the library through the same imports and its references
+  // have to be exported just the same. Both the path as given and its
+  // canonical form, since a file entry may carry either.
+  std::set<std::string> producer_files;
+  for (auto &h : header_paths) {
+    producer_files.insert(h);
+    std::error_code ec;
+    auto c = std::filesystem::weakly_canonical(std::filesystem::path(h), ec);
+    if (!ec) producer_files.insert(c.string());
+  }
+
   std::map<std::string, std::set<std::string>> reachable;
   {
     std::vector<std::map<std::string, std::set<std::string>>> partials(
@@ -323,10 +338,11 @@ trace_consumer_sources(
           auto &local = partials[i];
           auto &defined = consumer_defined[i];
           return std::make_unique<VisitorFrontendActionFactory>(
-              [&internal_by_header, &local, &defined](
+              [&internal_by_header, &local, &defined, &producer_files](
                   clang::CompilerInstance &ci) {
                 return std::make_unique<ConsumerRefConsumer>(
-                    ci.getSourceManager(), internal_by_header, local, &defined);
+                    ci.getSourceManager(), internal_by_header, local, &defined,
+                    &producer_files);
               });
         },
         [&](std::size_t i, const std::string &consumer) {

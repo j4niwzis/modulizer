@@ -60,7 +60,19 @@ export std::vector<std::string> cross_module_fwd_declared_fqns(
   std::vector<std::string> out;
   for (auto &[fqn, files] : fwd_files) {
     auto it = complete_files.find(fqn);
-    if (it == complete_files.end()) continue;  // opaque, never defined
+    if (it == complete_files.end()) {
+      // Declared by the library, defined by none of its headers: whatever
+      // defines it does so outside the module — an implementation unit, or a
+      // consumer (gtest friend-declares `internal::TestEventListenersAccessor`
+      // so its own unit test can define it and reach the private members).
+      // That definition is in the global module, so this declaration has to be
+      // `extern "C++"` too; a module-attached declaration would make the two a
+      // different entity ("declaration in the global module follows
+      // declaration in module X"). A type that is never defined anywhere is
+      // unaffected in practice — nothing can conflict with it.
+      out.push_back(fqn);
+      continue;
+    }
     for (auto &f : files) {
       if (!it->second.count(f)) {  // fwd-declared in a file that does not define it
         out.push_back(fqn);
