@@ -464,8 +464,8 @@ ConsumerTrace trace_consumers(
               std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
               consumers.push_back(std::make_unique<ConsumerRefConsumer>(
                   ci.getSourceManager(), internal_by_header, local, &defined));
-              consumers.push_back(
-                  make_traverse_consumer<SystemHeaderRefFinder>(sys));
+              consumers.push_back(make_traverse_consumer<SystemHeaderRefFinder>(
+                  &ci.getPreprocessor().getHeaderSearchInfo(), sys));
               return make_combined_consumer(std::move(consumers));
             });
       });
