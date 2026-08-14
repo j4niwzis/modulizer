@@ -431,3 +431,32 @@ TEST(ConsumerRewrite, BuildIncludeModuleMap) {
   EXPECT_TRUE(it->second.macro_header.empty())
       << "a header with no macros must have no macro file";
 }
+
+TEST(ConsumerRewrite, ReAddedSystemIncludesComeBeforeTheImports) {
+  // A re-added C header is not always the C library's own: a standard library
+  // ships wrappers under the C names — libstdc++'s `math.h` includes `<cmath>`.
+  // Included after `import std.compat;` such a header redeclares what the
+  // module already provided, and the translation unit fails inside the standard
+  // library itself:
+  //
+  //   ext/type_traits.h: error: type alias template redefinition with
+  //                      different types
+  //
+  // Seen first, the textual declarations are in place before the module arrives
+  // and the two agree.
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.include_to_module = {{"lib/lib.h", {"lib", ""}}};
+  cfg.required_system_includes = {"math.h"};
+  std::string src =
+      "#include \"lib/lib.h\"\n"
+      "double f() { return NAN; }\n";
+
+  auto out = rewrite_consumer_source(src, cfg);
+  auto inc = out.find("#include <math.h>");
+  auto imp = out.find("import std.compat;");
+  ASSERT_NE(inc, std::string::npos);
+  ASSERT_NE(imp, std::string::npos);
+  EXPECT_LT(inc, imp)
+      << "a re-added C header must precede the standard library import";
+}

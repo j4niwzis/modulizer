@@ -164,6 +164,29 @@ export std::string rewrite_consumer_source(
   }
 
   std::string block;
+
+  // Usage-based C-header re-add: `import std.compat;` cannot provide the C
+  // library's macros (errno, assert, INT_MAX, ...) or POSIX declarations/types
+  // (ssize_t, pthread_*) that consumers historically got transitively through
+  // the library headers. The per-consumer set of required C includes is traced
+  // from the consumer's source (trace_consumer_system_includes) and emitted
+  // here — no symbol regexes, no macro-name heuristics.
+  //
+  // BEFORE the imports, not after. A C header may be a standard library wrapper
+  // rather than the C library's own — libstdc++ ships `math.h` that includes
+  // `<cmath>` — and once `import std.compat;` has been seen, including it again
+  // textually redeclares what the module already provided:
+  //
+  //   ext/type_traits.h: error: type alias template redefinition with
+  //                      different types
+  //
+  // Seen first, the textual declarations are already in place when the module
+  // arrives and the two agree. The whole block is emitted at one insertion
+  // point, so this is only about the order within it.
+  for (auto &inc : options.required_system_includes)
+    if (!existing_std_includes.count(inc))
+      block += std::format("#include <{}>\n", inc);
+
   if (options.import_std) {
     // std.compat (rather than std) also provides the C library's global names
     // the consumer code may rely on.
@@ -181,16 +204,6 @@ export std::string rewrite_consumer_source(
       block += std::format("import {};\n", m);
   for (auto &mh : pending_macros)
     block += std::format("#include \"{}\"\n", mh);
-
-  // Usage-based C-header re-add: `import std.compat;` cannot provide the C
-  // library's macros (errno, assert, INT_MAX, ...) or POSIX declarations/types
-  // (ssize_t, pthread_*) that consumers historically got transitively through
-  // the library headers. The per-consumer set of required C includes is traced
-  // from the consumer's source (trace_consumer_system_includes) and emitted
-  // here — no symbol regexes, no macro-name heuristics.
-  for (auto &inc : options.required_system_includes)
-    if (!existing_std_includes.count(inc))
-      block += std::format("#include <{}>\n", inc);
 
   if (!block.empty()) {
     if (insert_at)
