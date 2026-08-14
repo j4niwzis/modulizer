@@ -245,7 +245,19 @@ trace_consumer_sources(
 // instead of its on-disk form — used to trace consumers an earlier pass already
 // converted to imports (see demodularize_consumer_source), which no longer
 // parse as they stand.
-export std::map<std::string, std::set<std::string>> trace_consumer_modules(
+// Both consumer traces answered in one parse per consumer. They ask different
+// questions of the same translation unit — same files, same flags, same
+// virtual sources — and profiling puts essentially the whole runtime in the
+// parse, so answering them separately parsed every consumer twice for nothing.
+export struct ConsumerTrace {
+  // Consumer path -> paths of the library headers whose internal entities it
+  // references (whose modules it must therefore import).
+  std::map<std::string, std::set<std::string>> producers_by_consumer;
+  // Consumer path -> system C/POSIX include names it must get back.
+  std::map<std::string, std::set<std::string>> system_includes_by_consumer;
+};
+
+export ConsumerTrace trace_consumers(
     const std::vector<std::string> &header_paths,
     const std::vector<std::string> &consumer_sources,
     llvm::StringRef library_name,
@@ -258,16 +270,28 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
   std::vector<std::map<std::string, std::set<std::string>>> partials(
       consumer_sources.size());
   std::vector<std::set<std::string>> consumer_defined(consumer_sources.size());
+  std::vector<std::set<std::string>> system_includes(consumer_sources.size());
   parallel_parse(
       consumer_sources, extra_args,
       ParseOptions{/*delayed_template_parsing=*/true, virtual_sources},
       [&](std::size_t i, const std::string &) {
         auto &local = partials[i];
         auto &defined = consumer_defined[i];
+        auto &sys = system_includes[i];
         return std::make_unique<VisitorFrontendActionFactory>(
-            [&internal_by_header, &local, &defined](clang::CompilerInstance &ci) {
-              return std::make_unique<ConsumerRefConsumer>(
-                  ci.getSourceManager(), internal_by_header, local, &defined);
+            [&internal_by_header, &local, &defined,
+             &sys](clang::CompilerInstance &ci) {
+              // The macro-expansion half is a preprocessor callback, so it has
+              // to ride on this same parse — which is why the two analyses
+              // share a parse rather than a cached AST.
+              ci.getPreprocessor().addPPCallbacks(
+                  std::make_unique<SystemHeaderUsageTracer>(ci, sys));
+              std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+              consumers.push_back(std::make_unique<ConsumerRefConsumer>(
+                  ci.getSourceManager(), internal_by_header, local, &defined));
+              consumers.push_back(
+                  make_traverse_consumer<SystemHeaderRefFinder>(sys));
+              return make_combined_consumer(std::move(consumers));
             });
       });
 
@@ -278,7 +302,7 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
   for (auto &defined : consumer_defined)
     any_consumer_defined.insert_range(defined);
 
-  std::map<std::string, std::set<std::string>> result;
+  ConsumerTrace result;
   for (std::size_t i = 0; i < consumer_sources.size(); ++i) {
     std::set<std::string> mods;
     for (auto &[producer, fqns] : partials[i]) {
@@ -290,9 +314,25 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
         }
       if (any) mods.insert(producer);
     }
-    if (!mods.empty()) result[consumer_sources[i]] = std::move(mods);
+    if (!mods.empty())
+      result.producers_by_consumer[consumer_sources[i]] = std::move(mods);
+    if (!system_includes[i].empty())
+      result.system_includes_by_consumer[consumer_sources[i]] =
+          std::move(system_includes[i]);
   }
   return result;
+}
+
+// The producer half on its own, for callers that want only that question.
+export std::map<std::string, std::set<std::string>> trace_consumer_modules(
+    const std::vector<std::string> &header_paths,
+    const std::vector<std::string> &consumer_sources,
+    llvm::StringRef library_name,
+    const std::vector<std::string> &extra_args,
+    const std::map<std::string, std::string> *virtual_sources = nullptr) {
+  return trace_consumers(header_paths, consumer_sources, library_name,
+                         extra_args, virtual_sources)
+      .producers_by_consumer;
 }
 
 // For every consumer source, the set of system C/POSIX include names (e.g.

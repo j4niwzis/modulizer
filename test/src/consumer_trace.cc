@@ -396,3 +396,46 @@ TEST(ConsumerTrace, VirtualSourcesCoverIncludedConsumers) {
       << "a reconstruction of an included consumer must apply to this parse";
   EXPECT_NE(it->second.find(producer), it->second.end());
 }
+
+TEST(ConsumerTrace, CombinedTraceMatchesTheSeparatePasses) {
+  // The two consumer traces ask different questions of the same translation
+  // unit — same files, same flags, same virtual sources — and profiling puts
+  // essentially the whole runtime of a --consumers run in the parse, so
+  // answering them separately parsed every consumer twice. Sharing the parse
+  // has to return precisely what the two passes returned on their own.
+  auto lib = data_path("sysuse_lib/prod.h");
+  auto use = data_path("sysuse_lib/use.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto separate_modules =
+      trace_consumer_modules({lib}, {use}, "sysuse_lib", extra_args);
+  auto separate_includes = trace_consumer_system_includes({use}, extra_args);
+  auto combined = trace_consumers({lib}, {use}, "sysuse_lib", extra_args);
+
+  EXPECT_EQ(combined.producers_by_consumer, separate_modules);
+  EXPECT_EQ(combined.system_includes_by_consumer, separate_includes);
+  // Pin the values too, so agreement between two empty maps cannot pass.
+  auto mit = combined.producers_by_consumer.find(use);
+  ASSERT_NE(mit, combined.producers_by_consumer.end());
+  EXPECT_NE(mit->second.count(lib), 0u);
+  auto iit = combined.system_includes_by_consumer.find(use);
+  ASSERT_NE(iit, combined.system_includes_by_consumer.end());
+  EXPECT_NE(iit->second.count("stdio.h"), 0u);
+}
+
+TEST(ConsumerTrace, CombinedTraceHonoursVirtualSources) {
+  // Sharing the parse must not lose the reconstruction behaviour either.
+  auto producer = data_path("reconv_lib/producer.h");
+  auto consumer = data_path("reconv_lib/consumer_converted.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  std::map<std::string, ConsumerHeaderInfo> include_to_module = {
+      {"reconv_lib/producer.h", {"reconv_lib.producer", ""}}};
+  std::map<std::string, std::string> virtual_sources = {
+      {consumer,
+       demodularize_consumer_source(read_file(consumer), include_to_module)}};
+  auto combined = trace_consumers({producer}, {consumer}, "reconv_lib",
+                                  extra_args, &virtual_sources);
+  auto it = combined.producers_by_consumer.find(consumer);
+  ASSERT_NE(it, combined.producers_by_consumer.end());
+  EXPECT_NE(it->second.find(producer), it->second.end());
+}

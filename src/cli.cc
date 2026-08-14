@@ -584,17 +584,17 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
     }
 
     if (any_library_include && !header_paths.empty()) {
-      auto traced =
-          trace_consumer_modules(header_paths, consumer_paths, library_name,
-                                 all_extra, &virtual_sources);
-      for (auto &[c, producers] : traced) {
+      // One parse per consumer answers both questions.
+      auto traced = trace_consumers(header_paths, consumer_paths, library_name,
+                                    all_extra, &virtual_sources);
+      for (auto &[c, producers] : traced.producers_by_consumer) {
         std::set<std::string> mods;
         for (auto &hp : producers)
           mods.insert(derive_module_name(hp, library_name));
         traced_modules_by_consumer[c] = std::move(mods);
       }
-      system_includes_by_consumer = trace_consumer_system_includes(
-          consumer_paths, all_extra, &virtual_sources);
+      system_includes_by_consumer =
+          std::move(traced.system_includes_by_consumer);
     }
   }
 
