@@ -157,6 +157,9 @@ GmfAndImports classify_includes(
       // system include paths available, every real header resolves; anything
       // unresolvable (e.g. inactive libc++ __cxx03 internals) is dropped.
       if (inc.transitive) {
+        // A standard-library private header: never emitted (its use, if any,
+        // was credited to its public ancestor by used_public_ancestors).
+        if (inc.system_internal) continue;
         if (!inc.is_quoted) {
           auto resolved =
               resolve_include(inc.path, header_path.str(), options.extra_args);
@@ -665,6 +668,12 @@ export HeaderRewriteResult rewrite_header(
 
   // Classify includes into GMF includes (system/third-party) vs purview
   // imports (library headers replaced by `import`).
+  // A declaration the module uses may be declared in a standard-library
+  // private header; that header is never emitted, so credit the use to the
+  // public header that owns it (see used_public_ancestors).
+  for (auto &a : used_public_ancestors(includes, header_path, options.extra_args,
+                                       used_headers))
+    used_headers.insert(a);
   auto [gmf_incs, purview_imports] = classify_includes(
       includes, auto_imports, library_name, module_name, header_path, options,
       imported_modules, used_headers, std_import_guard);
@@ -685,6 +694,9 @@ export HeaderRewriteResult rewrite_header(
 
 export struct SourceRewriteResult {
   std::string content;
+  // Dual-mode only: the module implementation unit that wraps `content`.
+  // Empty when the source is rewritten into a module unit in place.
+  std::string module_content;
   std::string module_name;
   std::vector<std::pair<std::string, std::string>> imported_modules;
 };
@@ -707,7 +719,14 @@ export SourceRewriteResult rewrite_source(
     const std::set<std::string> &interface_modules = {},
     const std::vector<std::string> &fwd_declared_fqns = {},
     bool hyphen_macros = false,
-    const std::string &umbrella_module = {}) {
+    const std::string &umbrella_module = {},
+    // Non-empty switches on dual mode: the source keeps its includes (guarded
+    // by this macro) so it still compiles as a plain translation unit, and the
+    // module implementation unit is emitted separately in `module_content`.
+    const std::string &use_modules_macro = {},
+    // Path of the body file as seen from the module unit (defaults to the
+    // CLI layout: `impl/<stem>.cc` included from `impl/modules/<stem>.cc`).
+    const std::string &body_include = {}) {
 
   SourceRewriteResult result;
   result.module_name = module_name.str();
@@ -745,7 +764,21 @@ export SourceRewriteResult rewrite_source(
       [&used_headers](clang::CompilerInstance &) {
         return make_traverse_consumer<UsedHeadersVisitor>(used_headers);
       });
-  tool.run(&used_factory);
+  // A failed parse yields no AST, so `used_headers` stays empty and every
+  // transitive system include is filtered out of the global module fragment —
+  // the unit then fails to compile on declarations it demonstrably uses
+  // (`getcwd`, `mkdir`, ...). That is silent otherwise: say so.
+  if (tool.run(&used_factory) != 0)
+    llvm::errs() << "warning: " << source_path
+                 << " did not parse cleanly; transitive system includes cannot "
+                    "be resolved and may be missing from the global module "
+                    "fragment\n";
+
+  // See rewrite_header: a use inside a standard-library private header counts
+  // as a use of the public header that owns it.
+  for (auto &a : used_public_ancestors(includes, source_path, extra_args,
+                                       used_headers))
+    used_headers.insert(a);
 
   // Quoted `{library}/...` includes auto-derive their module name, mirroring
   // rewrite_header's auto-import behavior.
@@ -759,6 +792,17 @@ export SourceRewriteResult rewrite_source(
   std::vector<IncludeDirective> gmf_incs;
   std::vector<std::string> imports;
   std::vector<ModPoint> deletions;
+
+  // An include the module unit no longer needs (it became an import, moved to
+  // the global module fragment, or is provided by an imported module). In
+  // module-unit mode it is deleted from the body; in dual mode the body stays
+  // compilable on its own, so the directive is kept and guarded instead.
+  bool dual = !use_modules_macro.empty();
+  std::vector<std::pair<unsigned, unsigned>> guarded_spans;
+  auto drop_include = [&](const IncludeDirective &inc) {
+    if (dual) guarded_spans.push_back({inc.offset, inc.end_offset});
+    else deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+  };
 
   // Collect member/entity definitions that must be `extern "C++"` because the
   // interface declares them that way (cross-module forward-declared entities).
@@ -792,6 +836,9 @@ export SourceRewriteResult rewrite_source(
     // this source body: they are never deleted. Only used transitive system
     // headers are emitted in the GMF.
     if (inc.transitive) {
+      // See classify_includes: standard-library private headers are never
+      // emitted, only the public header that owns them.
+      if (inc.system_internal) continue;
       if (!inc.is_quoted) {
         auto resolved = resolve_include(inc.path, source_path.str(), extra_args);
         if (!keep_transitive_system_include(resolved, inc.path,
@@ -853,7 +900,7 @@ export SourceRewriteResult rewrite_source(
         imports.push_back(replaced_mod);
         imported_mods.insert(replaced_mod);
       }
-      deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+      drop_include(inc);
       continue;
     }
 
@@ -919,7 +966,7 @@ export SourceRewriteResult rewrite_source(
     // an implementation unit, so it is dropped entirely (not imported, not
     // kept in the GMF).
     if (is_library && mname == module_name.str()) {
-      deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+      drop_include(inc);
       continue;
     }
 
@@ -929,12 +976,12 @@ export SourceRewriteResult rewrite_source(
         auto rc = classify_replacement(inc, source_path, extra_args,
                                        imported_mods, module_replaces);
         if (rc.other_replaced || rc.std_replaced) {
-          deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+          drop_include(inc);
           continue;
         }
         gmf_incs.push_back(inc);
       }
-      deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+      drop_include(inc);
       continue;
     }
 
@@ -945,12 +992,12 @@ export SourceRewriteResult rewrite_source(
                    << "' in " << source_path
                    << " cannot be converted to an import; kept in GMF\n";
       gmf_incs.push_back(inc);
-      deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+      drop_include(inc);
       continue;
     }
     imports.push_back(mname);
     imported_mods.insert(mname);
-    deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+    drop_include(inc);
   }
 
   std::vector<std::string> unique_imports;
@@ -958,6 +1005,30 @@ export SourceRewriteResult rewrite_source(
     std::set<std::string> seen;
     for (auto &m : imports)
       if (seen.insert(m).second) unique_imports.push_back(m);
+  }
+
+  // Dual mode: the dropped includes stay in the body, wrapped in
+  // `#ifndef LIB_USE_MODULES`, so the file still compiles as a plain
+  // translation unit. Directives separated only by whitespace share one guard,
+  // so the usual include block at the top of a source gets a single one.
+  if (dual && !guarded_spans.empty()) {
+    std::ranges::sort(guarded_spans);
+    std::vector<std::pair<unsigned, unsigned>> runs;
+    for (auto &span : guarded_spans) {
+      auto gap = runs.empty()
+          ? std::string::npos
+          : original.find_first_not_of(" \t\r\n", runs.back().second);
+      if (!runs.empty() && (gap == std::string::npos || gap >= span.first))
+        runs.back().second = span.second;
+      else
+        runs.push_back(span);
+    }
+    for (auto &run : runs) {
+      deletions.push_back(
+          {run.first, 0, std::format("#ifndef {}\n", use_modules_macro)});
+      deletions.push_back(
+          {run.second, 0, std::format("#endif  // {}\n", use_modules_macro)});
+    }
   }
 
   auto body = apply_mods(original, deletions);
@@ -1008,6 +1079,28 @@ export SourceRewriteResult rewrite_source(
   if (import_std) out += std::format("import {};\n", std_module_name(module_replaces));
   for (auto &m : unique_imports)
     out += std::format("import {};\n", m);
+
+  if (dual) {
+    // `module;` has to be the first token of the translation unit — clang
+    // rejects it even behind an `#ifdef` that is taken — so the two modes
+    // cannot share a file. The module implementation unit is a preamble that
+    // textually includes the body, which compiles out its own includes because
+    // this unit defines the use-modules macro.
+    out += std::format("\n#ifndef {}\n#define {} 1\n#endif\n",
+                       use_modules_macro, use_modules_macro);
+    out += std::format("#include \"{}\"\n",
+                       body_include.empty()
+                           ? std::format("../{}.cc", fs_stem)
+                           : body_include);
+    result.module_content = std::move(out);
+    std::string dual_body;
+    if (extern_cxx) dual_body += "extern \"C++\" {\n";
+    dual_body += body;
+    if (extern_cxx) dual_body += "}  // extern \"C++\"\n";
+    result.content = std::move(dual_body);
+    return result;
+  }
+
   if (extern_cxx) out += "extern \"C++\" {\n";
   out += body;
   if (extern_cxx) out += "}  // extern \"C++\"\n";

@@ -175,6 +175,13 @@ export struct IncludeDirective {
   bool skip_gmf = false;
   bool transitive = false;
   std::string parent_resolved;  // resolved path of the header that included it
+  // Discovered inside a standard-library/system header (`<bits/types.h>` seen
+  // through `<stdio.h>`). Such a header is an implementation detail of the
+  // standard library it came from and is never emitted; `public_ancestor` is
+  // the resolved path of the system header the source can legitimately include
+  // to obtain it.
+  bool system_internal = false;
+  std::string public_ancestor;
 };
 
 export std::vector<IncludeDirective> parse_includes(const std::string &src) {
@@ -243,6 +250,19 @@ export std::vector<std::string> get_system_include_dirs() {
   }
   std::filesystem::remove(tmp);
   return dirs;
+}
+
+// Whether a resolved header path lies in one of the compiler's own include
+// directories, i.e. it is a standard-library or system header rather than one
+// of the library being modularized.
+export bool resolved_in_system_dir(const std::string &resolved) {
+  auto rp = std::filesystem::path(resolved).lexically_normal().string();
+  for (auto &dir : get_system_include_dirs()) {
+    if (dir.empty()) continue;
+    auto dp = std::filesystem::path(dir).lexically_normal().string();
+    if (rp.starts_with(dp)) return true;
+  }
+  return false;
 }
 
 export std::string resolve_include(llvm::StringRef inc_path,
@@ -387,23 +407,50 @@ export void expand_include_closure(
     if (is_xmacro_include(inc.path)) continue;
     if (inc.path.contains("/custom/")) continue;
     if (!visited.insert(inc.path).second) continue;
-    if (!inc.is_quoted) {
-      // Only expand system headers that live in the include path; stdlib
-      // headers stay as plain candidates.
-      if (resolve_include(inc.path, base_path, extra_args).empty()) continue;
-    }
     auto resolved = resolve_include(inc.path, base_path, extra_args);
     if (resolved.empty()) continue;
     auto dep_text = read_file(resolved);
     auto dep_includes = parse_includes(dep_text);
     annotate_guards(dep_text, dep_includes);
+    // Everything reached from inside a standard-library/system header is that
+    // library's own business: its private headers and private guard conditions
+    // (`<bits/alltypes.h>`, `<__algorithm/sort.h>`, `#if __building_module(std)`)
+    // must never be emitted, or the output is pinned to the exact libc++ /
+    // libstdc++ / musl it was generated against. They are still walked, because
+    // a declaration the body uses may be declared in one of them, and the use
+    // has to be credited to the public header that owns it.
+    bool inside_system =
+        inc.system_internal || (!inc.is_quoted && resolved_in_system_dir(resolved));
     for (auto &di : dep_includes) {
       if (is_xmacro_include(di.path)) continue;
       di.transitive = true;
       di.parent_resolved = resolved;
+      if (inside_system) {
+        di.system_internal = true;
+        di.public_ancestor = inc.system_internal ? inc.public_ancestor : resolved;
+      }
       includes.push_back(std::move(di));
     }
   }
+}
+
+// The public system headers that own a declaration the body uses but that
+// declare it in one of their private headers (`size_t` in `<bits/types.h>`,
+// reached through `<stddef.h>`). The private header is never emitted, so the
+// use is credited to its public ancestor instead: unioned into `used_headers`,
+// it keeps the ancestor in the global module fragment.
+export std::set<std::string> used_public_ancestors(
+    const std::vector<IncludeDirective> &includes, llvm::StringRef base_path,
+    const std::vector<std::string> &extra_args,
+    const std::set<std::string> &used_headers) {
+  std::set<std::string> out;
+  for (auto &inc : includes) {
+    if (!inc.system_internal || inc.public_ancestor.empty()) continue;
+    auto resolved = resolve_include(inc.path, base_path, extra_args);
+    if (!resolved.empty() && used_headers.count(resolved))
+      out.insert(inc.public_ancestor);
+  }
+  return out;
 }
 
 // Drop transitive system includes whose parent header is also emitted in the

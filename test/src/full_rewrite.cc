@@ -196,6 +196,75 @@ TEST(FullRewrite, ExternCxxWhenEnabled) {
   EXPECT_NE(r.content.find("}  // extern \"C++\""), std::string::npos);
 }
 
+// Dual mode: the source stays a plain translation unit and the module
+// implementation unit becomes a separate preamble file that includes it.
+// `module;` has to be the first token of a translation unit (clang rejects it
+// even behind a taken `#ifdef`), so the two modes cannot share one file.
+TEST(FullRewrite, DualImplKeepsBodyCompilableAsPlainSource) {
+  auto r = rewrite_source(data_path("full_lib/impl.cc"), "full_lib.impl",
+                          {}, {}, false, false, {}, {}, {}, {}, false, {},
+                          /*use_modules_macro=*/"FULL_LIB_USE_MODULES");
+  EXPECT_EQ(r.content.find("module full_lib.impl;"), std::string::npos)
+      << "the body file is a plain translation unit, not a module unit";
+  EXPECT_EQ(r.content.find("module;"), std::string::npos)
+      << "the body file must not open a global module fragment";
+  EXPECT_NE(r.content.find("#include \"full_lib/a.h\""), std::string::npos)
+      << "the body keeps its includes so it still compiles on its own";
+  EXPECT_NE(r.content.find("#include <string>"), std::string::npos);
+  EXPECT_NE(r.content.find("#ifndef FULL_LIB_USE_MODULES"), std::string::npos)
+      << "the includes are guarded so the module unit can compile them out";
+  EXPECT_NE(r.content.find("#endif  // FULL_LIB_USE_MODULES"),
+            std::string::npos);
+  EXPECT_NE(r.content.find("std::string foo"), std::string::npos)
+      << "the body itself is unchanged";
+}
+
+TEST(FullRewrite, DualImplGuardsOneIncludeBlockOnce) {
+  auto r = rewrite_source(data_path("full_lib/impl.cc"), "full_lib.impl",
+                          {}, {}, false, false, {}, {}, {}, {}, false, {},
+                          "FULL_LIB_USE_MODULES");
+  auto count = [&](std::string_view needle) {
+    std::size_t n = 0;
+    for (std::size_t p = r.content.find(needle); p != std::string::npos;
+         p = r.content.find(needle, p + 1))
+      ++n;
+    return n;
+  };
+  EXPECT_EQ(count("#ifndef FULL_LIB_USE_MODULES"), 1u)
+      << "adjacent includes must share a single guard";
+  EXPECT_EQ(count("#endif  // FULL_LIB_USE_MODULES"), 1u);
+}
+
+TEST(FullRewrite, DualImplEmitsModuleUnitThatIncludesTheBody) {
+  auto r = rewrite_source(data_path("full_lib/impl.cc"), "full_lib.impl",
+                          {}, {}, false, false, {}, {}, {}, {}, false, {},
+                          "FULL_LIB_USE_MODULES");
+  auto &mc = r.module_content;
+  ASSERT_FALSE(mc.empty()) << "dual mode must emit a module unit";
+  EXPECT_EQ(mc.find("module;"), 0u)
+      << "the global module fragment must open the translation unit";
+  EXPECT_NE(mc.find("module full_lib.impl;"), std::string::npos);
+  EXPECT_EQ(mc.find("export module"), std::string::npos);
+  EXPECT_NE(mc.find("import full_lib.a;"), std::string::npos)
+      << "library includes still become imports in the module unit";
+  auto define_pos = mc.find("#define FULL_LIB_USE_MODULES 1");
+  auto include_pos = mc.find("#include \"../impl.cc\"");
+  EXPECT_NE(define_pos, std::string::npos)
+      << "the module unit compiles the body's includes out itself";
+  EXPECT_NE(include_pos, std::string::npos);
+  EXPECT_LT(define_pos, include_pos);
+  EXPECT_LT(mc.find("module full_lib.impl;"), define_pos)
+      << "the body is included in the module purview";
+  EXPECT_LT(mc.find("#include <string>"), mc.find("module full_lib.impl;"))
+      << "system includes stay in the global module fragment";
+}
+
+TEST(FullRewrite, ImplementationUnitHasNoModuleContentByDefault) {
+  auto r = rewrite_source(data_path("full_lib/impl.cc"), "full_lib.impl");
+  EXPECT_TRUE(r.module_content.empty())
+      << "without dual mode the rewrite stays a single module unit";
+}
+
 TEST(FullRewrite, HeaderInterfaceWithoutExternCxx) {
   auto r = rewrite_header(data_path("full_lib/a.h"), "full_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false});
   EXPECT_NE(r.cc_content.find("export module full_lib.a;"), std::string::npos);
@@ -927,4 +996,35 @@ TEST(FullRewrite, TemplateBodyScanRidingAnotherParseGivesTheSameResult) {
   EXPECT_EQ(folded.fwd_declared, standalone.fwd_declared);
   EXPECT_EQ(folded.aliases, standalone.aliases);
   EXPECT_EQ(folded.friend_pairs.size(), standalone.friend_pairs.size());
+}
+
+// Standard-conformance rules the export marker must respect. clang accepts the
+// violations below; they are ill-formed C++ and other implementations reject
+// them.
+TEST(FullRewrite, NoExportOnTemplateSpecializations) {
+  auto r = rewrite_header(data_path("spec_lib/a.h"), "spec_lib.a",
+                          RewriteOptions{.no_internal_filter = true});
+  auto &cc = r.h_content;
+  EXPECT_NE(cc.find("SPEC_LIB_EXPORT template <typename T>\nstruct Holder {"),
+            std::string::npos)
+      << "the primary template is exported";
+  EXPECT_EQ(cc.find("SPEC_LIB_EXPORT template <typename T>\nstruct Holder<T*>"),
+            std::string::npos)
+      << "[module.interface]/3: no export on a partial specialization";
+  EXPECT_EQ(cc.find("SPEC_LIB_EXPORT template <>"), std::string::npos)
+      << "[module.interface]/3: no export on an explicit specialization";
+  EXPECT_NE(cc.find("struct Holder<T*>"), std::string::npos)
+      << "the specialization itself is still emitted";
+  EXPECT_NE(cc.find("struct Holder<bool>"), std::string::npos);
+}
+
+TEST(FullRewrite, ExportPrecedesLinkageSpecification) {
+  auto r = rewrite_header(data_path("spec_lib/a.h"), "spec_lib.a",
+                          RewriteOptions{.no_internal_filter = true});
+  auto &cc = r.h_content;
+  EXPECT_NE(cc.find("SPEC_LIB_EXPORT extern \"C\" int spec_lib_answer"),
+            std::string::npos)
+      << "the export marker must precede the linkage-specification";
+  EXPECT_EQ(cc.find("extern \"C\" SPEC_LIB_EXPORT"), std::string::npos)
+      << "`extern \"C\" export` is ill-formed";
 }

@@ -92,6 +92,19 @@ module implementation units:
 - Implementation units are written under `out/impl/`; implementation-only
   modules get an empty `export module X;` interface so clang can compile the
   module.
+- `--dual-impl` keeps the implementation files usable *both* ways. `module;`
+  must be the first token of a translation unit — clang rejects it even behind
+  a taken `#ifdef` — so one file cannot serve both modes, and the rewrite is
+  split in two:
+  - `out/impl/<stem>.cc` is a plain translation unit: it keeps its includes,
+    wrapped in `#ifndef LIB_USE_MODULES`, and is otherwise the original body.
+  - `out/impl/modules/<stem>.cc` is the module implementation unit: global
+    module fragment, `module X;`, the imports, and then a textual include of
+    the body (with `LIB_USE_MODULES` defined, so the body's own includes
+    compile out).
+
+  A classic build compiles the first file and uses the original headers; a
+  modules build compiles the second. The body exists once either way.
 
 ### Wrapper generation (`--wrapper`)
 

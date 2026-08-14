@@ -180,6 +180,13 @@ llvm::cl::opt<std::string> MacroPrefixOpt(
                    "LIB_IMPORT_STD / LIB_USE_IMPORT_STD / LIB_EXPORT macros; "
                    "defaults to the uppercased library name"));
 
+llvm::cl::opt<bool> DualImplOpt(
+    "dual-impl",
+    llvm::cl::desc("Keep implementation files usable as plain translation "
+                   "units: impl/<stem>.cc keeps its includes (guarded by "
+                   "LIB_USE_MODULES) and impl/modules/<stem>.cc is the module "
+                   "implementation unit that includes it"));
+
 llvm::cl::opt<bool> HyphenMacrosOpt(
     "hyphen-macros",
     llvm::cl::desc("Name generated macro headers <stem>-macros.h instead of "
@@ -954,6 +961,14 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     bool ok = false;
   };
   std::vector<ImplOutcome> impl_outcomes(source_paths.size());
+  // Dual mode guards the body's includes with the same LIB_USE_MODULES macro
+  // the generated headers use, so one define switches the whole library over.
+  std::string dual_impl_macro;
+  if (DualImplOpt.getValue())
+    dual_impl_macro = (MacroPrefixOpt.getValue().empty()
+                           ? macro_prefix(library_name)
+                           : macro_prefix(MacroPrefixOpt.getValue())) +
+                      "_USE_MODULES";
   // The per-source rewrite (clang parse + include analysis) runs in parallel;
   // the empty-interface decision and file writes stay sequential because they
   // mutate shared interface_modules.
@@ -977,7 +992,8 @@ export inline int run_full_rewrite(int argc, const char **argv) {
                             fwd_declared_fqns, HyphenMacrosOpt.getValue(),
                             WrapperModuleOpt.getValue()
                                 ? std::format("{}.umbrella", library_name)
-                                : std::string{});
+                                : std::string{},
+                            dual_impl_macro);
     o.ok = !r.content.empty();
     o.r = std::move(r);
   });
@@ -1010,8 +1026,26 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     std::string cc_path = std::format("{}/impl/{}.cc",
         OutputDirOpt.getValue(), fs_stem);
     if (!write_file(cc_path, o.r.content)) return 1;
-    llvm::outs() << "Generated " << cc_path
-                 << " (module implementation unit)\n";
+    if (o.r.module_content.empty()) {
+      llvm::outs() << "Generated " << cc_path
+                   << " (module implementation unit)\n";
+    } else {
+      // Dual mode: cc_path is a plain translation unit; the module
+      // implementation unit that includes it lives one level down.
+      auto mod_dir = std::filesystem::path(OutputDirOpt.getValue()) /
+                     "impl" / "modules";
+      std::error_code ec;
+      std::filesystem::create_directories(mod_dir, ec);
+      if (ec) {
+        llvm::errs() << "error: " << ec.message() << " (" << mod_dir << ")\n";
+        return 1;
+      }
+      std::string mod_path = std::format("{}/impl/modules/{}.cc",
+          OutputDirOpt.getValue(), fs_stem);
+      if (!write_file(mod_path, o.r.module_content)) return 1;
+      llvm::outs() << "Generated " << cc_path << " + " << mod_path
+                   << " (dual-mode implementation unit)\n";
+    }
   }
 
   // Wrapper-module mode: generate a `<lib>` facade module that imports the

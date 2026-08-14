@@ -15,15 +15,6 @@ import std;
 // True when `resolved` (an absolute path) lives under one of the compiler's
 // system include directories — i.e. it is a third-party/system header, not a
 // project-local sibling library header.
-export bool resolved_in_system_dir(const std::string &resolved) {
-  auto rp = std::filesystem::path(resolved).lexically_normal().string();
-  for (auto &dir : get_system_include_dirs()) {
-    if (dir.empty()) continue;
-    auto dp = std::filesystem::path(dir).lexically_normal().string();
-    if (rp.starts_with(dp)) return true;
-  }
-  return false;
-}
 
 // Result of classifying a quoted (non-`custom/`) library include: whether it is
 // a library header that must become an import, and the module it maps to.
