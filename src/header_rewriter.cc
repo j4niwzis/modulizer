@@ -460,6 +460,48 @@ std::string assemble_interface_cc(
 
 }  // namespace
 
+// Which of `macros` the rewritten header still defines FOR ITSELF, so that the
+// macros file's early copy has to be dropped before the header is included
+// (see assemble_interface_cc).
+//
+// Keyed on each macro's definition as written, never on its name alone. A macro
+// defined in one branch of a conditional and again in the other
+//
+//   #ifdef __has_include
+//   #define HAS_INCLUDE __has_include
+//   #else
+//   #define HAS_INCLUDE(...) 0
+//   #endif
+//
+// leaves the branch that was NOT taken behind in the header once the taken one
+// is hoisted into the macros file. Reading that unreachable definition as a
+// redefinition would `#undef` the macros file's copy with nothing left to
+// restore it, and every use in the header fails to compile with "function-like
+// macro is not defined".
+export std::vector<std::string> macros_redefined_by_header(
+    const std::string &hdr, const std::vector<MacroRec> &macros) {
+  std::vector<std::string> out;
+  for (auto &m : macros) {
+    if (m.name.empty()) continue;
+    std::string_view def(m.body);
+    while (!def.empty() && (def.back() == '\n' || def.back() == '\r'))
+      def.remove_suffix(1);
+    if (def.empty()) continue;
+    for (std::size_t pos = hdr.find(def); pos != std::string::npos;
+         pos = hdr.find(def, pos + 1)) {
+      // At the start of a line, so a definition quoted inside another macro's
+      // body does not count as the header defining it.
+      auto ls = hdr.rfind('\n', pos);
+      auto first =
+          hdr.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1);
+      if (first != pos) continue;
+      out.push_back(m.name);
+      break;
+    }
+  }
+  return out;
+}
+
 export HeaderRewriteResult rewrite_header(
     llvm::StringRef header_path,
     llvm::StringRef module_name,
@@ -716,23 +758,7 @@ export HeaderRewriteResult rewrite_header(
   // assemble_interface_cc).
   std::vector<std::string> redefined_macros;
   if (!result.macros_content.empty()) {
-    for (auto &m : export_macros) {
-      if (m.name.empty()) continue;
-      auto needle = std::format("#define {}", m.name);
-      for (std::size_t pos = hdr.find(needle); pos != std::string::npos;
-           pos = hdr.find(needle, pos + 1)) {
-        // A definition of this very macro, not of one whose name merely starts
-        // with it, and at the start of a line.
-        auto after = pos + needle.size();
-        if (after < hdr.size() && (is_ident_char(hdr[after]) || hdr[after] == '_'))
-          continue;
-        auto ls = hdr.rfind('\n', pos);
-        auto first = hdr.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1);
-        if (first != pos) continue;
-        redefined_macros.push_back(m.name);
-        break;
-      }
-    }
+    redefined_macros = macros_redefined_by_header(hdr, export_macros);
   }
 
   result.cc_content = assemble_interface_cc(

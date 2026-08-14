@@ -1759,6 +1759,49 @@ TEST(HeaderRewrite, MovesPublicMacrosToMacrosFileKeepsPrivate) {
       << "the header body must still contain its inline code";
 }
 
+TEST(HeaderRewrite, UndefsTheEarlyCopyOnlyOfMacrosTheHeaderRedefines) {
+  // The macros file is included at the top of the GMF, before the standard
+  // library, so a macro derived from a feature-test macro is computed there
+  // against the wrong answer; the header's own definition is the correct one
+  // and the early copy is #undef'd immediately before including the header.
+  //
+  // Which macros that applies to must be decided by DEFINITION, not by name.
+  // A macro defined in both branches of a conditional is re-established by the
+  // header whichever branch is taken. A macro whose taken branch was hoisted
+  // into the macros file is not: what remains in the header is the branch that
+  // is never reached, and undefining on the strength of it leaves the macro
+  // undefined for every use in the header.
+  std::string hdr =
+      "#if defined(FEATURE)\n"
+      "#define BOTH 1\n"
+      "#else\n"
+      "#define BOTH 0\n"
+      "#endif\n"
+      "#ifdef __has_include\n"          // taken branch hoisted out
+      "#else\n"
+      "#define ONE_BRANCH(...) 0\n"
+      "#endif\n";
+  std::vector<MacroRec> macros = {
+      {"BOTH", "#define BOTH 1\n", 0, 0},
+      {"ONE_BRANCH", "#define ONE_BRANCH __has_include\n", 0, 0},
+  };
+
+  auto redefined = macros_redefined_by_header(hdr, macros);
+  EXPECT_TRUE(std::ranges::contains(redefined, "BOTH"))
+      << "a macro the header re-establishes must have its early copy dropped";
+  EXPECT_FALSE(std::ranges::contains(redefined, "ONE_BRANCH"))
+      << "the only definition left in the header is an unreachable branch "
+         "defining something else, so the early copy must survive";
+}
+
+TEST(HeaderRewrite, MacroRedefinitionIgnoresDefinitionsQuotedInOtherMacros) {
+  // A definition that appears inside another macro's replacement list is not
+  // the header defining it.
+  std::string hdr = "#define WRAPPER() do { } while (0) /* #define X 1 */\n";
+  std::vector<MacroRec> macros = {{"X", "#define X 1\n", 0, 0}};
+  EXPECT_TRUE(macros_redefined_by_header(hdr, macros).empty());
+}
+
 TEST(HeaderRewrite, MovesSourceCopyrightHeaderToTopOfGeneratedFiles) {
   // The source file's license/copyright comment block must be reproduced at
   // the very top of the generated module unit (before `module;`) and of the
