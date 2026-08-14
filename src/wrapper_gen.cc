@@ -152,6 +152,11 @@ void emit_wrapper_body(llvm::raw_ostream &os, const EntityModel &model,
   NsNode cxx_root, c_root;
   bool any_c = false;
   for (const auto &item : model.items) {
+    // Never re-export into namespace std. A header may declare things there
+    // (an ADL `swap`, a `hash` specialisation); re-opening std to re-export
+    // them is undefined behaviour, and they are not part of the wrapped
+    // library's API in any case.
+    if (!item.ns_path.empty() && item.ns_path.front() == "std") continue;
     if (item.c_language_linkage) {
       any_c = true;
       insert(c_root, item, re, reachable);
