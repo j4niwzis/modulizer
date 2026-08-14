@@ -119,9 +119,28 @@ bool run_alias_closure(
         const auto &fqns = reachable.find(producer)->second;
         std::set<std::string> &out = partials[i][producer];
         return std::make_unique<VisitorFrontendActionFactory>(
-            [&internal, &fqns, &out](clang::CompilerInstance &) {
-              return make_traverse_consumer<AliasReachabilityCloser>(
-                  internal, fqns, out);
+            [&internal, &fqns, &out](clang::CompilerInstance &)
+                -> std::unique_ptr<clang::ASTConsumer> {
+              // A producer's closure only ever grows its own set, so its fixed
+              // point is reachable without leaving this parse: traverse again
+              // with what the last round found until nothing new appears.
+              // Re-parsing the file per round is what this used to cost.
+              return std::make_unique<TraverseConsumer>(
+                  [&internal, &fqns, &out](clang::ASTContext &ctx) {
+                    std::set<std::string> acc(fqns.begin(), fqns.end());
+                    for (;;) {
+                      std::set<std::string> round;
+                      AliasReachabilityCloser v(ctx.getSourceManager(),
+                                                internal, acc, round);
+                      v.TraverseDecl(ctx.getTranslationUnitDecl());
+                      bool grew = false;
+                      for (auto &f : round)
+                        if (acc.insert(f).second) grew = true;
+                      if (!grew) break;
+                    }
+                    for (auto &f : acc)
+                      if (!fqns.count(f)) out.insert(f);
+                  });
             });
       });
   for (auto &partial : partials)
@@ -267,7 +286,8 @@ trace_consumer_reachability(
   // references a reachable entity is itself needed by the consumers, but
   // dependent-member references (`typename Alias<...>::type`) resolve to the
   // underlying template in the AST, so the alias name never reaches the trace.
-  while (run_alias_closure(internal_by_header, reachable, extra_args)) {}
+  // One call suffices: each producer's closure converges inside its own parse.
+  run_alias_closure(internal_by_header, reachable, extra_args);
 
   auto result = to_vector_map(reachable);
 
@@ -329,7 +349,8 @@ trace_consumer_sources(
   }
 
   // Transitive closure over aliases (same as trace_consumer_reachability).
-  while (run_alias_closure(internal_by_header, reachable, extra_args)) {}
+  // One call suffices: each producer's closure converges inside its own parse.
+  run_alias_closure(internal_by_header, reachable, extra_args);
 
   auto result = to_vector_map(reachable);
 
