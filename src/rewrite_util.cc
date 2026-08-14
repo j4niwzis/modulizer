@@ -49,6 +49,25 @@ export std::string decl_fqn(clang::NamedDecl *d) {
   return fqn;
 }
 
+// A partial or explicit specialization. [module.interface]/3 forbids an
+// export-declaration from declaring one: it is exported with its primary
+// template, so no export marker may be attached to it.
+export bool is_specialization(const clang::Decl *d) {
+  if (llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(d) ||
+      llvm::isa<clang::VarTemplatePartialSpecializationDecl>(d))
+    return true;
+  if (auto *rd = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(d))
+    return rd->getSpecializationKind() ==
+           clang::TemplateSpecializationKind::TSK_ExplicitSpecialization;
+  if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(d))
+    return fd->getTemplateSpecializationKind() ==
+           clang::TemplateSpecializationKind::TSK_ExplicitSpecialization;
+  if (auto *vd = llvm::dyn_cast<clang::VarDecl>(d))
+    return vd->getTemplateSpecializationKind() ==
+           clang::TemplateSpecializationKind::TSK_ExplicitSpecialization;
+  return false;
+}
+
 export bool is_ident_char(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
          (c >= '0' && c <= '9') || c == '_';

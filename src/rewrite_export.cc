@@ -333,11 +333,18 @@ public:
       // A forward declaration of an entity this module defines as a plain
       // module entity: export it normally.
       block += std::format("export {}\n", decl_text);
+    else if (exported)
+      // This module defines AND exports the entity, but its definition is
+      // `extern "C++"` (the entity is also declared elsewhere). The
+      // declaration must be exported too: [module.interface]/6 makes an
+      // exported declaration preceded by a non-exported one ill-formed, and a
+      // compiler that takes the first declaration as authoritative then never
+      // exports the entity at all.
+      block += std::format("export extern \"C++\" {}\n", decl_text);
     else
-      // Either the entity is defined by another module (so the declaration
-      // must merge with that definition) or this module's own definition is
-      // `extern "C++"` (because the entity is also declared elsewhere). A
-      // module-local declaration would be a distinct entity in both cases.
+      // The entity is defined by another module, so this declaration only has
+      // to merge with that definition; this module does not own it and must
+      // not export it.
       block += std::format("extern \"C++\" {}\n", decl_text);
     fwd_decls->push_back({nss, std::move(block)});
     // The injected declaration's signature may reference types declared in

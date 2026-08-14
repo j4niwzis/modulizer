@@ -495,6 +495,11 @@ private:
   }
 
   void addExport(clang::Decl *d, bool need_extern_cxx = false) {
+    // [module.interface]/3: an export-declaration shall not declare a partial
+    // or explicit specialization. A specialization is exported together with
+    // its primary template, so the marker is simply omitted. (clang accepts
+    // the marker; gcc rejects it, and the standard is on gcc's side.)
+    if (is_specialization(d)) return;
     if (auto *rd = llvm::dyn_cast<clang::CXXRecordDecl>(d)) {
       if (rd->getFriendObjectKind() != clang::Decl::FOK_None) return;
       if (auto *ct = rd->getDescribedClassTemplate())
@@ -564,6 +569,18 @@ private:
         }
       }
     }
+    // A declaration inside an unbraced linkage-specification (`extern "C" void
+    // f();`) begins after the `extern "C"`, so a marker placed there produces
+    // `extern "C" export void f();`. The export-declaration must come first
+    // ([dcl.link] admits `export extern "C" …`, not the reverse), so back the
+    // offset up to the linkage-specification itself.
+    if (auto *ls = llvm::dyn_cast_or_null<clang::LinkageSpecDecl>(
+            d->getLexicalDeclContext()))
+      if (!ls->hasBraces()) {
+        auto ls_loc = sm.getExpansionLoc(ls->getBeginLoc());
+        if (ls_loc.isValid() && sm.getFileID(ls_loc) == fid)
+          off = sm.getFileOffset(ls_loc);
+      }
     std::string prefix = std::format("{} ", export_macro);
     if (need_extern_cxx) {
       // A variable declared `extern int x;` already carries the storage-class
