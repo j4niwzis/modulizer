@@ -637,7 +637,7 @@ public:
           clang::PPCallbacks::ConditionValueKind) override {
     pending_file_guard.clear();
     if (sm.isInMainFile(loc))
-      stack.push_back({loc, {}, false, false, false});
+      stack.push_back({loc, {}, false, false, false, condition_text(loc)});
   }
 
   void MacroDefined(const clang::Token &name,
@@ -652,7 +652,7 @@ public:
   void Else(clang::SourceLocation loc, clang::SourceLocation) override {
     if (stack.empty()) return;
     auto &f = stack.back();
-    if (f.macro.empty()) return;
+    if (f.macro.empty() && f.cond.empty()) return;
     push_range(f, loc); // close range before #else
     f.loc = loc;
     f.flipped = !f.flipped; // flip guard sense for #else branch
@@ -663,7 +663,7 @@ public:
     if (stack.empty()) return;
     auto f = stack.back();
     stack.pop_back();
-    if (f.macro.empty()) return;
+    if (f.macro.empty() && f.cond.empty()) return;
     push_range(f, loc);
   }
 
@@ -693,7 +693,43 @@ private:
     bool is_ifndef;
     bool flipped = false;
     bool is_file_guard = false;
+    // Verbatim condition of an `#if <expr>` (empty for #ifdef/#ifndef, whose
+    // condition is rebuilt from `macro`). An entity declared only under such a
+    // condition has to be re-exported under it too, or a wrapper names
+    // something that does not exist in every configuration —
+    // `testing::WhenDynamicCastTo` exists only `#if GTEST_HAS_RTTI`.
+    std::string cond;
   };
+
+  // Text of the `#if` condition at `loc`: from the directive to end of line,
+  // with backslash continuations joined and the `#if` keyword removed.
+  std::string condition_text(clang::SourceLocation loc) {
+    auto buf = sm.getBufferData(sm.getFileID(loc));
+    std::size_t off = sm.getFileOffset(loc);
+    std::string out;
+    while (off < buf.size()) {
+      auto eol = buf.find('\n', off);
+      if (eol == llvm::StringRef::npos) eol = buf.size();
+      auto line = buf.substr(off, eol - off);
+      bool cont = !line.empty() && line.back() == '\\';
+      if (cont) line = line.drop_back(1);
+      out.append(line.data(), line.size());
+      off = eol + 1;
+      if (!cont) break;
+      out += ' ';
+    }
+    // Strip a leading `#` and the `if` keyword, wherever the location started.
+    auto ns = out.find_first_not_of(" \t");
+    if (ns != std::string::npos && out[ns] == '#') ns = out.find_first_not_of(" \t", ns + 1);
+    if (ns != std::string::npos && out.compare(ns, 2, "if") == 0) ns += 2;
+    out = ns == std::string::npos ? std::string{} : out.substr(ns);
+    auto first = out.find_first_not_of(" \t");
+    out = first == std::string::npos ? std::string{} : out.substr(first);
+    while (!out.empty() && (out.back() == ' ' || out.back() == '\t' ||
+                            out.back() == '\r'))
+      out.pop_back();
+    return out;
+  }
 
   void push_range(const Frame &f, clang::SourceLocation end) {
     // The file's own include guard covers the whole file; wrapping its
@@ -707,9 +743,16 @@ private:
     while (lineEnd < buf.size() && buf[lineEnd] != '\n') ++lineEnd;
     auto beginOff = static_cast<unsigned>(lineEnd + 1);
     auto endOff = sm.getFileOffset(end);
-    bool cond = f.is_ifndef ^ f.flipped;
-    auto prefix = std::format("{} {}\n", cond ? "#ifndef" : "#ifdef", f.macro);
-    auto suffix = std::format("#endif // {}\n", f.macro);
+    std::string prefix, suffix;
+    if (!f.cond.empty()) {
+      prefix = f.flipped ? std::format("#if !({})\n", f.cond)
+                         : std::format("#if {}\n", f.cond);
+      suffix = std::format("#endif // {}\n", f.cond);
+    } else {
+      bool cond = f.is_ifndef ^ f.flipped;
+      prefix = std::format("{} {}\n", cond ? "#ifndef" : "#ifdef", f.macro);
+      suffix = std::format("#endif // {}\n", f.macro);
+    }
     ranges.push_back({beginOff, endOff, std::move(prefix), std::move(suffix)});
   }
 

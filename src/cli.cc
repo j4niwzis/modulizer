@@ -1069,7 +1069,16 @@ export inline int run_full_rewrite(int argc, const char **argv) {
             if (!empty_interface_modules.count(m)) mods.push_back(m);
           return mods;
         }(),
-        fwd_declared_fqns);
+        fwd_declared_fqns,
+        [&] {
+          // The macro headers this run emitted, so a guarded re-export can be
+          // evaluated in the facade. They chain-include the ones they depend
+          // on, including another library's when this one builds on it.
+          std::set<std::string> incs;
+          for (auto &o : outcomes)
+            if (!o.r.macros_name.empty()) incs.insert(o.r.macros_name + ".h");
+          return std::vector<std::string>(incs.begin(), incs.end());
+        }());
     std::string w_path =
         std::format("{}/{}.cc", OutputDirOpt.getValue(), library_name);
     if (!write_file(w_path, wrapper_cc)) return 1;

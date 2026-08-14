@@ -218,10 +218,25 @@ export std::string generate_import_wrapper_cc(
     const std::vector<std::string> &reachable_internal = {},
     bool import_std = false,
     const std::vector<std::string> &import_modules = {},
-    const std::vector<std::string> &extern_cxx_fqns = {}) {
+    const std::vector<std::string> &extern_cxx_fqns = {},
+    const std::vector<std::string> &macro_includes = {}) {
   std::string result;
   llvm::raw_string_ostream os(result);
 
+  // An entity declared under a condition is re-exported under the same
+  // condition, and this facade otherwise includes nothing — so every macro
+  // those conditions test would be undefined here and each guarded re-export
+  // would quietly vanish. Pull the library's generated macro headers into a
+  // global module fragment so the conditions mean here what they mean in the
+  // headers they came from.
+  bool guarded = std::ranges::any_of(model.items, [](const EntityItem &i) {
+    return !i.guard_prefix.empty();
+  });
+  if (guarded && !macro_includes.empty()) {
+    os << "module;\n";
+    for (auto &inc : macro_includes) os << "#include \"" << inc << "\"\n";
+    os << "\n";
+  }
   os << "export module " << module_name << ";\n";
   os << "import " << import_name << ";\n";
   for (auto &m : import_modules) {

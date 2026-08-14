@@ -333,3 +333,67 @@ TEST(WrapperGen, EmitsTheIncludeFormNotTheGivenPath) {
                                      gDataDir + "/linkage_lib"};
   EXPECT_EQ(include_form(abs, nested), "api.h");
 }
+
+TEST(WrapperGen, ConditionalEntityIsReexportedUnderItsCondition) {
+  // `only_with_feature` is declared under `#if CONDGUARD_HAS_FEATURE` — an
+  // expression condition, not an #ifdef. Re-exporting it unconditionally makes
+  // the wrapper name an entity that need not exist: that is how a generated
+  // gmock wrapper ended up with `using ::testing::WhenDynamicCastTo;`, which
+  // exists only under GTEST_HAS_RTTI, and failed to compile with -fno-rtti.
+  auto model = analyze_file(data_path("condguard_lib/api.h"));
+  auto out = generate_wrapper_cc("condguard_lib", {"condguard_lib/api.h"},
+                                 model);
+  auto guarded = out.find("#if CONDGUARD_HAS_FEATURE");
+  ASSERT_NE(guarded, std::string::npos)
+      << "the condition guarding the declaration must guard the re-export";
+  auto entity = out.find("using ::condguard_lib::only_with_feature;");
+  ASSERT_NE(entity, std::string::npos);
+  EXPECT_LT(guarded, entity) << "the guard must open before the re-export";
+  EXPECT_NE(out.find("#endif", entity), std::string::npos) << "and close after";
+  auto plain = out.find("using ::condguard_lib::always_here;");
+  ASSERT_NE(plain, std::string::npos);
+  EXPECT_LT(plain, guarded)
+      << "an unguarded entity must not be swept into the guarded block";
+}
+
+TEST(WrapperGen, FacadeIncludesMacroHeadersForGuardedReexports) {
+  // The import wrapper is a pure facade: `export module`, imports, and using
+  // declarations, with nothing included. A guarded re-export there would test a
+  // macro that is not defined in that translation unit, so `#if GTEST_HAS_RTTI`
+  // would quietly evaluate to 0 and the entity would vanish instead of being
+  // re-exported. Give it a global module fragment with the library's macro
+  // headers so the condition means the same thing it means in the headers.
+  EntityModel model;
+  model.items.push_back({EntityItem::kClass, "Plain", {"wraplib"}});
+  EntityItem guarded{EntityItem::kClass, "OnlyWithFeature", {"wraplib"}};
+  guarded.guard_prefix = "#if WRAPLIB_HAS_FEATURE\n";
+  guarded.guard_suffix = "#endif // WRAPLIB_HAS_FEATURE\n";
+  model.items.push_back(guarded);
+  auto out = generate_import_wrapper_cc(
+      "wraplib", "wraplib.umbrella", model, kDefaultInternalFilter,
+      /*reachable_internal=*/{}, /*import_std=*/false, /*import_modules=*/{},
+      /*extern_cxx_fqns=*/{}, /*macro_includes=*/{"wraplib/wraplib-macros.h"});
+  auto gmf = out.find("module;");
+  ASSERT_NE(gmf, std::string::npos)
+      << "a guarded re-export needs a global module fragment";
+  auto inc = out.find("#include \"wraplib/wraplib-macros.h\"");
+  ASSERT_NE(inc, std::string::npos) << "which includes the macro headers";
+  auto decl = out.find("export module wraplib;");
+  ASSERT_NE(decl, std::string::npos);
+  EXPECT_LT(gmf, inc);
+  EXPECT_LT(inc, decl) << "the fragment must precede the module declaration";
+  EXPECT_NE(out.find("#if WRAPLIB_HAS_FEATURE"), std::string::npos);
+}
+
+TEST(WrapperGen, FacadeWithoutGuardsKeepsNoGlobalModuleFragment) {
+  // Nothing to evaluate, nothing to include: the facade stays as it was.
+  EntityModel model;
+  model.items.push_back({EntityItem::kClass, "Plain", {"wraplib"}});
+  auto out = generate_import_wrapper_cc(
+      "wraplib", "wraplib.umbrella", model, kDefaultInternalFilter,
+      /*reachable_internal=*/{}, /*import_std=*/false, /*import_modules=*/{},
+      /*extern_cxx_fqns=*/{}, /*macro_includes=*/{"wraplib/wraplib-macros.h"});
+  EXPECT_EQ(out.find("module;"), std::string::npos);
+  EXPECT_EQ(out.find("wraplib-macros.h"), std::string::npos);
+}
+
