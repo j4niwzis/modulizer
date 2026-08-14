@@ -734,9 +734,11 @@ public:
   EntityExtractionAction(EntityModel &model,
                          std::vector<std::string> &ifdef_macros,
                          bool wrapper_mode,
-                         std::set<std::string> *undefed)
+                         std::set<std::string> *undefed,
+                         VisitorFrontendActionFactory::ConsumerMaker extra)
       : model(model), ifdef_macros(ifdef_macros),
-        wrapper_mode(wrapper_mode), undefed(undefed) {}
+        wrapper_mode(wrapper_mode), undefed(undefed),
+        extra(std::move(extra)) {}
 
   std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
       clang::CompilerInstance &ci, llvm::StringRef) override {
@@ -746,8 +748,15 @@ public:
         std::make_unique<MacroCollector>(sm, model, wrapper_mode, undefed));
     pp.addPPCallbacks(
         std::make_unique<GuardTracker>(sm, guard_ranges, ifdef_macros));
-    return std::make_unique<EntityExtractionConsumer>(
+    auto consumer = std::make_unique<EntityExtractionConsumer>(
         ci.getASTContext(), model, guard_ranges);
+    if (!extra) return consumer;
+    // Another analysis rides this parse rather than sweeping the same files
+    // again; the parse is what costs, the traversal is not.
+    std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+    consumers.push_back(std::move(consumer));
+    consumers.push_back(extra(ci));
+    return make_combined_consumer(std::move(consumers));
   }
 
 private:
@@ -756,6 +765,7 @@ private:
   std::vector<std::string> &ifdef_macros;
   bool wrapper_mode;
   std::set<std::string> *undefed;
+  VisitorFrontendActionFactory::ConsumerMaker extra;
 };
 
 } // namespace
@@ -768,16 +778,18 @@ private:
 // macro names accumulated across every TU of the batch.
 export class EntityExtractionFactory : public clang::tooling::FrontendActionFactory {
 public:
-  explicit EntityExtractionFactory(EntityModel &model,
-                                   std::vector<std::string> &ifdef_macros,
-                                   bool wrapper_mode = false,
-                                   std::set<std::string> *undefed = nullptr)
+  // `extra`, when set, builds one more ASTConsumer to run over the same parse.
+  explicit EntityExtractionFactory(
+      EntityModel &model, std::vector<std::string> &ifdef_macros,
+      bool wrapper_mode = false, std::set<std::string> *undefed = nullptr,
+      VisitorFrontendActionFactory::ConsumerMaker extra = {})
       : model(model), ifdef_macros(ifdef_macros),
-        wrapper_mode(wrapper_mode), undefed(undefed) {}
+        wrapper_mode(wrapper_mode), undefed(undefed), extra(std::move(extra)) {}
 
   std::unique_ptr<clang::FrontendAction> create() override {
     return std::make_unique<EntityExtractionAction>(model, ifdef_macros,
-                                                    wrapper_mode, undefed);
+                                                    wrapper_mode, undefed,
+                                                    extra);
   }
 
 private:
@@ -785,6 +797,7 @@ private:
   std::vector<std::string> &ifdef_macros;
   bool wrapper_mode;
   std::set<std::string> *undefed;
+  VisitorFrontendActionFactory::ConsumerMaker extra;
 };
 
 export EntityModel analyze_headers_with_cdb(
