@@ -463,7 +463,14 @@ export void expand_include_closure(
       if (is_xmacro_include(di.path)) continue;
       di.transitive = true;
       di.parent_resolved = resolved;
-      if (inside_system && !kStdHeaders.count(di.path)) {
+      if (inside_system && kStdHeaders.count(di.path)) {
+        // A public standard header stays a candidate wherever it was found,
+        // but the conditions it was found *under* belong to the standard
+        // library, not to this program: `<cerrno>` inside `<bits/atomic_wait.h>`
+        // sits behind `#if __glibcxx_atomic_wait`, and emitting that guard
+        // would pin the output to one libstdc++ version.
+        di.guard_stack.clear();
+      } else if (inside_system) {
         di.system_internal = true;
         di.public_ancestor = inc.system_internal ? inc.public_ancestor : resolved;
       }
