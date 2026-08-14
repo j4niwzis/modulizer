@@ -29,6 +29,10 @@ export struct EntityItem {
   std::string guard_prefix;  // e.g. "#ifdef _WIN32\n"
   std::string guard_suffix;  // e.g. "#endif // _WIN32\n"
   bool complete = true;      // false for forward declarations (no body)
+  // True when the entity has C language linkage (declared inside `extern "C"`).
+  // A header wrapper re-exports it from a separate `extern "C"` block: it
+  // cannot sit in the `extern "C++"` one that carries everything else.
+  bool c_language_linkage = false;
   // FQNs (namespace-qualified) of library types this entity's declaration
   // references. For a function: return + parameter types; for a class: base
   // classes + the return/parameter types of its public member functions; for a
@@ -492,6 +496,11 @@ private:
 
   void add_item(EntityItem item, clang::Decl *d) {
     apply_guard(item, d);
+    // isExternC() lives on the declarations that can have language linkage.
+    if (auto *fd = llvm::dyn_cast_or_null<clang::FunctionDecl>(d))
+      item.c_language_linkage = fd->isExternC();
+    else if (auto *vd = llvm::dyn_cast_or_null<clang::VarDecl>(d))
+      item.c_language_linkage = vd->isExternC();
     model.items.push_back(std::move(item));
   }
 };
