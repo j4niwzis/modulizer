@@ -70,10 +70,14 @@ jobs:
 
             T=/gt/googletest/test/googletest-printers-test.cc
             cp "$T" /tmp/orig.cc
-            for inc in "<cstdio>" "<sys/types.h>"; do
+            for inc in "<cstdio>" "<sys/types.h>" "<stdio.h>"; do
               cp /tmp/orig.cc "$T"
-              # After the last include, before the first use.
-              sed -i "0,/^#include \"gtest\\/gtest-printers.h\"/s||#include $inc\n#include \"gtest/gtest-printers.h\"|" "$T"
+              # After the last import: the converted file has no #include line
+              # to anchor on, which is what defeated the first attempt.
+              last=$(grep -n "^import " "$T" | tail -1 | cut -d: -f1)
+              sed -i "${last}a #include $inc" "$T"
+              echo "--- inserted after line $last:"
+              sed -n "$((last)),$((last+1))p" "$T"
               if cmake --build /gt/b --target googletest-printers-test >/tmp/q2.log 2>&1; then
                 echo "RESULT Q2: #include $inc COMPILES the converted test"
               else
