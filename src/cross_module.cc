@@ -16,22 +16,30 @@ import std;
 // modules that do not define them, so every declaration (and the defining
 // module's definition) must be `extern "C++"` to keep a single shared entity
 // across module boundaries.
+// `precomputed`, when given, is the per-file entity model set for `paths`
+// (see analyze_files_per_file): this analysis needs nothing else from a parse,
+// so a caller that already extracted them must not pay for a second sweep.
 export std::vector<std::string> cross_module_fwd_declared_fqns(
     const std::vector<std::string> &paths,
-    const std::vector<std::string> &extra_args) {
+    const std::vector<std::string> &extra_args,
+    const std::vector<EntityModel> *precomputed = nullptr) {
   std::vector<std::map<std::string, std::set<std::string>>> complete_partials(
       paths.size());
   std::vector<std::map<std::string, std::set<std::string>>> fwd_partials(
       paths.size());
-  std::vector<EntityModel> models(paths.size());
+  std::vector<EntityModel> owned;
+  if (!precomputed) owned.resize(paths.size());
   std::vector<std::vector<std::string>> ifdef_macros(paths.size());
-  parallel_parse(
-      paths, extra_args, /*delayed_template_parsing=*/false,
-      [&](std::size_t i, const std::string &) {
-        return std::make_unique<EntityExtractionFactory>(models[i],
-                                                         ifdef_macros[i]);
-      },
-      [&](std::size_t i, const std::string &path) {
+  if (!precomputed)
+    parallel_parse(
+        paths, extra_args, /*delayed_template_parsing=*/false,
+        [&](std::size_t i, const std::string &) {
+          return std::make_unique<EntityExtractionFactory>(owned[i],
+                                                           ifdef_macros[i]);
+        });
+  const std::vector<EntityModel> &models = precomputed ? *precomputed : owned;
+  parallel_for(paths.size(), [&](std::size_t i) {
+        const std::string &path = paths[i];
         auto &complete_files = complete_partials[i];
         auto &fwd_files = fwd_partials[i];
         for (auto &item : models[i].items) {
@@ -83,20 +91,27 @@ export struct TemplateBodyRefResult {
   std::vector<std::string> aliases;
 };
 
+// `precomputed` has the same meaning as in cross_module_fwd_declared_fqns:
+// the first half of this analysis is the same entity extraction.
 export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
     const std::vector<std::string> &paths,
-    const std::vector<std::string> &extra_args) {
+    const std::vector<std::string> &extra_args,
+    const std::vector<EntityModel> *precomputed = nullptr) {
   std::vector<std::pair<std::map<std::string, std::set<std::string>>,
                         std::set<std::string>>> defined_partials(paths.size());
-  std::vector<EntityModel> models(paths.size());
+  std::vector<EntityModel> owned;
+  if (!precomputed) owned.resize(paths.size());
   std::vector<std::vector<std::string>> ifdef_macros(paths.size());
-  parallel_parse(
-      paths, extra_args, /*delayed_template_parsing=*/false,
-      [&](std::size_t i, const std::string &) {
-        return std::make_unique<EntityExtractionFactory>(models[i],
-                                                         ifdef_macros[i]);
-      },
-      [&](std::size_t i, const std::string &path) {
+  if (!precomputed)
+    parallel_parse(
+        paths, extra_args, /*delayed_template_parsing=*/false,
+        [&](std::size_t i, const std::string &) {
+          return std::make_unique<EntityExtractionFactory>(owned[i],
+                                                           ifdef_macros[i]);
+        });
+  const std::vector<EntityModel> &models = precomputed ? *precomputed : owned;
+  parallel_for(paths.size(), [&](std::size_t i) {
+        const std::string &path = paths[i];
         auto &defined_files = defined_partials[i].first;
         auto &alias_fqns = defined_partials[i].second;
         for (auto &item : models[i].items) {

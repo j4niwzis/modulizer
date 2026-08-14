@@ -881,7 +881,11 @@ export EntityModel analyze_files(const std::vector<std::string> &paths) {
 // NOTE: intentionally a single-pass extraction, unlike analyze_file (which
 // re-parses per #ifdef macro). compute_macro_modules depends on this
 // single-pass result; making it multi-pass would change macro reachability.
-export EntityModel analyze_files_with_flags(
+// The per-file entity models, one parse per path. Several analyses want these
+// same models — which entities each header declares and completes, which
+// macros it defines — and each used to parse the whole header set for itself.
+// Callers that need more than one of them should extract once and share.
+export std::vector<EntityModel> analyze_files_per_file(
     const std::vector<std::string> &paths,
     const std::vector<std::string> &extra_args) {
   std::vector<EntityModel> partials(paths.size());
@@ -891,10 +895,21 @@ export EntityModel analyze_files_with_flags(
                    return std::make_unique<EntityExtractionFactory>(
                        partials[i], ifdef_macros[i]);
                  });
+  return partials;
+}
+
+// The same models flattened into one, in path order.
+export EntityModel merge_entity_models(std::vector<EntityModel> partials) {
   EntityModel combined;
   for (auto &model : partials) {
     combined.items.insert_range(combined.items.end(), std::move(model.items));
     combined.macros.insert_range(combined.macros.end(), std::move(model.macros));
   }
   return combined;
+}
+
+export EntityModel analyze_files_with_flags(
+    const std::vector<std::string> &paths,
+    const std::vector<std::string> &extra_args) {
+  return merge_entity_models(analyze_files_per_file(paths, extra_args));
 }
