@@ -37,20 +37,53 @@ std::map<std::string, std::vector<std::string>> build_header_deps(
 
 // Collect the internal-namespace entity FQNs of each library header (shared by
 // the three trace functions below). `verbose` prints a per-header count line.
+// Records whether the main file defines any macro a generated macro header
+// would carry. Same eligibility rule as the entity extractor's collector, so
+// the two agree by construction rather than by coincidence.
+class MacroPresence : public clang::PPCallbacks {
+public:
+  MacroPresence(const clang::SourceManager &sm, char &out) : sm(sm), out(out) {}
+
+  void MacroDefined(const clang::Token &,
+                    const clang::MacroDirective *md) override {
+    if (collectible_macro(md, sm)) out = 1;
+  }
+
+private:
+  const clang::SourceManager &sm;
+  char &out;
+};
+
+// Collects, per library header, the internal entities it declares — and, when
+// `headers_with_macros` is given, whether it defines any macro. Both answers
+// come from the one parse: the run used to parse every library header twice to
+// ask them separately.
 std::map<std::string, std::set<std::string>> collect_internal_by_header(
     const std::vector<std::string> &header_paths,
-    const std::vector<std::string> &extra_args, bool verbose) {
+    const std::vector<std::string> &extra_args, bool verbose,
+    std::set<std::string> *headers_with_macros = nullptr) {
   std::map<std::string, std::set<std::string>> internal_by_header;
   std::vector<std::set<std::string>> collected(header_paths.size());
+  // Not vector<bool>: the workers write to distinct elements concurrently.
+  std::vector<char> defines_macros(header_paths.size(), 0);
+  const bool want_macros = headers_with_macros != nullptr;
   parallel_parse(
       header_paths, extra_args, /*delayed_template_parsing=*/true,
       [&](std::size_t i, const std::string &) {
         auto &entities = collected[i];
+        char &macros = defines_macros[i];
         return std::make_unique<VisitorFrontendActionFactory>(
-            [&entities](clang::CompilerInstance &) {
+            [&entities, &macros, want_macros](clang::CompilerInstance &ci) {
+              if (want_macros)
+                ci.getPreprocessor().addPPCallbacks(
+                    std::make_unique<MacroPresence>(ci.getSourceManager(),
+                                                    macros));
               return make_traverse_consumer<InternalCollector>(&entities);
             });
       });
+  if (want_macros)
+    for (std::size_t i = 0; i < header_paths.size(); ++i)
+      if (defines_macros[i]) headers_with_macros->insert(header_paths[i]);
   for (std::size_t i = 0; i < header_paths.size(); ++i) {
     if (verbose)
       llvm::outs() << "  " << std::filesystem::path(header_paths[i])
@@ -257,6 +290,32 @@ export struct ConsumerTrace {
   std::map<std::string, std::set<std::string>> system_includes_by_consumer;
 };
 
+// Everything a --consumers run needs from the library headers, from one parse
+// of each: which internal entities each declares, and which of them define
+// macros a consumer must include the generated macro header for.
+export struct LibraryHeaderAnalysis {
+  std::map<std::string, std::set<std::string>> internal_by_header;
+  std::set<std::string> headers_with_macros;
+};
+
+export LibraryHeaderAnalysis analyze_library_headers(
+    const std::vector<std::string> &header_paths,
+    const std::vector<std::string> &extra_args, bool verbose = false) {
+  LibraryHeaderAnalysis out;
+  out.internal_by_header = collect_internal_by_header(
+      header_paths, extra_args, verbose, &out.headers_with_macros);
+  return out;
+}
+
+// Trace against an already-computed header analysis, so a caller that needed
+// it for its own reasons does not pay for a second sweep of the headers.
+export ConsumerTrace trace_consumers(
+    const std::map<std::string, std::set<std::string>> &internal_by_header,
+    const std::vector<std::string> &consumer_sources,
+    llvm::StringRef library_name,
+    const std::vector<std::string> &extra_args,
+    const std::map<std::string, std::string> *virtual_sources = nullptr);
+
 export ConsumerTrace trace_consumers(
     const std::vector<std::string> &header_paths,
     const std::vector<std::string> &consumer_sources,
@@ -264,9 +323,17 @@ export ConsumerTrace trace_consumers(
     const std::vector<std::string> &extra_args,
     const std::map<std::string, std::string> *virtual_sources = nullptr) {
 
-  std::map<std::string, std::set<std::string>> internal_by_header =
-      collect_internal_by_header(header_paths, extra_args, /*verbose=*/false);
+  return trace_consumers(
+      collect_internal_by_header(header_paths, extra_args, /*verbose=*/false),
+      consumer_sources, library_name, extra_args, virtual_sources);
+}
 
+ConsumerTrace trace_consumers(
+    const std::map<std::string, std::set<std::string>> &internal_by_header,
+    const std::vector<std::string> &consumer_sources,
+    llvm::StringRef library_name,
+    const std::vector<std::string> &extra_args,
+    const std::map<std::string, std::string> *virtual_sources) {
   std::vector<std::map<std::string, std::set<std::string>>> partials(
       consumer_sources.size());
   std::vector<std::set<std::string>> consumer_defined(consumer_sources.size());

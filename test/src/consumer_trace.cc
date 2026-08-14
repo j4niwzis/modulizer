@@ -439,3 +439,40 @@ TEST(ConsumerTrace, CombinedTraceHonoursVirtualSources) {
   ASSERT_NE(it, combined.producers_by_consumer.end());
   EXPECT_NE(it->second.find(producer), it->second.end());
 }
+
+TEST(ConsumerTrace, LibraryHeaderAnalysisMatchesTheSeparatePasses) {
+  // The library headers were parsed twice per --consumers run: once to ask
+  // which of them define macros, once to collect the internal entities each
+  // declares. Both answers come from one parse — the macro question is a
+  // preprocessor callback over the same eligibility rule (collectible_macro)
+  // the entity extractor uses, the entity question an AST traversal.
+  std::vector<std::string> headers = {
+      data_path("sysuse_lib/prod.h"),
+      data_path("test_lib/producer.h"),
+      data_path("test_lib/internal/foo.h"),
+      data_path("macro_test.h"),
+      data_path("twocons_lib/producer.h"),
+  };
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto combined = analyze_library_headers(headers, extra_args);
+
+  for (const auto &h : headers) {
+    bool had_macros = !analyze_files_with_flags({h}, extra_args).macros.empty();
+    EXPECT_EQ(combined.headers_with_macros.count(h) != 0u, had_macros)
+        << "macro presence must agree for " << h;
+  }
+
+  // The internal-entity half must drive the trace exactly as before.
+  auto producer = data_path("sysuse_lib/prod.h");
+  auto use = data_path("sysuse_lib/use.cc");
+  auto separate = trace_consumer_modules({producer}, {use}, "sysuse_lib",
+                                         extra_args);
+  auto shared = trace_consumers(combined.internal_by_header, {use},
+                                "sysuse_lib", extra_args);
+  EXPECT_EQ(shared.producers_by_consumer, separate)
+      << "a precomputed header analysis must trace identically";
+  auto it = shared.producers_by_consumer.find(use);
+  ASSERT_NE(it, shared.producers_by_consumer.end());
+  EXPECT_NE(it->second.count(producer), 0u);
+}
