@@ -78,13 +78,35 @@ public:
   ConsumerRefFinder(const clang::SourceManager &sm,
                     const std::map<std::string, std::set<std::string>>
                         &producer_internal,
-                    std::map<std::string, std::set<std::string>> &reachable)
+                    std::map<std::string, std::set<std::string>> &reachable,
+                    const std::set<std::string> *producer_files = nullptr)
       : sm(sm),
         consumer_fid(sm.getMainFileID()),
         producer_internal(producer_internal),
-        reachable(reachable) {}
+        reachable(reachable),
+        producer_files(producer_files) {}
 
   void setContext(clang::ASTContext &ctx) { ctx_ = &ctx; }
+
+  // Whether a reference written at `loc` is a use BY the consumer. The main
+  // file always is. Without a producer set that is all that counts, which
+  // makes every reference in a header the consumer includes invisible: the
+  // use of `internal::ElemFromList` in gmock's own
+  // `gmock/internal/gmock-internal-utils.h` is as real as one in the .cc that
+  // includes it, and gmock reaches gtest through the same imports. So with a
+  // producer set, a reference counts unless it is written in one of the
+  // headers being rewritten — a use inside the library itself is not a
+  // consumer use, and counting those would export every internal entity.
+  bool is_consumer_use(clang::SourceLocation loc) const {
+    if (!loc.isValid()) return false;
+    auto eloc = sm.getExpansionLoc(loc);
+    if (sm.isInMainFile(eloc)) return true;
+    if (!producer_files) return false;
+    if (sm.isInSystemHeader(eloc)) return false;
+    auto fe = sm.getFileEntryRefForID(sm.getFileID(eloc));
+    if (!fe) return false;
+    return !producer_files->count(fe->getName().str());
+  }
 
   bool shouldVisitImplicitCode() const { return true; }
   bool shouldVisitTemplateInstantiations() const { return true; }
@@ -122,7 +144,7 @@ public:
 
   bool VisitFunctionDecl(clang::FunctionDecl *fd) {
     if (!fd) return true;
-    if (!sm.isInMainFile(fd->getLocation())) return true;
+    if (!is_consumer_use(fd->getLocation())) return true;
     checkType(fd->getReturnType());
     for (unsigned i = 0; i < fd->getNumParams(); ++i)
       checkType(fd->getParamDecl(i)->getType());
@@ -176,28 +198,28 @@ public:
 
   bool VisitVarDecl(clang::VarDecl *vd) {
     if (!vd) return true;
-    if (!sm.isInMainFile(vd->getLocation())) return true;
+    if (!is_consumer_use(vd->getLocation())) return true;
     checkType(vd->getType());
     return true;
   }
 
   bool VisitFieldDecl(clang::FieldDecl *fd) {
     if (!fd) return true;
-    if (!sm.isInMainFile(fd->getLocation())) return true;
+    if (!is_consumer_use(fd->getLocation())) return true;
     checkType(fd->getType());
     return true;
   }
 
   bool VisitTypedefDecl(clang::TypedefDecl *td) {
     if (!td) return true;
-    if (!sm.isInMainFile(td->getLocation())) return true;
+    if (!is_consumer_use(td->getLocation())) return true;
     checkType(td->getUnderlyingType());
     return true;
   }
 
   bool VisitTypeAliasDecl(clang::TypeAliasDecl *ta) {
     if (!ta) return true;
-    if (!sm.isInMainFile(ta->getLocation())) return true;
+    if (!is_consumer_use(ta->getLocation())) return true;
     checkType(ta->getUnderlyingType());
     return true;
   }
@@ -223,7 +245,7 @@ public:
   bool VisitClassTemplateSpecializationDecl(
       clang::ClassTemplateSpecializationDecl *d) {
     if (!d) return true;
-    if (!sm.isInMainFile(d->getLocation())) return true;
+    if (!is_consumer_use(d->getLocation())) return true;
     if (auto *as_written = d->getTemplateArgsAsWritten())
       for (auto &arg : as_written->arguments())
         checkTemplateArg(arg);
@@ -260,7 +282,7 @@ private:
   void walkStmt(clang::Stmt *s) {
     if (!s || depth_ > 200) return;
     auto loc = sm.getExpansionLoc(s->getBeginLoc());
-    if (loc.isValid() && !sm.isInMainFile(loc)) return;
+    if (loc.isValid() && !is_consumer_use(loc)) return;
     ScopeDepth g(depth_);
     if (auto *ce = llvm::dyn_cast<clang::CallExpr>(s))
       checkDecl(ce->getDirectCallee());
@@ -503,6 +525,9 @@ private:
   clang::ASTContext *ctx_ = nullptr;
   const std::map<std::string, std::set<std::string>> &producer_internal;
   std::map<std::string, std::set<std::string>> &reachable;
+  // The headers being rewritten (as given AND canonicalized, since a file
+  // entry may be either). Null keeps the main-file-only rule.
+  const std::set<std::string> *producer_files = nullptr;
 };
 
 export class ConsumerRefConsumer : public clang::ASTConsumer {
@@ -511,9 +536,10 @@ public:
                       const std::map<std::string, std::set<std::string>>
                           &producer_internal,
                       std::map<std::string, std::set<std::string>> &reachable,
-                      std::set<std::string> *consumer_defined)
+                      std::set<std::string> *consumer_defined,
+                      const std::set<std::string> *producer_files = nullptr)
       : defined_collector(sm, consumer_defined),
-        vis(sm, producer_internal, reachable) {}
+        vis(sm, producer_internal, reachable, producer_files) {}
 
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     if (defined_collector.enabled())

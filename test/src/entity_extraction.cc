@@ -23,6 +23,28 @@ TEST(EntityExtraction, FindsPublicClass) {
   EXPECT_TRUE(found);
 }
 
+TEST(EntityExtraction, ClassDefinedByNoHeaderIsCrossModuleForwardDeclared) {
+  // `Accessor` is declared by the library and defined by none of its headers:
+  // whatever defines it does so outside the module — an implementation unit,
+  // or a consumer, as with the friend accessors a test defines to reach a
+  // class's private members. That definition lands in the global module, so
+  // the declaration must be `extern "C++"` too; a module-attached one would be
+  // a different entity and the friendship would not apply to the definition.
+  std::vector<std::string> headers = {data_path("openfwd_lib/api.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  auto fqns = cross_module_fwd_declared_fqns(headers, extra_args);
+  EXPECT_TRUE(std::find(fqns.begin(), fqns.end(), "openfwd_lib::Accessor") !=
+              fqns.end())
+      << "a class the library never defines must be treated as a shared "
+         "global-module entity";
+  EXPECT_TRUE(std::find(fqns.begin(), fqns.end(), "openfwd_lib::Widget") ==
+              fqns.end())
+      << "a class defined in the header that declares it is a module entity";
+  EXPECT_TRUE(std::find(fqns.begin(), fqns.end(), "openfwd_lib::Plain") ==
+              fqns.end())
+      << "a class defined where it is declared is a module entity";
+}
+
 TEST(EntityExtraction, FunctionTemplateCompleteReflectsBody) {
   // fwtpl.h forward-declares the function template `foo` (no body) and defines
   // `bar` (has a body). The `complete` flag must reflect whether a body exists:
