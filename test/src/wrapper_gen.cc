@@ -262,3 +262,41 @@ TEST(WrapperGen, SkipsClassMemberAndFriendEntities) {
   EXPECT_EQ(out.find("friendlib::internal::Helper"), std::string::npos)
       << "a friend-declared class must not be misattributed to the wrapper";
 }
+
+TEST(WrapperGen, WrapsTheBodyInExternCxxAndSeparatesCLinkage) {
+  // Everything a header wrapper re-exports belongs to the global module — it
+  // is declared in a header included in the global module fragment — so the
+  // whole body is one `export extern "C++"` block. That is also what makes
+  // entities with internal linkage re-exportable at all: a plain exported
+  // using declaration naming a `const` variable at namespace scope is rejected
+  // ("using declaration referring to 'X' with internal linkage cannot be
+  // exported"), and `export` has to sit outside the linkage block, not inside
+  // it. Entities with C language linkage cannot be in that block and get their
+  // own `export extern "C"` one.
+  clang::tooling::FixedCompilationDatabase db(
+      ".", {"-x", "c++", "-std=c++20", "-I", gDataDir});
+  auto model = analyze_headers_with_cdb(db, {data_path("linkage_lib/api.h")});
+  auto out = generate_wrapper_cc("linkage_lib", {"linkage_lib/api.h"}, model);
+
+  EXPECT_NE(out.find("export extern \"C++\" {"), std::string::npos)
+      << "the C++ body must be one exported linkage block";
+  EXPECT_NE(out.find("export extern \"C\" {"), std::string::npos)
+      << "C-linkage entities need a block of their own";
+
+  auto cxx_at = out.find("export extern \"C++\" {");
+  auto c_at = out.find("export extern \"C\" {");
+  auto pos = [&](std::string_view needle) { return out.find(needle); };
+
+  // The internal-linkage constants are re-exported, inside the C++ block.
+  ASSERT_NE(pos("using ::linkage_lib::kToggle;"), std::string::npos);
+  EXPECT_GT(pos("using ::linkage_lib::kToggle;"), cxx_at);
+  EXPECT_LT(pos("using ::linkage_lib::kToggle;"), c_at);
+  EXPECT_NE(pos("using ::linkage_lib::kLimit;"), std::string::npos);
+  EXPECT_NE(pos("using ::linkage_lib::compute;"), std::string::npos);
+  EXPECT_NE(pos("using ::linkage_lib::Widget;"), std::string::npos);
+
+  // The C entry point goes after the C block opens.
+  ASSERT_NE(pos("using ::linkage_lib_c_entry;"), std::string::npos);
+  EXPECT_GT(pos("using ::linkage_lib_c_entry;"), c_at)
+      << "a C-linkage function must not sit in the extern \"C++\" block";
+}

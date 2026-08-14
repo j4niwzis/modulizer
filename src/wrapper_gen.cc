@@ -109,10 +109,11 @@ void emit_tree(llvm::raw_ostream &os, const NsNode &node,
                const std::set<std::string> &extern_cxx) {
   std::string indent(depth * 2, ' ');
   if (!node.items.empty()) {
-    // The root node holds global-namespace entities (no namespace wrapper):
-    // their using-declarations need `export`. Entities inside an exported
-    // namespace are exported via the namespace block itself.
-    emit_items(os, indent, node.items, depth == 0, extern_cxx);
+    // Global-namespace entities have no namespace block to export them, so
+    // their using-declarations carry `export` themselves — unless the caller
+    // already wrapped the whole body in an exported linkage block, in which
+    // case a nested `export` would be redundant (and ill-formed).
+    emit_items(os, indent, node.items, depth == 0 && export_ns, extern_cxx);
   }
   for (const auto &[name, child] : node.children) {
     if (child.items.empty() && child.children.empty()) continue;
@@ -132,6 +133,14 @@ void emit_tree(llvm::raw_ostream &os, const NsNode &node,
 // reachable_internal (consumer- or macro-reachable). Entities whose FQN is in
 // extern_cxx are cross-module friend-declared `extern "C++"` shared entities and
 // are re-exported with matching linkage.
+// A header wrapper re-exports entities that all belong to the global module —
+// each is declared in a header included in the global module fragment — so the
+// body is emitted as one `export extern "C++"` block, which attaches the
+// re-exports there. That is also what makes entities with internal linkage
+// re-exportable: a plain exported using declaration naming a `const` variable
+// at namespace scope is rejected outright, and `export` has to sit outside the
+// linkage block rather than inside it. Entities with C language linkage cannot
+// live in that block and get an `export extern "C"` one of their own.
 void emit_wrapper_body(llvm::raw_ostream &os, const EntityModel &model,
                        llvm::StringRef internal_filter,
                        const std::vector<std::string> &reachable_internal,
@@ -140,12 +149,26 @@ void emit_wrapper_body(llvm::raw_ostream &os, const EntityModel &model,
   std::set<std::string> reachable(reachable_internal.begin(),
                                    reachable_internal.end());
 
-  NsNode root;
+  NsNode cxx_root, c_root;
+  bool any_c = false;
   for (const auto &item : model.items) {
-    insert(root, item, re, reachable);
+    if (item.c_language_linkage) {
+      any_c = true;
+      insert(c_root, item, re, reachable);
+    } else {
+      insert(cxx_root, item, re, reachable);
+    }
   }
 
-  emit_tree(os, root, "", 0, true, extern_cxx);
+  os << "export extern \"C++\" {\n";
+  emit_tree(os, cxx_root, "", 0, /*export_using=*/false, extern_cxx);
+  os << "}\n";
+
+  if (any_c) {
+    os << "\nexport extern \"C\" {\n";
+    emit_tree(os, c_root, "", 0, /*export_using=*/false, extern_cxx);
+    os << "}\n";
+  }
 }
 
 } // namespace
