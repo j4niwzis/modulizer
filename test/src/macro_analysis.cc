@@ -372,3 +372,86 @@ TEST(SharedHeaderModels, PrecomputedModelsGiveIdenticalAnalyses) {
   EXPECT_EQ(mm_shared.macro_reachable, mm_own.macro_reachable);
   EXPECT_EQ(mm_shared.macro_modules, mm_own.macro_modules);
 }
+
+TEST(MacroAnalysis, KeepsGuardOfConditionalNestedInAnIncludeGuard) {
+  // A macro-only conditional is emitted verbatim so the right branch expands on
+  // the actual platform. Nested conditionals are left to the enclosing block,
+  // which carries them along — but only when that block is itself emitted.
+  //
+  // A header wrapped in an `#ifndef` include guard looks macro-only at the
+  // moment the nested block closes, because the code that disqualifies it comes
+  // further down the file. Suppressing the nested block on that basis lost its
+  // guard entirely: the enclosing block was never emitted, and the macros file
+  // ended up with whichever branch the conversion host happened to take.
+  std::string src =
+      "#ifndef LIB_DEFS_H_\n"
+      "#define LIB_DEFS_H_\n"
+      "\n"
+      "#ifdef __has_include\n"
+      "#define LIB_HAS_INCLUDE __has_include\n"
+      "#else\n"
+      "#define LIB_HAS_INCLUDE(...) 0\n"
+      "#endif\n"
+      "\n"
+      "namespace lib { inline int use() { return 1; } }\n"
+      "\n"
+      "#endif  // LIB_DEFS_H_\n";
+
+  std::vector<MacroRec> macros;
+  extract_textual_macros(src, macros);
+
+  auto block = std::ranges::find_if(macros, [](const MacroRec &m) {
+    return m.name.empty();
+  });
+  ASSERT_NE(block, macros.end())
+      << "the macro-only conditional must be emitted verbatim";
+  EXPECT_NE(block->body.find("#ifdef __has_include"), std::string::npos)
+      << "its guard must be kept, not just the branch taken here";
+  EXPECT_NE(block->body.find("#define LIB_HAS_INCLUDE __has_include"),
+            std::string::npos);
+  EXPECT_NE(block->body.find("#define LIB_HAS_INCLUDE(...) 0"),
+            std::string::npos)
+      << "both branches must survive so the header ports to a compiler that "
+         "takes the other one";
+  EXPECT_EQ(block->body.find("namespace lib"), std::string::npos)
+      << "the enclosing include guard mixes in code and must not be emitted";
+}
+
+TEST(MacroAnalysis, EmitsConditionalBlocksInSourceOrder) {
+  // Order is load-bearing: a macro used in a later conditional's `#if` has to
+  // be defined by an earlier one, so the blocks must come out in the order
+  // they were written, not the order they happen to be collected in.
+  std::string src =
+      "#ifndef LIB_DEFS_H_\n"
+      "#define LIB_DEFS_H_\n"
+      "\n"
+      "#ifdef __has_attribute\n"
+      "#define LIB_HAVE_ATTRIBUTE(x) __has_attribute(x)\n"
+      "#else\n"
+      "#define LIB_HAVE_ATTRIBUTE(x) 0\n"
+      "#endif\n"
+      "\n"
+      "#if LIB_HAVE_ATTRIBUTE(format)\n"
+      "#define LIB_PRINTF __attribute__((format(printf, 1, 2)))\n"
+      "#else\n"
+      "#define LIB_PRINTF\n"
+      "#endif\n"
+      "\n"
+      "namespace lib { inline int use() { return 1; } }\n"
+      "\n"
+      "#endif  // LIB_DEFS_H_\n";
+
+  std::vector<MacroRec> macros;
+  extract_textual_macros(src, macros);
+
+  std::string emitted;
+  for (const auto &m : macros)
+    if (m.name.empty()) emitted += m.body;
+
+  auto have = emitted.find("#define LIB_HAVE_ATTRIBUTE(x) __has_attribute(x)");
+  auto printf_use = emitted.find("#if LIB_HAVE_ATTRIBUTE(format)");
+  ASSERT_NE(have, std::string::npos);
+  ASSERT_NE(printf_use, std::string::npos);
+  EXPECT_LT(have, printf_use)
+      << "the macro must be defined before the conditional that tests it";
+}

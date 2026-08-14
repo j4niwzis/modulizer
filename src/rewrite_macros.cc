@@ -152,7 +152,23 @@ export void extract_textual_macros(const std::string &original,
     bool is_zero;       // `#if 0` (dead on every platform)
     bool has_define;    // contains a non-guard #define (in any nested branch)
     bool has_code;      // contains a non-preprocessor (declaration) line
+    // Conditionals closed while this one was open, as indices into `cands`.
+    std::vector<std::size_t> children;
   };
+  // A closed conditional and whether it is worth emitting verbatim. Whether a
+  // NESTED one also needs emitting cannot be decided when it closes: that turns
+  // on whether the enclosing block ends up emitted, and the enclosing block's
+  // code may all come after it — which is exactly the shape of a header whose
+  // include guard wraps the whole file. Deciding early suppressed a nested
+  // conditional as "the parent covers it" when the parent was later disqualified
+  // by the code below it and never emitted at all, losing the guard.
+  struct Cand {
+    std::size_t start, end;
+    bool worth;
+    std::vector<std::size_t> children;
+  };
+  std::vector<Cand> cands;
+  std::vector<std::size_t> roots;
   std::vector<CondBlock> blocks;
   bool in_macro_cont = false;  // inside a multi-line `#define \` continuation
 
@@ -204,30 +220,25 @@ export void extract_textual_macros(const std::string &original,
           auto ns = rest.find_first_not_of(" \t");
           is_zero = ns != std::string_view::npos && rest[ns] == '0';
         }
-        blocks.push_back({pos, is_zero, false, false});
+        blocks.push_back({pos, is_zero, false, false, {}});
       } else if (dir == "endif") {
         if (!blocks.empty()) {
-          auto b = blocks.back();
+          auto b = std::move(blocks.back());
           blocks.pop_back();
-          // Emit a macro-only conditional verbatim so the correct branch
-          // expands on the actual platform. A block mixing macros with code is
-          // skipped (it would declare entities in the global module fragment);
-          // its macros are still captured individually by PPCallbacks. When the
-          // enclosing block is itself macro-only it will be emitted and covers
-          // this one, so only emit when the parent is not macro-only.
-          bool parent_macro_only =
-              !blocks.empty() && blocks.back().has_define &&
-              !blocks.back().has_code && !blocks.back().is_zero;
-          if (b.has_define && !b.has_code && !b.is_zero &&
-              !parent_macro_only) {
-            auto end = nl + 1;
-            auto full = std::string(src.substr(b.start, end - b.start));
-            // The block is macro-only and is emitted verbatim so conditional
-            // macros re-expand on the actual platform.
-            auto cleaned = strip_block_includes(std::move(full));
-            macros.push_back({"", std::move(cleaned), (unsigned)b.start,
-                              (unsigned)(nl + 1)});
-          }
+          // A macro-only conditional is worth emitting verbatim so the correct
+          // branch expands on the actual platform. A block mixing macros with
+          // code is not (it would declare entities in the global module
+          // fragment); its macros are still captured individually by
+          // PPCallbacks. Whether a nested one is redundant — covered by an
+          // enclosing block that gets emitted — is settled after the scan.
+          cands.push_back({b.start, nl + 1,
+                           b.has_define && !b.has_code && !b.is_zero,
+                           std::move(b.children)});
+          auto idx = cands.size() - 1;
+          if (!blocks.empty())
+            blocks.back().children.push_back(idx);
+          else
+            roots.push_back(idx);
         }
       } else if (dir == "else" || dir == "elif") {
         // keep blocks unchanged
@@ -274,6 +285,25 @@ export void extract_textual_macros(const std::string &original,
     }
     pos = nl + 1;
   }
+
+  // Emit the outermost conditional on each path that is worth emitting; an
+  // emitted block carries its nested ones along, so descend only past blocks
+  // that are not emitted themselves. Outermost-first keeps the emitted blocks
+  // in source order.
+  auto emit = [&](auto &&self, std::size_t idx) -> void {
+    auto &c = cands[idx];
+    if (c.worth) {
+      auto full = std::string(src.substr(c.start, c.end - c.start));
+      macros.push_back({"", strip_block_includes(std::move(full)),
+                        (unsigned)c.start, (unsigned)c.end});
+      return;
+    }
+    // Siblings are recorded as they close, which for siblings is source order —
+    // and source order is what has to be kept, since a macro used in a later
+    // conditional's `#if` must already be defined by an earlier one.
+    for (auto child : c.children) self(self, child);
+  };
+  for (auto idx : roots) emit(emit, idx);
 }
 
 // Result of override-guard analysis for a macro define.
