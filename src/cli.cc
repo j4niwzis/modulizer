@@ -528,15 +528,10 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
 
   // Which library headers produce a generated macro file? A consumer must
   // include those explicitly (macros do not cross module boundaries).
-  std::set<std::string> headers_with_macros;
-  {
-    std::vector<EntityModel> models(header_paths.size());
-    parallel_for(header_paths.size(), [&](std::size_t i) {
-      models[i] = analyze_files_with_flags({header_paths[i]}, all_extra);
-    });
-    for (std::size_t i = 0; i < header_paths.size(); ++i)
-      if (!models[i].macros.empty()) headers_with_macros.insert(header_paths[i]);
-  }
+  // One sweep of the library headers answers both what they declare and which
+  // of them define macros; the trace below reuses it instead of sweeping again.
+  auto header_analysis = analyze_library_headers(header_paths, all_extra);
+  const auto &headers_with_macros = header_analysis.headers_with_macros;
 
   auto include_map = build_include_module_map(
       header_paths, library_name, all_extra, HyphenMacrosOpt.getValue(),
@@ -585,8 +580,9 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
 
     if (any_library_include && !header_paths.empty()) {
       // One parse per consumer answers both questions.
-      auto traced = trace_consumers(header_paths, consumer_paths, library_name,
-                                    all_extra, &virtual_sources);
+      auto traced =
+          trace_consumers(header_analysis.internal_by_header, consumer_paths,
+                          library_name, all_extra, &virtual_sources);
       for (auto &[c, producers] : traced.producers_by_consumer) {
         std::set<std::string> mods;
         for (auto &hp : producers)
