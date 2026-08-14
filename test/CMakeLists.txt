@@ -9,7 +9,7 @@ set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
 set(CMAKE_CXX_MODULE_STD ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-project(modulizerTests LANGUAGES CXX)
+project(modulizerTests LANGUAGES CXX C)
 
 # ---- Options ----
 

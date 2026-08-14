@@ -15,7 +15,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 project(
   modulizer
   VERSION 1.0
-  LANGUAGES CXX
+  LANGUAGES CXX C
 )
 
 
