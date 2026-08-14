@@ -1265,6 +1265,17 @@ TEST(HeaderRewrite, ImportStdReplacesCppHeadersKeepsCHeaders) {
       << "the macro-carrying <cerrno> wrapper must be kept";
   EXPECT_NE(r.cc_content.find("#include <cstdio>"), std::string::npos)
       << "the macro-carrying <cstdio> wrapper must be kept";
+  // Those wrappers are reached from deep inside libstdc++/libc++ private
+  // headers, behind that implementation's own feature guards (`#if
+  // __glibcxx_atomic_wait`, `#ifdef _GLIBCXX_HAVE_LINUX_FUTEX`). The header is
+  // ours to keep; the conditions it was found under are not, and emitting them
+  // would pin the output to the standard library it was generated against.
+  EXPECT_EQ(r.cc_content.find("_GLIBCXX"), std::string::npos)
+      << "a libstdc++ private guard must never reach the GMF";
+  EXPECT_EQ(r.cc_content.find("__glibcxx"), std::string::npos)
+      << "a libstdc++ private feature-test guard must never reach the GMF";
+  EXPECT_EQ(r.cc_content.find("_LIBCPP"), std::string::npos)
+      << "a libc++ private guard must never reach the GMF";
 }
 
 TEST(HeaderRewrite, GmfMergesDuplicateIncludes) {
