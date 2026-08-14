@@ -859,3 +859,28 @@ TEST(FullRewrite, ImplUnitIncludesUmbrellaMacros) {
       << "an impl unit that uses macros from the umbrella header must include "
          "the umbrella macros file";
 }
+
+TEST(FullRewrite, FriendPairsFromTheScanMatchTheDedicatedSweep) {
+  // Which friend targets matter depends on the set of extern "C++" entities,
+  // which is only complete after the template-body scan and the source scans
+  // have run — but the friend declarations themselves do not depend on it. So
+  // they are collected by a sweep that happens anyway and filtered here, and
+  // that must give exactly what the dedicated sweep gave.
+  std::vector<std::string> headers = {data_path("friendimpl_lib/core.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  std::vector<std::string> fwd = {"friendimpl_lib::Foo"};
+
+  auto swept = friend_extern_fqns(headers, extra_args, fwd);
+  auto scan = cross_module_template_body_referenced_fqns(headers, extra_args);
+  auto filtered = friend_extern_fqns_from_pairs(scan.friend_pairs, fwd);
+
+  EXPECT_EQ(filtered, swept)
+      << "filtering the collected pairs must equal the dedicated sweep";
+  EXPECT_NE(std::find(filtered.begin(), filtered.end(), "friendimpl_lib::Bar"),
+            filtered.end())
+      << "and must still find the friend target";
+
+  // A class that is not extern "C++" must contribute nothing.
+  EXPECT_TRUE(friend_extern_fqns_from_pairs(scan.friend_pairs, {}).empty())
+      << "no extern \"C++\" enclosing class means no friend targets";
+}

@@ -707,6 +707,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   // types that are never defined stay exported.
   std::vector<std::string> defined_fqns;
   std::vector<std::string> fwd_declared_fqns;
+  std::vector<std::pair<std::string, std::string>> friend_pairs;
   std::vector<std::string> alias_reachable;
   std::set<std::string> same_module_free_fqns;
   if (!header_paths.empty()) {
@@ -732,6 +733,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     {
       auto tpl_refs = cross_module_template_body_referenced_fqns(
           header_paths, all_extra, &header_models);
+      friend_pairs = std::move(tpl_refs.friend_pairs);
       // Skip entities that are already exported (macro-reachable or listed via
       // `--reachable-fqn`): consumers see those through the module import, so
       // the template body resolves them without an injected `extern "C++"`
@@ -812,8 +814,10 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     // Entities friend-declared inside an extern "C++" class attach to the
     // global module, so their definitions must be `extern "C++"` too, wherever
     // they live. The impl side needs these FQNs to mark the definitions.
-    auto friend_fqns = friend_extern_fqns(
-        header_paths, all_extra, fwd_declared_fqns);
+    // The friend declarations were already collected by the template-body
+    // scan; which of them matter is decided here, without another parse.
+    auto friend_fqns =
+        friend_extern_fqns_from_pairs(friend_pairs, fwd_declared_fqns);
     fwd_declared_fqns.insert(fwd_declared_fqns.end(),
                              friend_fqns.begin(), friend_fqns.end());
   }

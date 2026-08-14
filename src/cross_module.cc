@@ -89,6 +89,45 @@ export std::vector<std::string> cross_module_fwd_declared_fqns(
 export struct TemplateBodyRefResult {
   std::vector<std::string> fwd_declared;
   std::vector<std::string> aliases;
+  // Every friend declaration seen while scanning, as (enclosing class FQN,
+  // friend target FQN). friend_extern_fqns keeps the targets whose enclosing
+  // class is `extern "C++"`, which is decided later — the scan itself does not
+  // depend on that, so it rides along here instead of costing its own sweep.
+  std::vector<std::pair<std::string, std::string>> friend_pairs;
+};
+
+// Records every friend declaration as (enclosing class FQN, friend target
+// FQN). Which of them matter depends on the set of `extern "C++"` entities,
+// which is only complete later; the scan does not, so it can ride on a sweep
+// that is happening anyway and be filtered afterwards.
+class FriendPairCollector
+    : public clang::RecursiveASTVisitor<FriendPairCollector> {
+public:
+  FriendPairCollector(const clang::SourceManager &sm,
+                      std::vector<std::pair<std::string, std::string>> &out)
+      : sm(sm), out(out) {}
+
+  bool shouldVisitTemplateInstantiations() const { return false; }
+  bool shouldVisitImplicitCode() const { return false; }
+
+  bool VisitFriendDecl(clang::FriendDecl *f) {
+    if (!f) return true;
+    auto *cls = llvm::dyn_cast_or_null<clang::CXXRecordDecl>(f->getDeclContext());
+    if (!cls) return true;
+    auto loc = cls->getLocation();
+    if (!loc.isValid() || !sm.isInMainFile(loc)) return true;
+    auto enclosing = cls->getQualifiedNameAsString();
+    if (auto *tsi = f->getFriendType())
+      if (auto *td = tsi->getType()->getAsTagDecl())
+        out.emplace_back(enclosing, td->getQualifiedNameAsString());
+    if (auto *nd = llvm::dyn_cast_or_null<clang::NamedDecl>(f->getFriendDecl()))
+      out.emplace_back(enclosing, nd->getQualifiedNameAsString());
+    return true;
+  }
+
+private:
+  const clang::SourceManager &sm;
+  std::vector<std::pair<std::string, std::string>> &out;
 };
 
 // `precomputed` has the same meaning as in cross_module_fwd_declared_fqns:
@@ -334,11 +373,14 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
 
   std::vector<std::set<std::string>> partial_outs(paths.size());
   std::vector<std::set<std::string>> partial_aliases(paths.size());
+  std::vector<std::vector<std::pair<std::string, std::string>>> partial_friends(
+      paths.size());
   parallel_parse(
       paths, extra_args, /*delayed_template_parsing=*/false,
       [&](std::size_t i, const std::string &path) {
         auto &out = partial_outs[i];
         auto &out_aliases = partial_aliases[i];
+        auto &out_friends = partial_friends[i];
         return std::make_unique<VisitorFrontendActionFactory>(
             [&, self = path](clang::CompilerInstance &ci) {
               struct Consumer : clang::ASTConsumer {
@@ -358,8 +400,12 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
                 std::set<std::string> &o;
                 std::set<std::string> &oa;
               };
-              return std::make_unique<Consumer>(defined_files, alias_fqns, self,
-                                                out, out_aliases);
+              std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+              consumers.push_back(std::make_unique<Consumer>(
+                  defined_files, alias_fqns, self, out, out_aliases));
+              consumers.push_back(
+                  make_traverse_consumer<FriendPairCollector>(out_friends));
+              return make_combined_consumer(std::move(consumers));
             });
       });
   for (std::size_t i = 0; i < paths.size(); ++i) {
@@ -369,6 +415,9 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
   TemplateBodyRefResult result;
   result.fwd_declared = std::ranges::to<std::vector>(out);
   result.aliases = std::ranges::to<std::vector>(out_aliases);
+  for (auto &per_file : partial_friends)
+    result.friend_pairs.insert(result.friend_pairs.end(), per_file.begin(),
+                               per_file.end());
   return result;
 }
 
@@ -617,6 +666,19 @@ export std::vector<std::string> out_of_line_defined_free_classes(
 // A friend declaration inside a global-module class attaches to the global
 // module, so the friend target's definition (wherever it lives) must also be
 // `extern "C++"`. The impl side needs these FQNs to mark the definitions.
+// The friend targets whose enclosing class is `extern "C++"`, from pairs a
+// scan already collected — no parse of its own.
+export std::vector<std::string> friend_extern_fqns_from_pairs(
+    const std::vector<std::pair<std::string, std::string>> &friend_pairs,
+    const std::vector<std::string> &fwd_declared_fqns) {
+  std::set<std::string> fwd_set(fwd_declared_fqns.begin(),
+                                fwd_declared_fqns.end());
+  std::set<std::string> out;
+  for (const auto &[enclosing, target] : friend_pairs)
+    if (fwd_set.count(enclosing)) out.insert(target);
+  return std::ranges::to<std::vector>(out);
+}
+
 export std::vector<std::string> friend_extern_fqns(
     const std::vector<std::string> &paths,
     const std::vector<std::string> &extra_args,
