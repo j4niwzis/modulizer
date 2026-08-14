@@ -476,3 +476,46 @@ TEST(ConsumerTrace, LibraryHeaderAnalysisMatchesTheSeparatePasses) {
   ASSERT_NE(it, shared.producers_by_consumer.end());
   EXPECT_NE(it->second.count(producer), 0u);
 }
+
+TEST(ConsumerTrace, SharedHeaderScanMatchesTheSeparateSweeps) {
+  // A --full run wants both the per-file entity models and the internal-entity
+  // index, and parsed every header once for each. One sweep yields both, and
+  // must yield exactly what the two produced.
+  std::vector<std::string> headers = {data_path("test_lib/producer.h"),
+                                      data_path("test_lib/consumer.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto scan = scan_headers(headers, extra_args);
+  auto models = analyze_files_per_file(headers, extra_args);
+  ASSERT_EQ(scan.models.size(), models.size());
+  for (std::size_t i = 0; i < models.size(); ++i)
+    EXPECT_EQ(scan.models[i].items.size(), models[i].items.size())
+        << "entity extraction must be unaffected by the extra consumer";
+
+  EXPECT_EQ(scan.internal.covered.size(), headers.size())
+      << "the scan must record which files it looked at";
+  EXPECT_EQ(trace_consumer_reachability(headers, "test_lib", extra_args,
+                                        &scan.internal),
+            trace_consumer_reachability(headers, "test_lib", extra_args))
+      << "reusing the index must not change reachability";
+}
+
+TEST(ConsumerTrace, UncoveredPathsAreStillScanned) {
+  // Coverage is not the same as presence: a file that declared no internal
+  // entity is absent from the index, and a file nobody scanned is absent too.
+  // Only the recorded coverage tells them apart, and anything uncovered — an
+  // implementation source, when only the headers were scanned — must still be
+  // collected rather than silently treated as empty.
+  std::vector<std::string> headers = {data_path("test_lib/producer.h"),
+                                      data_path("test_lib/consumer.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto full = trace_consumer_reachability(headers, "test_lib", extra_args);
+
+  // An index that covers only the first header: the second must be scanned.
+  auto scan = scan_headers({headers[0]}, extra_args);
+  auto partial = trace_consumer_reachability(headers, "test_lib", extra_args,
+                                             &scan.internal);
+  EXPECT_EQ(partial, full)
+      << "a partially covered index must give the same answer as none";
+}

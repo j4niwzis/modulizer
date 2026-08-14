@@ -1,6 +1,7 @@
 module;
 
 export module modulizer.consumer_trace;
+import modulizer.analyzer;
 import modulizer.astutil;
 import modulizer.include_analysis;
 import modulizer.trace_visitors;
@@ -139,14 +140,71 @@ std::map<std::string, std::vector<std::string>> to_vector_map(
   return result;
 }
 
+// The internal entities declared per file, together with the set of files
+// actually scanned. Coverage has to be explicit: a file absent from the map
+// declared none, which is not the same as a file nobody looked at.
+export struct InternalEntityIndex {
+  std::map<std::string, std::set<std::string>> by_header;
+  std::set<std::string> covered;
+};
+
+// One sweep of `paths` producing both the per-file entity models and the
+// internal-entity index. A --full run wants both, and used to parse every
+// header once for each.
+export struct HeaderScan {
+  std::vector<EntityModel> models;
+  InternalEntityIndex internal;
+};
+
+export HeaderScan scan_headers(const std::vector<std::string> &paths,
+                               const std::vector<std::string> &extra_args) {
+  HeaderScan scan;
+  scan.models.resize(paths.size());
+  std::vector<std::vector<std::string>> ifdef_macros(paths.size());
+  std::vector<std::set<std::string>> internal(paths.size());
+  parallel_parse(paths, extra_args, /*delayed_template_parsing=*/false,
+                 [&](std::size_t i, const std::string &) {
+                   auto &entities = internal[i];
+                   return std::make_unique<EntityExtractionFactory>(
+                       scan.models[i], ifdef_macros[i], /*wrapper_mode=*/false,
+                       /*undefed=*/nullptr,
+                       [&entities](clang::CompilerInstance &) {
+                         return make_traverse_consumer<InternalCollector>(
+                             &entities);
+                       });
+                 });
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    scan.internal.covered.insert(paths[i]);
+    if (!internal[i].empty())
+      scan.internal.by_header[paths[i]] = std::move(internal[i]);
+  }
+  return scan;
+}
+
 export std::map<std::string, std::vector<std::string>>
 trace_consumer_reachability(
     const std::vector<std::string> &header_paths,
     llvm::StringRef library_name,
-    const std::vector<std::string> &extra_args) {
+    const std::vector<std::string> &extra_args,
+    const InternalEntityIndex *precomputed = nullptr) {
 
-  std::map<std::string, std::set<std::string>> internal_by_header =
-      collect_internal_by_header(header_paths, extra_args, /*verbose=*/true);
+  // Whatever a caller already scanned is reused; anything it did not cover —
+  // implementation sources, say, when only the headers were scanned — is
+  // collected here.
+  std::map<std::string, std::set<std::string>> internal_by_header;
+  std::vector<std::string> to_scan;
+  if (precomputed) {
+    internal_by_header = precomputed->by_header;
+    for (const auto &p : header_paths)
+      if (!precomputed->covered.count(p)) to_scan.push_back(p);
+  } else {
+    to_scan = header_paths;
+  }
+  if (!to_scan.empty()) {
+    auto rest = collect_internal_by_header(to_scan, extra_args,
+                                           /*verbose=*/true);
+    for (auto &[path, fqns] : rest) internal_by_header[path] = std::move(fqns);
+  }
 
   auto deps = build_header_deps(header_paths, library_name, extra_args);
   llvm::outs() << "  deps: " << deps.size() << " consumers\n";

@@ -662,9 +662,16 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   trace_paths.insert(trace_paths.end(), source_paths.begin(), source_paths.end());
   auto all_extra = first_extra_args(parser.getCompilations(), trace_paths);
 
+  // One sweep of the headers yields both the per-file entity models that four
+  // analyses below want and the internal-entity index the reachability trace
+  // needs; each used to parse the whole header set for itself.
+  HeaderScan header_scan;
+  if (!header_paths.empty()) header_scan = scan_headers(header_paths, all_extra);
+  std::vector<EntityModel> &header_models = header_scan.models;
+
   if (ReachableFqnsOpt.getValue().empty() && trace_paths.size() > 1) {
     internal_reachable = trace_consumer_reachability(
-        trace_paths, library_name, all_extra);
+        trace_paths, library_name, all_extra, &header_scan.internal);
   }
   // Explicit INTERNAL consumer sources (the library's own tests/main, or a
   // sibling library): entities they reference are exported from their defining
@@ -682,12 +689,6 @@ export inline int run_full_rewrite(int argc, const char **argv) {
 
   auto module_replaces = parse_module_replaces();
 
-  // The per-file entity models: what each header declares, completes and
-  // defines as macros. Four analyses below want exactly these, and each used
-  // to parse the whole header set for itself; extract them once instead.
-  std::vector<EntityModel> header_models;
-  if (!header_paths.empty())
-    header_models = analyze_files_per_file(header_paths, all_extra);
 
   std::vector<std::string> macro_reachable;
   std::set<std::string> macro_modules;
