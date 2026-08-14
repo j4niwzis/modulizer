@@ -46,3 +46,19 @@ TEST(Util, IsInternalSegmentMatchesMarkers) {
   EXPECT_FALSE(is_internal_segment("mylib-internal"));
   EXPECT_FALSE(is_internal_segment("api"));
 }
+
+TEST(Util, BaseCompileFlagsCarryClangsResourceDir) {
+  // A ClangTool derives clang's builtin-header directory from the running
+  // executable's path, so every parse fails with `'stddef.h' file not found`
+  // unless the binary happens to sit beside a clang installation. That failure
+  // is silent — no AST means nothing is found to be used, and every
+  // transitively used header is then dropped from the generated output — so
+  // the flags name the directory explicitly instead.
+  auto &rd = clang_resource_dir();
+  if (rd.empty()) GTEST_SKIP() << "no clang++ on PATH to ask for one";
+  EXPECT_TRUE(std::filesystem::exists(std::format("{}/include/stddef.h", rd)))
+      << "the resource directory must be the one holding clang's builtins";
+  auto flags = base_compile_flags();
+  EXPECT_TRUE(std::ranges::contains(flags, std::format("-resource-dir={}", rd)))
+      << "every parse must be told where clang's builtin headers are";
+}

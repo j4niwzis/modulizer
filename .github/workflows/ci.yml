@@ -1,0 +1,163 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GTEST_PARALLEL_COMMIT: cd488bdedc1d2cffb98201a17afc1b298b0b90f1
+
+jobs:
+  # modulizer's own test suite. It links clang's libraries, and every prebuilt
+  # clang (apt.llvm.org, the LLVM release tarballs, Alpine's) is built against
+  # libstdc++ — compiling modulizer with libc++ would give `std::__1::` mangling
+  # on every std type crossing clang's API and would not link. So this suite
+  # varies the C library, and stdlib coverage lives in `generated-tree` below,
+  # which is the code whose portability the tool is actually responsible for.
+  unit:
+    name: unit tests (glibc, libstdc++)
+    runs-on: ubuntu-latest
+    # ubuntu:26.04 for libstdc++ 15, whose `bits/std.cc` CMake compiles as the
+    # `std` module. Runner images ship an older libstdc++.
+    container: ubuntu:26.04
+    env:
+      CMAKE_VERSION: 4.4.2
+    steps:
+      - name: Install prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git gnupg lsb-release ninja-build python3 \
+            software-properties-common wget xz-utils libstdc++-15-dev
+
+      - name: Install clang 22
+        # The libtooling wrapper is generated against clang 22's headers (clang
+        # 21 has no clang/AST/NestedNameSpecifierBase.h), and the modules must
+        # be compiled by the clang that produced the BMIs.
+        run: |
+          curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
+          chmod +x /tmp/llvm.sh
+          /tmp/llvm.sh 22 all
+          ln -sf /usr/lib/llvm-22/bin/clang++ /usr/local/bin/clang++
+          ln -sf /usr/lib/llvm-22/bin/clang /usr/local/bin/clang
+
+      - name: Install CMake ${{ env.CMAKE_VERSION }}
+        run: |
+          mkdir -p /opt/cmake
+          curl -fsSL -o /tmp/cmake.tar.gz \
+            "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz"
+          tar -xf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
+          echo /opt/cmake/bin >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        # -fno-rtti: the prebuilt clang libraries are built without RTTI, so
+        # their typeinfo symbols do not exist. A C compiler is named because
+        # the googletest-modules dependency enables C in its project(), and
+        # these images have no `cc` to fall back on.
+        run: |
+          cmake -S test -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_CXX_FLAGS=-fno-rtti \
+            -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm \
+            -DClang_DIR=/usr/lib/llvm-22/lib/cmake/clang
+
+      - name: Build
+        # Only what the suite needs. `cmake --build` with no target also builds
+        # googletest-modules' own gmock wrapper, which this job compiles
+        # -fno-rtti and which re-exports testing::WhenDynamicCastTo
+        # unconditionally — an entity that only exists under GTEST_HAS_RTTI.
+        # That is a real defect in the generated wrapper, but it belongs to the
+        # generated-tree job (which builds everything, with RTTI on), not here.
+        run: cmake --build build --target modulizerTests -j"$(nproc)"
+
+      - name: Test
+        # gtest-parallel runs each test in its own process; a suite that spends
+        # its time parsing C++ finishes in a fraction of the serial time. Run
+        # from the repository root — the tests resolve fixtures by relative
+        # path, as ctest's WORKING_DIRECTORY does — and with clang on PATH,
+        # which is how the ClangTool they drive finds its system include paths.
+        run: |
+          git clone --quiet https://github.com/google/gtest-parallel.git /opt/gtest-parallel
+          git -C /opt/gtest-parallel checkout --quiet "$GTEST_PARALLEL_COMMIT"
+          python3 /opt/gtest-parallel/gtest-parallel --workers="$(nproc)" build/modulizerTests
+
+  unit-musl:
+    name: unit tests (musl, libstdc++)
+    runs-on: ubuntu-latest
+    steps:
+      # Alpine runs through `docker run` rather than as this job's `container:`.
+      # A job container has the runner's own Node mounted into it to execute
+      # JavaScript actions (checkout, cache, …), and that Node is glibc-linked,
+      # so it cannot start under musl. Keeping the job itself on the glibc
+      # runner means the actions run normally and only the build crosses into
+      # Alpine, which needs nothing but a shell.
+      - uses: actions/checkout@v4
+
+      - name: Build and test under musl
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:edge sh -euxc '
+            # binutils supplies the `ld` clang drives; without it the first
+            # compiler check dies with `posix_spawn failed`. g++ supplies the
+            # GCC installation clang links against on Alpine (crt files,
+            # libgcc) and libstdc++, including the `bits/std.cc` that becomes
+            # the `std` module.
+            # LLVMExports.cmake references every component archive by path
+            # and CMake checks each one exists, so all of them have to be
+            # installed even though this links the shared libraries: Alpine
+            # splits them into llvm22-static/clang22-static, and the testing
+            # ones (libLLVMTestingAnnotations.a, libLLVMTestingSupport.a) into
+            # llvm22-gtest. clang22-extra-tools carries clang-scan-deps, which
+            # CMake drives to scan module dependencies.
+            apk add --no-cache clang22 clang22-dev clang22-extra-tools \
+              clang22-static llvm22-dev llvm22-static llvm22-gtest binutils \
+              g++ cmake ninja-build ninja-is-really-ninja git python3 \
+              musl-dev linux-headers
+            cmake -S test -B build-musl -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER=clang \
+              -DCMAKE_CXX_COMPILER=clang++ \
+              -DCMAKE_CXX_FLAGS=-fno-rtti \
+              -DLLVM_DIR=/usr/lib/llvm22/lib/cmake/llvm \
+              -DClang_DIR=/usr/lib/llvm22/lib/cmake/clang
+            cmake --build build-musl --target modulizerTests -j"$(nproc)"
+            git clone --quiet https://github.com/google/gtest-parallel.git /opt/gtest-parallel
+            git -C /opt/gtest-parallel checkout --quiet '"$GTEST_PARALLEL_COMMIT"'
+            python3 /opt/gtest-parallel/gtest-parallel --workers="$(nproc)" build-musl/modulizerTests
+          '
+
+  generated-tree:
+    # What the tool emits has to compile against a standard library other than
+    # the one it was generated with — that is the whole point of never emitting
+    # `bits/…` or `__algorithm/…` internals, or a private guard like
+    # `#if __glibcxx_atomic_wait`. googletest-modules is modulizer's output for
+    # googletest, so building it under each combination tests exactly that.
+    name: generated tree (${{ matrix.libc }}, ${{ matrix.stdlib }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        libc: [glibc, musl]
+        stdlib: [libstdc++, libc++]
+        exclude:
+          # Alpine's libc++-dev ships headers and libc++.so only — no
+          # `std.cppm` and no `libc++.modules.json` — so CMake cannot build the
+          # `std` module against it and `import std;` is unavailable. libc++
+          # coverage comes from the glibc leg, where apt.llvm.org ships them.
+          - libc: musl
+            stdlib: libc++
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test the generated tree
+        run: |
+          .github/scripts/build-generated-tree.sh "${{ matrix.libc }}" "${{ matrix.stdlib }}"
