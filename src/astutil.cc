@@ -38,6 +38,29 @@ private:
   ConsumerMaker make_;
 };
 
+// Run several ASTConsumers over one parse. Analyses that need the same
+// translation unit — same inputs, same flags — should share the parse rather
+// than each paying for their own: profiling attributes essentially the whole
+// runtime to parsing and Sema, and almost none of it to the traversals.
+export class CombinedConsumer : public clang::ASTConsumer {
+public:
+  explicit CombinedConsumer(
+      std::vector<std::unique_ptr<clang::ASTConsumer>> consumers)
+      : consumers_(std::move(consumers)) {}
+
+  void HandleTranslationUnit(clang::ASTContext &ctx) override {
+    for (auto &c : consumers_) c->HandleTranslationUnit(ctx);
+  }
+
+private:
+  std::vector<std::unique_ptr<clang::ASTConsumer>> consumers_;
+};
+
+export std::unique_ptr<clang::ASTConsumer> make_combined_consumer(
+    std::vector<std::unique_ptr<clang::ASTConsumer>> consumers) {
+  return std::make_unique<CombinedConsumer>(std::move(consumers));
+}
+
 // Shared macro-eligibility check used by the entity/macro collectors and the
 // header rewriter. Returns the MacroInfo when a #define is worth collecting
 // (defined in the main file, not a system/builtin macro, not a header guard),
