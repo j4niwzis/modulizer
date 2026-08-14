@@ -300,3 +300,34 @@ TEST(WrapperGen, WrapsTheBodyInExternCxxAndSeparatesCLinkage) {
   EXPECT_GT(pos("using ::linkage_lib_c_entry;"), c_at)
       << "a C-linkage function must not sit in the extern \"C++\" block";
 }
+
+TEST(WrapperGen, NeverReexportsIntoNamespaceStd) {
+  // A wrapped header may declare things in namespace std — an ADL `swap`, a
+  // `hash` specialisation. Re-opening std to re-export them is undefined
+  // behaviour, and they are not part of the wrapped library's API anyway.
+  clang::tooling::FixedCompilationDatabase db(
+      ".", {"-x", "c++", "-std=c++20", "-I", gDataDir});
+  auto model = analyze_headers_with_cdb(db, {data_path("linkage_lib/api.h")});
+  auto out = generate_wrapper_cc("linkage_lib", {"linkage_lib/api.h"}, model);
+
+  EXPECT_EQ(out.find("namespace std"), std::string::npos)
+      << "the wrapper must never re-open namespace std";
+  EXPECT_EQ(out.find("using ::std::"), std::string::npos);
+  // The library's own entities are unaffected.
+  EXPECT_NE(out.find("using ::linkage_lib::compute;"), std::string::npos);
+}
+
+TEST(WrapperGen, EmitsTheIncludeFormNotTheGivenPath) {
+  // Generating from absolute header paths must not bake the generating
+  // machine's layout into the wrapper: what belongs in the global module
+  // fragment is the form a consumer writes.
+  auto abs = data_path("linkage_lib/api.h");
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  EXPECT_EQ(include_form(abs, extra_args), "linkage_lib/api.h");
+  // A path outside every -I directory has no include form and is kept as is.
+  EXPECT_EQ(include_form("/elsewhere/foo.h", extra_args), "/elsewhere/foo.h");
+  // The most specific -I directory wins.
+  std::vector<std::string> nested = {"-I", gDataDir, "-I",
+                                     gDataDir + "/linkage_lib"};
+  EXPECT_EQ(include_form(abs, nested), "api.h");
+}

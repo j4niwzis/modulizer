@@ -115,6 +115,32 @@ export std::optional<PreprocessorConditional> preprocessor_conditional_kind(
   return std::nullopt;
 }
 
+// The form a consumer writes to include `header_path`: the path relative to
+// whichever `-I` directory (from `extra_args`) contains it, longest match
+// first, so `/opt/llvm/include/clang/AST/Decl.h` under `-I/opt/llvm/include`
+// becomes `clang/AST/Decl.h`. Falls back to the path as given. A generated
+// wrapper must emit this and not the path it was handed, or it bakes the
+// generating machine's layout into the output.
+export std::string include_form(llvm::StringRef header_path,
+                                const std::vector<std::string> &extra_args) {
+  auto path = std::filesystem::path(header_path.str()).lexically_normal();
+  std::string best;
+  auto consider = [&](std::string_view dir) {
+    if (dir.empty()) return;
+    auto d = std::filesystem::path(dir).lexically_normal();
+    auto rel = path.lexically_relative(d).string();
+    if (rel.empty() || rel.starts_with("..")) return;
+    if (best.empty() || rel.size() < best.size()) best = rel;
+  };
+  for (std::size_t i = 0; i < extra_args.size(); ++i) {
+    if (extra_args[i] == "-I" && i + 1 < extra_args.size())
+      consider(extra_args[i + 1]);
+    else if (extra_args[i].starts_with("-I"))
+      consider(std::string_view(extra_args[i]).substr(2));
+  }
+  return best.empty() ? header_path.str() : best;
+}
+
 export struct IncludeRef {
   std::string path;
   bool is_quoted;

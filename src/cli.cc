@@ -306,7 +306,15 @@ export inline int run_wrapper(int argc, const char **argv) {
   expand_overloads(reachable, model);
   expand_transitive_types(reachable, model);
 
-  auto cc = generate_wrapper_cc(ModuleNameOpt, header_paths, model,
+  // Emit the include form of each header, not the path as given: an absolute
+  // path here would bake this machine's layout into the generated wrapper.
+  auto wrapper_extra = first_extra_args(parser.getCompilations(), header_paths);
+  std::vector<std::string> include_forms;
+  include_forms.reserve(header_paths.size());
+  for (const auto &h : header_paths)
+    include_forms.push_back(include_form(h, wrapper_extra));
+
+  auto cc = generate_wrapper_cc(ModuleNameOpt, include_forms, model,
                                 kDefaultInternalFilter,
                                 reachable.reachable_fqns);
   auto h = generate_companion_h(model);
