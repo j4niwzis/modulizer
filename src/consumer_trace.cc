@@ -186,7 +186,9 @@ trace_consumer_reachability(
     const std::vector<std::string> &header_paths,
     llvm::StringRef library_name,
     const std::vector<std::string> &extra_args,
-    const InternalEntityIndex *precomputed = nullptr) {
+    const InternalEntityIndex *precomputed = nullptr,
+    const std::function<std::unique_ptr<clang::ASTConsumer>(
+        clang::CompilerInstance &, const std::string &)> &extra = {}) {
 
   // Whatever a caller already scanned is reused; anything it did not cover —
   // implementation sources, say, when only the headers were scanned — is
@@ -237,12 +239,23 @@ trace_consumer_reachability(
         consumers.size());
     parallel_parse(
         consumers, extra_args, /*delayed_template_parsing=*/true,
-        [&](std::size_t i, const std::string &) {
+        [&](std::size_t i, const std::string &path) {
           auto &local = partials[i];
           return std::make_unique<VisitorFrontendActionFactory>(
-              [&internal_by_header, &local](clang::CompilerInstance &ci) {
-                return std::make_unique<ConsumerRefConsumer>(
+              [&internal_by_header, &local, &extra,
+               self = path](clang::CompilerInstance &ci) {
+                auto own = std::make_unique<ConsumerRefConsumer>(
                     ci.getSourceManager(), internal_by_header, local, nullptr);
+                // Another analysis of the same file rides this parse. It
+                // decides per path whether it wants this one at all, so a
+                // header-only analysis is not fed implementation sources.
+                std::unique_ptr<clang::ASTConsumer> rider;
+                if (extra) rider = extra(ci, self);
+                if (!rider) return std::unique_ptr<clang::ASTConsumer>(std::move(own));
+                std::vector<std::unique_ptr<clang::ASTConsumer>> both;
+                both.push_back(std::move(own));
+                both.push_back(std::move(rider));
+                return make_combined_consumer(std::move(both));
               });
         });
     for (auto &partial : partials)

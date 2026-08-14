@@ -130,6 +130,269 @@ private:
   std::vector<std::pair<std::string, std::string>> &out;
 };
 
+// The raw per-file output of the template-body scan, before it is folded into
+// a TemplateBodyRefResult. Kept separate so the scan can ride a sweep that is
+// already parsing these files instead of running one of its own.
+export struct TemplateBodyRawScan {
+  std::vector<std::set<std::string>> outs;
+  std::vector<std::set<std::string>> aliases;
+  std::vector<std::vector<std::pair<std::string, std::string>>> friend_pairs;
+
+  explicit TemplateBodyRawScan(std::size_t n = 0)
+      : outs(n), aliases(n), friend_pairs(n) {}
+};
+
+// Collects the FQNs an entity references from template bodies, restricted to
+// entities defined in a different file.
+class TemplateBodyRefCollector
+    : public clang::RecursiveASTVisitor<TemplateBodyRefCollector> {
+public:
+  TemplateBodyRefCollector(
+      const clang::SourceManager &sm,
+      const std::map<std::string, std::set<std::string>> &defined_files,
+      const std::set<std::string> &alias_fqns, const std::string &self_path,
+      std::set<std::string> &out, std::set<std::string> &out_aliases)
+      : sm(sm), defined_files(defined_files), alias_fqns(alias_fqns),
+        self_path(self_path), out(out), out_aliases(out_aliases) {}
+
+  bool shouldVisitTemplateInstantiations() const { return false; }
+  bool shouldVisitImplicitCode() const { return false; }
+
+  // Nonzero while traversing a template body (a function template, a class
+  // template's member function, etc.). Only references made from inside such
+  // bodies get instantiated at the consumer and need the shared-entity
+  // treatment; references in plain (non-template) declarations resolve when
+  // the module is compiled and are handled by normal export rules.
+  int template_depth_ = 0;
+
+  bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl *d) {
+    ++template_depth_;
+    bool r = clang::RecursiveASTVisitor<TemplateBodyRefCollector>::
+        TraverseFunctionTemplateDecl(d);
+    --template_depth_;
+    return r;
+  }
+
+  bool TraverseCXXMethodDecl(clang::CXXMethodDecl *d) {
+    // Member functions of a class template (pattern) are instantiated at the
+    // consumer too.
+    if (d && d->getParent() &&
+        d->getParent()->getDescribedClassTemplate())
+      ++template_depth_;
+    bool r = clang::RecursiveASTVisitor<TemplateBodyRefCollector>::
+        TraverseCXXMethodDecl(d);
+    if (d && d->getParent() &&
+        d->getParent()->getDescribedClassTemplate())
+      --template_depth_;
+    return r;
+  }
+
+  void record(clang::NamedDecl *d) {
+    if (!d) return;
+    auto *canon = llvm::dyn_cast_or_null<clang::NamedDecl>(d->getCanonicalDecl());
+    if (!canon) return;
+    auto loc = canon->getLocation();
+    if (!loc.isValid() || sm.isInMainFile(loc) || sm.isInSystemHeader(loc))
+      return;
+    // Only namespace-scope entities are injectable. Skip template parameters
+    // (`kFromKind`), enum constants (`kBool`, `kInteger`), locals, etc.
+    {
+      bool ns_scope = false;
+      for (auto *dc = canon->getDeclContext(); dc; dc = dc->getParent()) {
+        if (llvm::isa<clang::NamespaceDecl>(dc) ||
+            llvm::isa<clang::TranslationUnitDecl>(dc)) {
+          ns_scope = true;
+          break;
+        }
+        if (llvm::isa<clang::FunctionDecl>(dc) ||
+            llvm::isa<clang::CXXRecordDecl>(dc) ||
+            llvm::isa<clang::ClassTemplateDecl>(dc) ||
+            llvm::isa<clang::FunctionTemplateDecl>(dc) ||
+            llvm::isa<clang::EnumDecl>(dc) ||
+            llvm::isa<clang::TypeAliasTemplateDecl>(dc) ||
+            llvm::isa<clang::TypeAliasDecl>(dc))
+          break;
+      }
+      if (!ns_scope) return;
+    }
+    auto fqn = canon->getQualifiedNameAsString();
+    // Only INTERNAL-namespace entities need the shared-entity treatment:
+    // public entities are exported by default and thus visible to the using
+    // module via its import, so no injected declaration is needed. The
+    // real-world case is `lib::internal::MatchHelper` used inside
+    // `Spec<F>::Call` — `lib::PublicValue` (public) must not
+    // be flagged.
+    if (!fqn.contains("::internal::") && !fqn.contains("::detail::") &&
+        !fqn.contains("::impl::")) return;
+    auto it = defined_files.find(fqn);
+    if (it == defined_files.end()) return;  // not defined by any library header
+    if (it->second.count(self_path)) return;  // defined here, not cross-module
+    // Alias templates cannot be forward-declared: mark them for EXPORT from
+    // the defining module (visible via import) instead of injecting a copy.
+    if (alias_fqns.count(fqn)) {
+      out_aliases.insert(fqn);
+      return;
+    }
+    if (!out.insert(fqn).second) return;  // already recorded
+    // Transitive expansion: an injected entity's own definition may reference
+    // further cross-module entities. For example
+    // `IsConvertible<From, To>` (defined in
+    // internal-utils.h) is `using IsConvertible =
+    // IsConvertibleImpl<...>` — the impl alias must be
+    // injected too, or the using module's copied definition cannot compile.
+    // Recursively scan the definition and record every cross-module entity it
+    // mentions.
+    scan_definition(canon);
+  }
+
+  // Scan the definition of a recorded cross-module entity and record every
+  // library entity it references (transitively). Alias templates copy their
+  // whole RHS; function templates keep their trailing return type (which may
+  // reference other entities, e.g. `auto call(...) ->
+  // decltype(apply_impl(...))`); both must have their dependencies recorded.
+  // Function/class BODY references are not needed (the injection strips the
+  // body).
+  void scan_definition(clang::NamedDecl *d) {
+    if (!d) return;
+    if (auto *tat = llvm::dyn_cast<clang::TypeAliasTemplateDecl>(d)) {
+      DeclRefScanner<TemplateBodyRefCollector> scanner(*this);
+      if (auto *ta = tat->getTemplatedDecl()) scanner.TraverseDecl(ta);
+    } else if (auto *ta = llvm::dyn_cast<clang::TypeAliasDecl>(d)) {
+      DeclRefScanner<TemplateBodyRefCollector> scanner(*this);
+      scanner.TraverseDecl(ta);
+    } else if (auto *ft = llvm::dyn_cast<clang::FunctionTemplateDecl>(d)) {
+      // The injected declaration keeps the trailing return type (`auto
+      // f(...) -> decltype(...)`), which may reference helper entities like
+      // ApplyImpl. Traverse the return type's underlying decltype expression
+      // via the AST, then fall back to scanning the declaration source text
+      // for qualified names.
+      if (auto *fd = ft->getTemplatedDecl()) {
+        if (auto *rt = llvm::dyn_cast_or_null<clang::DecltypeType>(
+                fd->getReturnType().getTypePtrOrNull())) {
+          CallRefScanner<TemplateBodyRefCollector> scanner(*this);
+          scanner.TraverseStmt(rt->getUnderlyingExpr());
+        }
+      }
+      // Fall back / supplement: scan the declaration source text for
+      // `ns::Name` sequences.
+      std::string text = clang::Lexer::getSourceText(
+          clang::CharSourceRange::getTokenRange(ft->getSourceRange()), sm,
+          clang::LangOptions())
+                             .str();
+      for (auto &fqn : scan_fqn_text(text)) {
+        auto it = defined_files.find(fqn);
+        if (it != defined_files.end() &&
+            !it->second.count(self_path) &&
+            fqn.contains("::internal::")) {
+          if (alias_fqns.count(fqn))
+            out_aliases.insert(fqn);
+          else
+            out.insert(fqn);
+        }
+      }
+    }
+  }
+
+  bool in_main(clang::SourceLocation loc) const {
+    return loc.isValid() && sm.isInMainFile(loc);
+  }
+  bool VisitCallExpr(clang::CallExpr *e) {
+    if (e && template_depth_ > 0 && in_main(e->getExprLoc())) {
+      if (auto *fd = e->getDirectCallee()) record(fd);
+      else if (auto *e2 = e->getCallee()) {
+        if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(e2))
+          record(dre->getDecl());
+        else if (auto *ule = llvm::dyn_cast<clang::UnresolvedLookupExpr>(e2))
+          for (auto *d : ule->decls())
+            record(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
+      }
+    }
+    return true;
+  }
+
+  bool VisitUnresolvedLookupExpr(clang::UnresolvedLookupExpr *e) {
+    if (!e || template_depth_ <= 0 || !in_main(e->getExprLoc())) return true;
+    for (auto *d : e->decls())
+      record(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
+    return true;
+  }
+
+  bool VisitDeclRefExpr(clang::DeclRefExpr *e) {
+    if (e && template_depth_ > 0 && in_main(e->getLocation()))
+      record(e->getDecl());
+    return true;
+  }
+
+  bool VisitTypeLoc(clang::TypeLoc tl) {
+    if (!tl || template_depth_ <= 0 || !in_main(tl.getBeginLoc())) return true;
+    auto *t = tl.getTypePtr();
+    if (!t) return true;
+    if (auto *td = t->getAsTagDecl()) { record(td); return true; }
+    if (auto *tst = llvm::dyn_cast<clang::TemplateSpecializationType>(t)) {
+      if (auto *td = tst->getTemplateName().getAsTemplateDecl())
+        record(td);
+    }
+    return true;
+  }
+
+private:
+  const clang::SourceManager &sm;
+  const std::map<std::string, std::set<std::string>> &defined_files;
+  const std::set<std::string> &alias_fqns;
+  const std::string &self_path;
+  std::set<std::string> &out;
+  std::set<std::string> &out_aliases;
+};
+
+// Builds the consumers the template-body scan runs for one file, so it can be
+// attached to any parse of that file. `defined_files`/`alias_fqns` come from
+// the entity models, which a caller has before the sweep starts.
+export std::unique_ptr<clang::ASTConsumer> make_template_body_scan_consumer(
+    clang::CompilerInstance &ci,
+    const std::map<std::string, std::set<std::string>> &defined_files,
+    const std::set<std::string> &alias_fqns, const std::string &self_path,
+    std::set<std::string> &out, std::set<std::string> &out_aliases,
+    std::vector<std::pair<std::string, std::string>> &friend_pairs) {
+  struct Consumer : clang::ASTConsumer {
+    Consumer(const std::map<std::string, std::set<std::string>> &df,
+             const std::set<std::string> &af, std::string sp,
+             std::set<std::string> &o, std::set<std::string> &oa)
+        : df(df), af(af), sp(std::move(sp)), o(o), oa(oa) {}
+    void HandleTranslationUnit(clang::ASTContext &ctx) override {
+      TemplateBodyRefCollector v(ctx.getSourceManager(), df, af, sp, o, oa);
+      v.TraverseDecl(ctx.getTranslationUnitDecl());
+    }
+    const std::map<std::string, std::set<std::string>> &df;
+    const std::set<std::string> &af;
+    std::string sp;
+    std::set<std::string> &o;
+    std::set<std::string> &oa;
+  };
+  std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+  consumers.push_back(std::make_unique<Consumer>(defined_files, alias_fqns,
+                                                 self_path, out, out_aliases));
+  consumers.push_back(
+      make_traverse_consumer<FriendPairCollector>(friend_pairs));
+  (void)ci;
+  return make_combined_consumer(std::move(consumers));
+}
+
+export TemplateBodyRefResult finalize_template_body_scan(
+    const TemplateBodyRawScan &raw) {
+  std::set<std::string> out, out_aliases;
+  TemplateBodyRefResult result;
+  for (std::size_t i = 0; i < raw.outs.size(); ++i) {
+    out.insert_range(raw.outs[i]);
+    out_aliases.insert_range(raw.aliases[i]);
+    result.friend_pairs.insert(result.friend_pairs.end(),
+                               raw.friend_pairs[i].begin(),
+                               raw.friend_pairs[i].end());
+  }
+  result.fwd_declared = std::ranges::to<std::vector>(out);
+  result.aliases = std::ranges::to<std::vector>(out_aliases);
+  return result;
+}
+
 // `precomputed` has the same meaning as in cross_module_fwd_declared_fqns:
 // the first half of this analysis is the same entity extraction.
 export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
@@ -171,205 +434,6 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
   // header, restricted to entities defined in a DIFFERENT header.
   std::set<std::string> out;
   std::set<std::string> out_aliases;
-  class TemplateBodyRefCollector
-      : public clang::RecursiveASTVisitor<TemplateBodyRefCollector> {
-  public:
-    TemplateBodyRefCollector(
-        const clang::SourceManager &sm,
-        const std::map<std::string, std::set<std::string>> &defined_files,
-        const std::set<std::string> &alias_fqns, const std::string &self_path,
-        std::set<std::string> &out, std::set<std::string> &out_aliases)
-        : sm(sm), defined_files(defined_files), alias_fqns(alias_fqns),
-          self_path(self_path), out(out), out_aliases(out_aliases) {}
-
-    bool shouldVisitTemplateInstantiations() const { return false; }
-    bool shouldVisitImplicitCode() const { return false; }
-
-    // Nonzero while traversing a template body (a function template, a class
-    // template's member function, etc.). Only references made from inside such
-    // bodies get instantiated at the consumer and need the shared-entity
-    // treatment; references in plain (non-template) declarations resolve when
-    // the module is compiled and are handled by normal export rules.
-    int template_depth_ = 0;
-
-    bool TraverseFunctionTemplateDecl(clang::FunctionTemplateDecl *d) {
-      ++template_depth_;
-      bool r = clang::RecursiveASTVisitor<TemplateBodyRefCollector>::
-          TraverseFunctionTemplateDecl(d);
-      --template_depth_;
-      return r;
-    }
-
-    bool TraverseCXXMethodDecl(clang::CXXMethodDecl *d) {
-      // Member functions of a class template (pattern) are instantiated at the
-      // consumer too.
-      if (d && d->getParent() &&
-          d->getParent()->getDescribedClassTemplate())
-        ++template_depth_;
-      bool r = clang::RecursiveASTVisitor<TemplateBodyRefCollector>::
-          TraverseCXXMethodDecl(d);
-      if (d && d->getParent() &&
-          d->getParent()->getDescribedClassTemplate())
-        --template_depth_;
-      return r;
-    }
-
-    void record(clang::NamedDecl *d) {
-      if (!d) return;
-      auto *canon = llvm::dyn_cast_or_null<clang::NamedDecl>(d->getCanonicalDecl());
-      if (!canon) return;
-      auto loc = canon->getLocation();
-      if (!loc.isValid() || sm.isInMainFile(loc) || sm.isInSystemHeader(loc))
-        return;
-      // Only namespace-scope entities are injectable. Skip template parameters
-      // (`kFromKind`), enum constants (`kBool`, `kInteger`), locals, etc.
-      {
-        bool ns_scope = false;
-        for (auto *dc = canon->getDeclContext(); dc; dc = dc->getParent()) {
-          if (llvm::isa<clang::NamespaceDecl>(dc) ||
-              llvm::isa<clang::TranslationUnitDecl>(dc)) {
-            ns_scope = true;
-            break;
-          }
-          if (llvm::isa<clang::FunctionDecl>(dc) ||
-              llvm::isa<clang::CXXRecordDecl>(dc) ||
-              llvm::isa<clang::ClassTemplateDecl>(dc) ||
-              llvm::isa<clang::FunctionTemplateDecl>(dc) ||
-              llvm::isa<clang::EnumDecl>(dc) ||
-              llvm::isa<clang::TypeAliasTemplateDecl>(dc) ||
-              llvm::isa<clang::TypeAliasDecl>(dc))
-            break;
-        }
-        if (!ns_scope) return;
-      }
-      auto fqn = canon->getQualifiedNameAsString();
-      // Only INTERNAL-namespace entities need the shared-entity treatment:
-      // public entities are exported by default and thus visible to the using
-      // module via its import, so no injected declaration is needed. The
-      // real-world case is `lib::internal::MatchHelper` used inside
-      // `Spec<F>::Call` — `lib::PublicValue` (public) must not
-      // be flagged.
-      if (!fqn.contains("::internal::") && !fqn.contains("::detail::") &&
-          !fqn.contains("::impl::")) return;
-      auto it = defined_files.find(fqn);
-      if (it == defined_files.end()) return;  // not defined by any library header
-      if (it->second.count(self_path)) return;  // defined here, not cross-module
-      // Alias templates cannot be forward-declared: mark them for EXPORT from
-      // the defining module (visible via import) instead of injecting a copy.
-      if (alias_fqns.count(fqn)) {
-        out_aliases.insert(fqn);
-        return;
-      }
-      if (!out.insert(fqn).second) return;  // already recorded
-      // Transitive expansion: an injected entity's own definition may reference
-      // further cross-module entities. For example
-      // `IsConvertible<From, To>` (defined in
-      // internal-utils.h) is `using IsConvertible =
-      // IsConvertibleImpl<...>` — the impl alias must be
-      // injected too, or the using module's copied definition cannot compile.
-      // Recursively scan the definition and record every cross-module entity it
-      // mentions.
-      scan_definition(canon);
-    }
-
-    // Scan the definition of a recorded cross-module entity and record every
-    // library entity it references (transitively). Alias templates copy their
-    // whole RHS; function templates keep their trailing return type (which may
-    // reference other entities, e.g. `auto call(...) ->
-    // decltype(apply_impl(...))`); both must have their dependencies recorded.
-    // Function/class BODY references are not needed (the injection strips the
-    // body).
-    void scan_definition(clang::NamedDecl *d) {
-      if (!d) return;
-      if (auto *tat = llvm::dyn_cast<clang::TypeAliasTemplateDecl>(d)) {
-        DeclRefScanner<TemplateBodyRefCollector> scanner(*this);
-        if (auto *ta = tat->getTemplatedDecl()) scanner.TraverseDecl(ta);
-      } else if (auto *ta = llvm::dyn_cast<clang::TypeAliasDecl>(d)) {
-        DeclRefScanner<TemplateBodyRefCollector> scanner(*this);
-        scanner.TraverseDecl(ta);
-      } else if (auto *ft = llvm::dyn_cast<clang::FunctionTemplateDecl>(d)) {
-        // The injected declaration keeps the trailing return type (`auto
-        // f(...) -> decltype(...)`), which may reference helper entities like
-        // ApplyImpl. Traverse the return type's underlying decltype expression
-        // via the AST, then fall back to scanning the declaration source text
-        // for qualified names.
-        if (auto *fd = ft->getTemplatedDecl()) {
-          if (auto *rt = llvm::dyn_cast_or_null<clang::DecltypeType>(
-                  fd->getReturnType().getTypePtrOrNull())) {
-            CallRefScanner<TemplateBodyRefCollector> scanner(*this);
-            scanner.TraverseStmt(rt->getUnderlyingExpr());
-          }
-        }
-        // Fall back / supplement: scan the declaration source text for
-        // `ns::Name` sequences.
-        std::string text = clang::Lexer::getSourceText(
-            clang::CharSourceRange::getTokenRange(ft->getSourceRange()), sm,
-            clang::LangOptions())
-                               .str();
-        for (auto &fqn : scan_fqn_text(text)) {
-          auto it = defined_files.find(fqn);
-          if (it != defined_files.end() &&
-              !it->second.count(self_path) &&
-              fqn.contains("::internal::")) {
-            if (alias_fqns.count(fqn))
-              out_aliases.insert(fqn);
-            else
-              out.insert(fqn);
-          }
-        }
-      }
-    }
-
-    bool in_main(clang::SourceLocation loc) const {
-      return loc.isValid() && sm.isInMainFile(loc);
-    }
-    bool VisitCallExpr(clang::CallExpr *e) {
-      if (e && template_depth_ > 0 && in_main(e->getExprLoc())) {
-        if (auto *fd = e->getDirectCallee()) record(fd);
-        else if (auto *e2 = e->getCallee()) {
-          if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(e2))
-            record(dre->getDecl());
-          else if (auto *ule = llvm::dyn_cast<clang::UnresolvedLookupExpr>(e2))
-            for (auto *d : ule->decls())
-              record(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
-        }
-      }
-      return true;
-    }
-
-    bool VisitUnresolvedLookupExpr(clang::UnresolvedLookupExpr *e) {
-      if (!e || template_depth_ <= 0 || !in_main(e->getExprLoc())) return true;
-      for (auto *d : e->decls())
-        record(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
-      return true;
-    }
-
-    bool VisitDeclRefExpr(clang::DeclRefExpr *e) {
-      if (e && template_depth_ > 0 && in_main(e->getLocation()))
-        record(e->getDecl());
-      return true;
-    }
-
-    bool VisitTypeLoc(clang::TypeLoc tl) {
-      if (!tl || template_depth_ <= 0 || !in_main(tl.getBeginLoc())) return true;
-      auto *t = tl.getTypePtr();
-      if (!t) return true;
-      if (auto *td = t->getAsTagDecl()) { record(td); return true; }
-      if (auto *tst = llvm::dyn_cast<clang::TemplateSpecializationType>(t)) {
-        if (auto *td = tst->getTemplateName().getAsTemplateDecl())
-          record(td);
-      }
-      return true;
-    }
-
-  private:
-    const clang::SourceManager &sm;
-    const std::map<std::string, std::set<std::string>> &defined_files;
-    const std::set<std::string> &alias_fqns;
-    const std::string &self_path;
-    std::set<std::string> &out;
-    std::set<std::string> &out_aliases;
-  };
 
   std::vector<std::set<std::string>> partial_outs(paths.size());
   std::vector<std::set<std::string>> partial_aliases(paths.size());
@@ -383,29 +447,9 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
         auto &out_friends = partial_friends[i];
         return std::make_unique<VisitorFrontendActionFactory>(
             [&, self = path](clang::CompilerInstance &ci) {
-              struct Consumer : clang::ASTConsumer {
-                Consumer(const std::map<std::string, std::set<std::string>> &df,
-                         const std::set<std::string> &af,
-                         const std::string &sp, std::set<std::string> &o,
-                         std::set<std::string> &oa)
-                    : df(df), af(af), sp(sp), o(o), oa(oa) {}
-                void HandleTranslationUnit(clang::ASTContext &ctx) override {
-                  TemplateBodyRefCollector v(ctx.getSourceManager(), df, af, sp,
-                                             o, oa);
-                  v.TraverseDecl(ctx.getTranslationUnitDecl());
-                }
-                const std::map<std::string, std::set<std::string>> &df;
-                const std::set<std::string> &af;
-                const std::string &sp;
-                std::set<std::string> &o;
-                std::set<std::string> &oa;
-              };
-              std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
-              consumers.push_back(std::make_unique<Consumer>(
-                  defined_files, alias_fqns, self, out, out_aliases));
-              consumers.push_back(
-                  make_traverse_consumer<FriendPairCollector>(out_friends));
-              return make_combined_consumer(std::move(consumers));
+              return make_template_body_scan_consumer(
+                  ci, defined_files, alias_fqns, self, out, out_aliases,
+                  out_friends);
             });
       });
   for (std::size_t i = 0; i < paths.size(); ++i) {

@@ -884,3 +884,47 @@ TEST(FullRewrite, FriendPairsFromTheScanMatchTheDedicatedSweep) {
   EXPECT_TRUE(friend_extern_fqns_from_pairs(scan.friend_pairs, {}).empty())
       << "no extern \"C++\" enclosing class means no friend targets";
 }
+
+TEST(FullRewrite, TemplateBodyScanRidingAnotherParseGivesTheSameResult) {
+  // The template-body scan needs only what the header sweep already produced,
+  // so it can run as a rider on the reachability trace's parse instead of
+  // sweeping the headers again. Folding the raw per-file collection must give
+  // exactly what the standalone sweep gives.
+  std::vector<std::string> headers = {data_path("tplbase_lib/defs.h"),
+                                      data_path("tplbase_lib/use.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto standalone =
+      cross_module_template_body_referenced_fqns(headers, extra_args);
+
+  // Drive the same collectors by hand, as the rider does.
+  auto models = analyze_files_per_file(headers, extra_args);
+  std::map<std::string, std::set<std::string>> defined_files;
+  std::set<std::string> alias_fqns;
+  for (std::size_t i = 0; i < headers.size(); ++i)
+    for (const auto &item : models[i].items) {
+      if (!item.complete) continue;
+      auto fqn = fqn_of(item.ns_path, item.name);
+      defined_files[fqn].insert(headers[i]);
+      if (item.kind == EntityItem::kAlias) alias_fqns.insert(fqn);
+    }
+  TemplateBodyRawScan raw(headers.size());
+  for (std::size_t i = 0; i < headers.size(); ++i) {
+    std::vector<std::string> one = {headers[i]};
+    parallel_parse(one, extra_args, /*delayed_template_parsing=*/false,
+                   [&](std::size_t, const std::string &path) {
+                     return std::make_unique<VisitorFrontendActionFactory>(
+                         [&, self = path](clang::CompilerInstance &ci) {
+                           return make_template_body_scan_consumer(
+                               ci, defined_files, alias_fqns, self,
+                               raw.outs[i], raw.aliases[i],
+                               raw.friend_pairs[i]);
+                         });
+                   });
+  }
+  auto folded = finalize_template_body_scan(raw);
+
+  EXPECT_EQ(folded.fwd_declared, standalone.fwd_declared);
+  EXPECT_EQ(folded.aliases, standalone.aliases);
+  EXPECT_EQ(folded.friend_pairs.size(), standalone.friend_pairs.size());
+}
