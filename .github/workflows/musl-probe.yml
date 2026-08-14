@@ -20,6 +20,12 @@ name: musl probe
 #     more once it gets past this one?
 
 on:
+  # Also on pull_request and on pushes to this branch: workflow_dispatch alone
+  # would need the file on the default branch before GitHub offers the button,
+  # which it is not yet.
+  pull_request:
+  push:
+    branches: [musl-consumer-includes]
   workflow_dispatch:
 
 jobs:
