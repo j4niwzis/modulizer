@@ -669,9 +669,38 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   if (!header_paths.empty()) header_scan = scan_headers(header_paths, all_extra);
   std::vector<EntityModel> &header_models = header_scan.models;
 
+  // The template-body scan wants the same parse of the same headers as the
+  // reachability trace, and both need only what the sweep above produced, so
+  // it rides along. Its inputs — which file defines what, and which of those
+  // are aliases — come from the entity models.
+  std::map<std::string, std::set<std::string>> tpl_defined_files;
+  std::set<std::string> tpl_alias_fqns;
+  std::map<std::string, std::size_t> header_index;
+  for (std::size_t i = 0; i < header_paths.size(); ++i) {
+    header_index[header_paths[i]] = i;
+    for (const auto &item : header_scan.models[i].items) {
+      if (!item.complete) continue;
+      auto fqn = fqn_of(item.ns_path, item.name);
+      tpl_defined_files[fqn].insert(header_paths[i]);
+      if (item.kind == EntityItem::kAlias) tpl_alias_fqns.insert(fqn);
+    }
+  }
+  TemplateBodyRawScan tpl_raw(header_paths.size());
+  bool tpl_scanned = false;
+
   if (ReachableFqnsOpt.getValue().empty() && trace_paths.size() > 1) {
+    tpl_scanned = true;
     internal_reachable = trace_consumer_reachability(
-        trace_paths, library_name, all_extra, &header_scan.internal);
+        trace_paths, library_name, all_extra, &header_scan.internal,
+        [&](clang::CompilerInstance &ci, const std::string &path)
+            -> std::unique_ptr<clang::ASTConsumer> {
+          auto it = header_index.find(path);
+          if (it == header_index.end()) return nullptr;  // not a library header
+          auto i = it->second;
+          return make_template_body_scan_consumer(
+              ci, tpl_defined_files, tpl_alias_fqns, path, tpl_raw.outs[i],
+              tpl_raw.aliases[i], tpl_raw.friend_pairs[i]);
+        });
   }
   // Explicit INTERNAL consumer sources (the library's own tests/main, or a
   // sibling library): entities they reference are exported from their defining
@@ -732,8 +761,10 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     // must mark the definition `extern "C++"` — the entity itself is internal
     // and never exported to consumers.
     {
-      auto tpl_refs = cross_module_template_body_referenced_fqns(
-          header_paths, all_extra, &header_models);
+      auto tpl_refs = tpl_scanned
+          ? finalize_template_body_scan(tpl_raw)
+          : cross_module_template_body_referenced_fqns(header_paths, all_extra,
+                                                       &header_models);
       friend_pairs = std::move(tpl_refs.friend_pairs);
       // Skip entities that are already exported (macro-reachable or listed via
       // `--reachable-fqn`): consumers see those through the module import, so

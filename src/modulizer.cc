@@ -7,6 +7,7 @@ export module modulizer;
 // the modulizer.* modules (including the CLI entry points in
 // modulizer.cli); this module only aggregates them.
 export import modulizer.analyzer;
+export import modulizer.astutil;
 export import modulizer.cli;
 export import modulizer.consumer_rewriter;
 export import modulizer.consumer_trace;
