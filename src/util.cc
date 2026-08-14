@@ -1,6 +1,7 @@
 module;
 
 #include <pthread.h>
+#include <unistd.h>
 
 export module modulizer.util;
 import libtooling;
@@ -130,10 +131,39 @@ export std::string macro_base_name(llvm::StringRef stem, bool hyphen) {
   return s;
 }
 
+// Clang's builtin-header directory (`<clang>/lib/clang/<ver>/include`, holding
+// stddef.h and friends). A ClangTool derives it from the running executable's
+// path, so every parse fails with `'stddef.h' file not found` whenever the tool
+// does not sit next to a clang installation — and a failed parse is silent
+// here: it just yields no AST, so nothing is found to be used and every
+// transitively used header is dropped from the output. Ask the clang++ on PATH
+// instead, so the answer does not depend on where the binary lives.
+// MODULIZER_RESOURCE_DIR overrides it.
+export const std::string &clang_resource_dir() {
+  static const std::string dir = [] {
+    if (auto *env = std::getenv("MODULIZER_RESOURCE_DIR")) return std::string(env);
+    auto tmp = std::filesystem::temp_directory_path() /
+               std::format("modulizer_resdir_{}.txt", getpid());
+    std::system(std::format("clang++ -print-resource-dir >{} 2>/dev/null",
+                            tmp.string()).c_str());
+    std::string out;
+    {
+      std::ifstream f(tmp);
+      std::getline(f, out);
+    }
+    std::filesystem::remove(tmp);
+    if (!out.empty() && !std::filesystem::exists(out)) out.clear();
+    return out;
+  }();
+  return dir;
+}
+
 export std::vector<std::string> base_compile_flags(
     bool delayed_template_parsing = false) {
   std::vector<std::string> flags = {"-x", "c++", "-std=c++20",
       "-Wno-pragma-once-outside-header"};
+  if (auto &rd = clang_resource_dir(); !rd.empty())
+    flags.push_back(std::format("-resource-dir={}", rd));
   if (delayed_template_parsing)
     flags.push_back("-fno-delayed-template-parsing");
   return flags;
