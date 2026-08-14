@@ -675,28 +675,69 @@ private:
 
 // ── System-header usage tracing ─────────────────────────────────────
 
-// Shared: derive the include name (e.g. "errno.h", "pthread.h") a consumer
+// A system header no consumer may include directly: an implementation detail
+// that exists only to be pulled in by the public header owning the declaration.
+// Covers the C library's arch/detail split (glibc's and musl's `bits/`) and the
+// per-declaration fragments compilers ship (`__stddef_size_t.h` and friends).
+bool is_private_system_header(llvm::StringRef path) {
+  std::filesystem::path p(path.str());
+  if (p.filename().string().starts_with("__")) return true;
+  return std::ranges::any_of(p, [](const std::filesystem::path &part) {
+    return part == "bits";
+  });
+}
+
+// The name the consumer would write in an `#include <...>` to reach `fe`,
+// relative to whichever search directory the header was found under — so a
+// header in a subdirectory keeps it (`sys/types.h`, not `types.h`, which names
+// nothing). Falls back to the bare filename when no search directory covers it.
+std::string include_spelling_for(clang::FileEntryRef fe,
+                                 const clang::SourceManager &sm,
+                                 clang::FileID main_fid,
+                                 const clang::HeaderSearch *hs) {
+  std::string fallback =
+      std::filesystem::path(fe.getName().str()).filename().string();
+  if (!hs) return fallback;
+  std::string main_path;
+  if (auto mfe = sm.getFileEntryRefForID(main_fid))
+    main_path = mfe->getName().str();
+  auto spelled = hs->suggestPathToFileForDiagnostics(fe, main_path);
+  if (spelled.empty() || spelled.contains("..") ||
+      std::filesystem::path(spelled).is_absolute())
+    return fallback;
+  return spelled;
+}
+
+// Shared: derive the include name (e.g. "errno.h", "sys/types.h") a consumer
 // should write to get a macro/symbol defined at `loc`. Walks the include chain
-// from the defining file toward the consumer's main file; the OUTERMOST system
-// C/POSIX header on the chain is the one the consumer would include. C++ stdlib
-// headers (under `/c++/`) are skipped — `import std.compat` provides those.
+// from the defining file toward the consumer's main file and takes the
+// INNERMOST public system header on it — the one that owns the declaration.
+//
+// Not the outermost: that is merely whichever C header the library happened to
+// pull in first, and it provides the declaration only transitively, on the
+// libc the conversion ran against. Reporting `stdlib.h` for `ssize_t` because
+// glibc's `stdlib.h` reaches `sys/types.h` produces a tree that builds on
+// glibc and fails on musl, whose `stdlib.h` does not.
+//
+// C++ stdlib headers (under `/c++/`) are skipped entirely — `import std.compat`
+// provides those — as are private headers, whose public parent is taken instead.
 std::string system_include_name_for(clang::SourceLocation loc,
                                     const clang::SourceManager &sm,
-                                    clang::FileID main_fid) {
-  std::string best;
+                                    clang::FileID main_fid,
+                                    const clang::HeaderSearch *hs = nullptr) {
   auto fid = sm.getFileID(loc);
   while (fid.isValid() && fid != main_fid) {
     if (auto fe = sm.getFileEntryRefForID(fid)) {
       auto path = fe->getName();
       if (sm.isInSystemHeader(sm.getLocForStartOfFile(fid)) &&
-          !path.contains("/c++/"))
-        best = std::filesystem::path(path.str()).filename().string();
+          !path.contains("/c++/") && !is_private_system_header(path))
+        return include_spelling_for(*fe, sm, main_fid, hs);
     }
     auto inc = sm.getIncludeLoc(fid);
     if (!inc.isValid()) break;
     fid = sm.getFileID(inc);
   }
-  return best;
+  return {};
 }
 
 // PP callbacks: records the system header of every macro EXPANDED in the
@@ -709,7 +750,7 @@ export class SystemHeaderUsageTracer : public clang::PPCallbacks {
 public:
   SystemHeaderUsageTracer(clang::CompilerInstance &ci, std::set<std::string> &out)
       : sm(ci.getSourceManager()), main_fid(ci.getSourceManager().getMainFileID()),
-        out(out) {}
+        hs(&ci.getPreprocessor().getHeaderSearchInfo()), out(out) {}
 
   void MacroExpands(const clang::Token &MacroNameTok,
                     const clang::MacroDefinition &MD,
@@ -722,13 +763,14 @@ public:
     if (!mi || mi->isBuiltinMacro() || mi->isUsedForHeaderGuard()) return;
     auto def_loc = mi->getDefinitionLoc();
     if (!def_loc.isValid() || sm.isInMainFile(def_loc)) return;
-    auto name = system_include_name_for(def_loc, sm, main_fid);
+    auto name = system_include_name_for(def_loc, sm, main_fid, hs);
     if (!name.empty()) out.insert(std::move(name));
   }
 
 private:
   const clang::SourceManager &sm;
   clang::FileID main_fid;
+  const clang::HeaderSearch *hs;
   std::set<std::string> &out;
 };
 
@@ -739,9 +781,10 @@ private:
 export class SystemHeaderRefFinder
     : public clang::RecursiveASTVisitor<SystemHeaderRefFinder> {
 public:
-  SystemHeaderRefFinder(const clang::SourceManager &sm, std::set<std::string> &out)
-      : sm(sm), main_fid(sm.getMainFileID()),
-        out(out) {}
+  SystemHeaderRefFinder(const clang::SourceManager &sm,
+                        const clang::HeaderSearch *hs,
+                        std::set<std::string> &out)
+      : sm(sm), main_fid(sm.getMainFileID()), hs(hs), out(out) {}
 
   bool shouldVisitImplicitCode() const { return true; }
   bool shouldVisitTemplateInstantiations() const { return true; }
@@ -856,13 +899,14 @@ private:
       cd = dtor->getParent();
     auto loc = sm.getExpansionLoc(cd->getLocation());
     if (!loc.isValid() || sm.isInMainFile(loc)) return;
-    auto name = system_include_name_for(loc, sm, main_fid);
+    auto name = system_include_name_for(loc, sm, main_fid, hs);
     if (!name.empty()) out.insert(std::move(name));
   }
 
   int depth_ = 0;
   const clang::SourceManager &sm;
   clang::FileID main_fid;
+  const clang::HeaderSearch *hs;
   std::set<std::string> &out;
 };
 
@@ -886,7 +930,8 @@ private:
         clang::CompilerInstance &ci, llvm::StringRef) override {
       ci.getPreprocessor().addPPCallbacks(
           std::make_unique<SystemHeaderUsageTracer>(ci, out));
-      return make_traverse_consumer<SystemHeaderRefFinder>(out);
+      return make_traverse_consumer<SystemHeaderRefFinder>(
+          &ci.getPreprocessor().getHeaderSearchInfo(), out);
     }
 
   private:

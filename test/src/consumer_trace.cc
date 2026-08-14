@@ -423,6 +423,47 @@ TEST(ConsumerTrace, VirtualSourcesCoverIncludedConsumers) {
   EXPECT_NE(it->second.find(producer), it->second.end());
 }
 
+TEST(ConsumerTrace, ReportsTheHeaderThatOwnsTheType) {
+  // The traced include must be the system header that OWNS the declaration,
+  // not an umbrella that merely reaches it. An umbrella provides the type only
+  // on the platform the conversion ran against — reporting it produces a tree
+  // that builds against one C library and fails against another whose umbrella
+  // does not pull the owning header in.
+  //
+  // The owning header sits in a subdirectory, so this also pins the include
+  // spelling: "owner/types.h", since a bare "types.h" names nothing.
+  auto use = data_path("sysincl_lib/use_owned.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir, "-isystem",
+                                         std::string(gDataDir) + "/sysincl"};
+
+  auto traced = trace_consumer_system_includes({use}, extra_args);
+  auto it = traced.find(use);
+  ASSERT_NE(it, traced.end())
+      << "a system type used only inside a cast must still be traced";
+  EXPECT_NE(it->second.count("owner/types.h"), 0u);
+  EXPECT_EQ(it->second.count("umbrella.h"), 0u)
+      << "the umbrella provides the type only transitively";
+  EXPECT_EQ(it->second.count("bits/detail.h"), 0u)
+      << "a private implementation header is not includable";
+}
+
+TEST(ConsumerTrace, ReportsThePublicParentOfAPrivateFragment) {
+  // The owning header is not always the innermost one: compilers split
+  // declarations into `__`-prefixed fragments that cannot be included on their
+  // own. For those the public header that gathers them is the answer, so the
+  // walk must keep going outward rather than report the fragment.
+  auto use = data_path("sysincl_lib/use_fragment.cc");
+  std::vector<std::string> extra_args = {"-I", gDataDir, "-isystem",
+                                         std::string(gDataDir) + "/sysincl"};
+
+  auto traced = trace_consumer_system_includes({use}, extra_args);
+  auto it = traced.find(use);
+  ASSERT_NE(it, traced.end());
+  EXPECT_NE(it->second.count("umbrella.h"), 0u);
+  EXPECT_EQ(it->second.count("__fragment.h"), 0u)
+      << "a per-declaration fragment is not includable on its own";
+}
+
 TEST(ConsumerTrace, CombinedTraceMatchesTheSeparatePasses) {
   // The two consumer traces ask different questions of the same translation
   // unit — same files, same flags, same virtual sources — and profiling puts
