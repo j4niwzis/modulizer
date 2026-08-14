@@ -682,11 +682,19 @@ export inline int run_full_rewrite(int argc, const char **argv) {
 
   auto module_replaces = parse_module_replaces();
 
+  // The per-file entity models: what each header declares, completes and
+  // defines as macros. Four analyses below want exactly these, and each used
+  // to parse the whole header set for itself; extract them once instead.
+  std::vector<EntityModel> header_models;
+  if (!header_paths.empty())
+    header_models = analyze_files_per_file(header_paths, all_extra);
+
   std::vector<std::string> macro_reachable;
   std::set<std::string> macro_modules;
   if (!header_paths.empty()) {
     auto mm = compute_macro_modules(
-        header_paths, library_name, all_extra, parse_reachable_fqns());
+        header_paths, library_name, all_extra, parse_reachable_fqns(),
+        &header_models);
     macro_reachable = std::move(mm.macro_reachable);
     macro_modules = std::move(mm.macro_modules);
     llvm::outs() << "Macro-reachable entities: " << macro_reachable.size()
@@ -702,17 +710,18 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   std::vector<std::string> alias_reachable;
   std::set<std::string> same_module_free_fqns;
   if (!header_paths.empty()) {
-    auto all = analyze_files_with_flags(header_paths, all_extra);
     std::set<std::string> seen;
-    for (auto &item : all.items) {
-      if (!item.complete) continue;
-      auto fqn = fqn_of(item.ns_path, item.name);
-      if (seen.insert(fqn).second) defined_fqns.push_back(fqn);
-    }
+    for (const auto &model : header_models)
+      for (const auto &item : model.items) {
+        if (!item.complete) continue;
+        auto fqn = fqn_of(item.ns_path, item.name);
+        if (seen.insert(fqn).second) defined_fqns.push_back(fqn);
+      }
     // Entities forward-declared in one header but defined in a different one
     // are declared in modules that do not define them. Their declarations and
     // definitions must be `extern "C++"` to stay a single shared entity.
-    fwd_declared_fqns = cross_module_fwd_declared_fqns(header_paths, all_extra);
+    fwd_declared_fqns =
+        cross_module_fwd_declared_fqns(header_paths, all_extra, &header_models);
     // Entities referenced inside template bodies in one header but defined in a
     // different one (e.g. a declaration macro expanding to a call that reaches
     // an internal helper). A consumer instantiating those templates resolves the
@@ -722,7 +731,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     // and never exported to consumers.
     {
       auto tpl_refs = cross_module_template_body_referenced_fqns(
-          header_paths, all_extra);
+          header_paths, all_extra, &header_models);
       // Skip entities that are already exported (macro-reachable or listed via
       // `--reachable-fqn`): consumers see those through the module import, so
       // the template body resolves them without an injected `extern "C++"`

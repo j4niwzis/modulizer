@@ -322,3 +322,53 @@ TEST(MacroAnalysis, InternalModuleReachableViaMacroInOtherFile) {
             std::string::npos)
       << "rewritten header must re-export the internal module reached via macro";
 }
+
+TEST(SharedHeaderModels, PerFileExtractionMatchesTheCombinedOne) {
+  // Several --full analyses want the same thing from the library headers:
+  // which entities each declares and completes, which macros each defines.
+  // Each used to parse the whole header set for itself. The per-file
+  // extraction is the primitive they now share, and merging it must reproduce
+  // exactly what the combined extraction produced.
+  std::vector<std::string> headers = {data_path("fwd_lib/a.h"),
+                                      data_path("fwd_lib/b.h"),
+                                      data_path("mreach_lib/a.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+
+  auto combined = analyze_files_with_flags(headers, extra_args);
+  auto merged = merge_entity_models(analyze_files_per_file(headers, extra_args));
+
+  ASSERT_EQ(merged.items.size(), combined.items.size());
+  ASSERT_EQ(merged.macros.size(), combined.macros.size());
+  for (std::size_t i = 0; i < merged.items.size(); ++i) {
+    EXPECT_EQ(fqn_of(merged.items[i].ns_path, merged.items[i].name),
+              fqn_of(combined.items[i].ns_path, combined.items[i].name));
+    EXPECT_EQ(merged.items[i].complete, combined.items[i].complete);
+  }
+}
+
+TEST(SharedHeaderModels, PrecomputedModelsGiveIdenticalAnalyses) {
+  // Handing those models to the analyses that would otherwise re-extract them
+  // must not change a single answer.
+  std::vector<std::string> headers = {data_path("fwd_lib/a.h"),
+                                      data_path("fwd_lib/b.h"),
+                                      data_path("mreach_lib/a.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  auto models = analyze_files_per_file(headers, extra_args);
+
+  EXPECT_EQ(cross_module_fwd_declared_fqns(headers, extra_args, &models),
+            cross_module_fwd_declared_fqns(headers, extra_args))
+      << "forward-declaration analysis must not depend on who parsed";
+
+  auto shared = cross_module_template_body_referenced_fqns(headers, extra_args,
+                                                           &models);
+  auto own = cross_module_template_body_referenced_fqns(headers, extra_args);
+  EXPECT_EQ(shared.fwd_declared, own.fwd_declared);
+  EXPECT_EQ(shared.aliases, own.aliases);
+
+  auto mm_shared = modulizer::compute_macro_modules(headers, "fwd_lib",
+                                                    extra_args, {},
+                                                    &models);
+  auto mm_own = modulizer::compute_macro_modules(headers, "fwd_lib", extra_args);
+  EXPECT_EQ(mm_shared.macro_reachable, mm_own.macro_reachable);
+  EXPECT_EQ(mm_shared.macro_modules, mm_own.macro_modules);
+}

@@ -179,16 +179,20 @@ export std::set<std::string> modules_with_reachable_entities(
 // `--reachable-fqn`) are merged on top: macro analysis always runs so
 // macro-reachable internals are never lost just because the user also
 // listed some FQNs by hand.
+// `precomputed`, when given, is the per-file entity model set for
+// `header_paths` (see analyze_files_per_file), so a caller that already has
+// them does not make this function extract them again.
 export MacroModuleResult compute_macro_modules(
     const std::vector<std::string> &header_paths,
     llvm::StringRef library_name,
     const std::vector<std::string> &extra_args,
-    const std::vector<std::string> &manual_fqns = {}) {
+    const std::vector<std::string> &manual_fqns = {},
+    const std::vector<EntityModel> *precomputed = nullptr) {
   MacroModuleResult out;
-  std::vector<EntityModel> per_header(header_paths.size());
-  parallel_for(header_paths.size(), [&](std::size_t i) {
-    per_header[i] = analyze_files_with_flags({header_paths[i]}, extra_args);
-  });
+  std::vector<EntityModel> owned;
+  if (!precomputed) owned = analyze_files_per_file(header_paths, extra_args);
+  const std::vector<EntityModel> &per_header =
+      precomputed ? *precomputed : owned;
   EntityModel all_macros;
   for (auto &m : per_header) {
     for (auto &item : m.items) all_macros.items.push_back(item);
