@@ -103,6 +103,10 @@ export std::string rewrite_consumer_source(
   std::vector<std::string> pending_macros;
   std::vector<std::string> out;
   std::optional<std::size_t> insert_at;
+  // Where each system include the consumer already writes ends up in `out`.
+  // An include that survives BELOW the block does not spare the block from
+  // emitting it: after the imports is exactly where it must not be.
+  std::map<std::string, std::size_t> system_include_at;
   {
     std::size_t pos = 0;
     // Depth of open #if/#ifdef/#ifndef blocks, and where the outermost
@@ -157,11 +161,30 @@ export std::string rewrite_consumer_source(
           continue;
         }
       }
+      if (auto inc = parse_include_line(line))
+        if (!inc->is_quoted)
+          system_include_at.try_emplace(inc->path, out.size());
       out.push_back(line);
       pos = nl + 1;
       if (pos >= src.size()) break;
     }
   }
+
+  // A system include the consumer already writes counts as "already there" only
+  // if it survives ABOVE the block. One that stays below it — a header included
+  // inside a platform conditional, which is replaced in place rather than
+  // hoisted — is the ordering this block exists to avoid, and g++ does not
+  // merely diagnose it:
+  //
+  //   bits/types/__fpos_t.h:12:11: internal compiler error:
+  //       in finish_member_declaration, at cp/semantics.cc:4213
+  //
+  // Emitting it in the block as well costs an include the header guard drops.
+  auto already_above_block = [&](const std::string &path) {
+    auto it = system_include_at.find(path);
+    if (it == system_include_at.end()) return false;
+    return !insert_at || it->second < *insert_at;
+  };
 
   std::string block;
 
@@ -184,7 +207,7 @@ export std::string rewrite_consumer_source(
   // arrives and the two agree. The whole block is emitted at one insertion
   // point, so this is only about the order within it.
   for (auto &inc : options.required_system_includes)
-    if (!existing_std_includes.count(inc))
+    if (!already_above_block(inc))
       block += std::format("#include <{}>\n", inc);
 
   if (options.import_std) {
@@ -194,7 +217,7 @@ export std::string rewrite_consumer_source(
       block += "import std.compat;\n";
   } else {
     for (auto &h : kStdIncludes)
-      if (!existing_std_includes.count(h))
+      if (!already_above_block(h))
         block += std::format("#include <{}>\n", h);
   }
   for (auto &m : pending_imports) block += std::format("import {};\n", m);
