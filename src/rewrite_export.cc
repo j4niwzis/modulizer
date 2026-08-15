@@ -356,20 +356,23 @@ public:
     if (llvm::isa<clang::FunctionDecl>(text_decl) ||
         llvm::isa<clang::FunctionTemplateDecl>(text_decl))
       strip_function_default_args(decl_text);
-    // A variable declared `extern const char X[];` already carries the
-    // storage-class specifier; prefixing `extern "C++"` would give `extern
-    // "C++" extern ...` (a duplicate-decl-specifier diagnostic).
-    if (auto *vd = llvm::dyn_cast<clang::VarDecl>(text_decl)) {
-      auto ns = decl_text.find_first_not_of(" \t");
-      if (ns != std::string::npos &&
-          decl_text.compare(ns, 6, "extern") == 0) {
-        auto after = ns + 6;
-        while (after < decl_text.size() &&
-               (decl_text[after] == ' ' || decl_text[after] == '\t'))
-          ++after;
-        decl_text.erase(ns, after - ns);
-      }
-    }
+    // A declaration written with its own `extern` storage-class specifier
+    // (`extern const char X[];`, or a function whose keyword follows the
+    // template parameter list) must not keep it: the `extern "C++"` added below
+    // would leave the specifier inside the linkage-specification, which is
+    // ill-formed. The keyword says nothing a declaration does not already mean,
+    // and for a variable the linkage-specification keeps it a declaration
+    // rather than a definition.
+    clang::Decl *storage_decl = text_decl;
+    if (auto *td = llvm::dyn_cast<clang::TemplateDecl>(text_decl))
+      storage_decl = td->getTemplatedDecl();
+    bool extern_spec = false;
+    if (auto *vd = llvm::dyn_cast_or_null<clang::VarDecl>(storage_decl))
+      extern_spec = vd->getStorageClass() == clang::SC_Extern;
+    else if (auto *fd =
+                 llvm::dyn_cast_or_null<clang::FunctionDecl>(storage_decl))
+      extern_spec = fd->getStorageClass() == clang::SC_Extern;
+    if (extern_spec) strip_storage_extern(decl_text);
     // The declaration text (namespace wrappers added at emission time so
     // adjacent declarations in the same namespace can be merged into a single
     // `namespace ... { ... }` block).

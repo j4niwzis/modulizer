@@ -261,6 +261,42 @@ export std::string extract_file_header_comment(const std::string &src) {
   return out;
 }
 
+// Remove the `extern` storage-class specifier from copied declaration text, so
+// the declaration can be wrapped in `extern "C++"` — a specifier inside a
+// linkage-specification is ill-formed. The keyword follows a leading
+// `template <...>` header, which is skipped by matching its angle brackets; a
+// scan that ends up somewhere unexpected simply finds no keyword and leaves the
+// text alone. The caller decides whether the declaration has one to begin with
+// (a question for the AST, not for the text). Returns whether one was removed.
+export bool strip_storage_extern(std::string &text) {
+  std::size_t from = 0;
+  auto first = text.find_first_not_of(" \t\r\n");
+  if (first != std::string::npos &&
+      std::string_view(text).substr(first).starts_with("template")) {
+    auto lt = text.find('<', first + 8);
+    if (lt == std::string::npos) return false;
+    int depth = 0;
+    for (from = lt; from < text.size(); ++from) {
+      if (text[from] == '<') {
+        ++depth;
+      } else if (text[from] == '>' && --depth == 0) {
+        ++from;
+        break;
+      }
+    }
+    if (depth != 0) return false;
+  }
+  // The keyword commonly begins the line after the parameter list, and
+  // find_extern_spec scans no further than a newline.
+  while (from < text.size() && (text[from] == ' ' || text[from] == '\t' ||
+                                text[from] == '\n' || text[from] == '\r'))
+    ++from;
+  unsigned start = 0, end = 0;
+  if (!find_extern_spec(text, from, start, end)) return false;
+  text.erase(start, end - start);
+  return true;
+}
+
 export void strip_function_default_args(std::string &text) {
   auto lp = text.find('(');
   if (lp == std::string::npos) return;

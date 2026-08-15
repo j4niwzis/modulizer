@@ -805,6 +805,36 @@ TEST(HeaderRewrite, InjectedRecordDropsAttributeMacroBeforeName) {
          "macro before the class name";
 }
 
+TEST(HeaderRewrite, InjectedDeclDropsStorageClassExtern) {
+  // injextern_lib/defs.h declares entities carrying an `extern` storage-class
+  // specifier. The declarations injected into a using module are copied from
+  // that text and wrapped in `extern "C++"`, which would leave the specifier
+  // inside the linkage-specification — ill-formed. A template keeps its
+  // parameter list, after which the specifier sits.
+  std::map<std::string, std::string> include_map = {
+    {"injextern_lib/defs.h", "injextern_lib.defs"},
+  };
+  auto r = rewrite_header(
+      data_path("injextern_lib/use.h"), "injextern_lib.use",
+      RewriteOptions{.include_to_module = include_map,
+                     .extern_cxx = false,
+                     .extra_args = {"-I", gDataDir},
+                     .defined_fqns = {"injextern_lib::internal::Make",
+                                      "injextern_lib::internal::Check"},
+                     .fwd_declared_fqns = {"injextern_lib::internal::Make",
+                                           "injextern_lib::internal::Check"}});
+  EXPECT_NE(r.cc_content.find("extern \"C++\" template <class T>"),
+            std::string::npos)
+      << "the injected template declaration must be extern \"C++\"";
+  EXPECT_EQ(r.cc_content.find("extern \"C++\" extern"), std::string::npos)
+      << "an injected declaration must not keep its own extern specifier";
+  EXPECT_EQ(r.cc_content.find("extern T Make"), std::string::npos)
+      << "the template's specifier follows the parameter list and must go too";
+  EXPECT_NE(r.cc_content.find("extern \"C++\" bool Check(int n);"),
+            std::string::npos)
+      << "the rest of the injected declaration is kept verbatim";
+}
+
 TEST(HeaderRewrite, ExternCxxDropsStorageClassExtern) {
   // linkspec_lib/api.h declares entities with an `extern` storage-class
   // specifier of their own. Wrapping such a declaration in `extern "C++"`
