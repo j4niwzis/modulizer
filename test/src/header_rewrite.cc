@@ -805,6 +805,33 @@ TEST(HeaderRewrite, InjectedRecordDropsAttributeMacroBeforeName) {
          "macro before the class name";
 }
 
+TEST(HeaderRewrite, ExternCxxDropsStorageClassExtern) {
+  // linkspec_lib/api.h declares entities with an `extern` storage-class
+  // specifier of their own. Wrapping such a declaration in `extern "C++"`
+  // leaves the keyword inside the linkage-specification, which is ill-formed
+  // ("invalid use of 'extern' in linkage specification"), so it must be
+  // dropped — including on a template, where it follows the parameter list.
+  auto r = rewrite_header(
+      data_path("linkspec_lib/api.h"), "linkspec_lib.api",
+      RewriteOptions{.extern_cxx = false,
+                     .extra_args = {"-I", gDataDir},
+                     .fwd_declared_fqns = {"linkspec_lib::Make",
+                                           "linkspec_lib::Check",
+                                           "linkspec_lib::counter"}});
+  EXPECT_NE(r.h_content.find("extern \"C++\" template <class T>"),
+            std::string::npos)
+      << "the cross-module template declaration must be extern \"C++\"";
+  EXPECT_EQ(r.h_content.find("extern T Make"), std::string::npos)
+      << "the template's own extern storage-class specifier must be dropped";
+  EXPECT_EQ(r.h_content.find("extern \"C++\" extern"), std::string::npos)
+      << "no declaration may keep an extern specifier inside extern \"C++\"";
+  EXPECT_NE(r.h_content.find("extern \"C++\" bool Check(int n);"),
+            std::string::npos)
+      << "a function declaration keeps its signature without the specifier";
+  EXPECT_NE(r.h_content.find("extern \"C++\" int counter;"), std::string::npos)
+      << "a variable stays a declaration: extern \"C++\" carries the meaning";
+}
+
 TEST(HeaderRewrite, InjectedSignatureTypeKeptComplete) {
   // fwdstr_lib/consumer.h references `foo` (only declared in dep.h). The
   // injected module-local forward declaration must keep the full signature

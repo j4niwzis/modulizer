@@ -112,6 +112,47 @@ public:
     mods.push_back({begin_off, del_end - begin_off, ""});
   }
 
+  // A declaration that carries its own `extern` storage-class specifier must
+  // not also be given `extern "C++"`: the linkage-specification already
+  // supplies the linkage the keyword asks for, and the two together are
+  // ill-formed (gcc diagnoses it, clang accepts it):
+  //
+  //   extern "C++" template <class T> extern T Make(int);
+  //   error: invalid use of 'extern' in linkage specification
+  //
+  // Return the modification that removes the keyword. Dropping it changes
+  // nothing: on a function `extern` is what a declaration means anyway, and on
+  // a variable it marks a declaration rather than a definition — which
+  // `extern "C++"` keeps. The keyword belongs to the declaration itself, whose
+  // begin location sits after any template parameter list, so the scan starts
+  // there rather than at the marker offset (which precedes `template`).
+  std::optional<ModPoint> drop_storage_extern(clang::Decl *d, unsigned off,
+                                              llvm::StringRef src,
+                                              clang::FileID fid) {
+    clang::Decl *inner = d;
+    if (auto *td = llvm::dyn_cast<clang::TemplateDecl>(d))
+      inner = td->getTemplatedDecl();
+    if (!inner) return std::nullopt;
+    clang::StorageClass sc = clang::SC_None;
+    if (auto *vd = llvm::dyn_cast<clang::VarDecl>(inner))
+      sc = vd->getStorageClass();
+    else if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(inner))
+      sc = fd->getStorageClass();
+    // A declaration inside `extern "C"` has no storage class of its own, so the
+    // linkage-specification's own keyword is never the one found here.
+    if (sc != clang::SC_Extern) return std::nullopt;
+    auto begin = inner->getBeginLoc();
+    auto loc = begin.isMacroID() ? sm.getSpellingLoc(begin)
+                                 : sm.getExpansionLoc(begin);
+    if (!loc.isValid() || sm.getFileID(loc) != fid) return std::nullopt;
+    // The marker offset may have been backed up over an attribute macro, which
+    // find_extern_spec knows how to skip; never scan from before it.
+    unsigned scan = std::max(sm.getFileOffset(loc), off);
+    unsigned start = 0, end = 0;
+    if (!find_extern_spec(src, scan, start, end)) return std::nullopt;
+    return ModPoint{start, end - start, ""};
+  }
+
   // Prefix a forward declaration with `extern "C++"` so it attaches to the
   // global module and merges with the entity's definition in another module.
   // For templates the declaration starts at `template`, not at the struct/class
@@ -163,6 +204,8 @@ public:
         off = new_off;
       }
     }
+    if (auto m = drop_storage_extern(d, off, src, fid))
+      mods.push_back(std::move(*m));
     mods.push_back({off, 0, "extern \"C++\" "});
   }
 
@@ -588,24 +631,16 @@ private:
     std::string prefix =
         specialization ? std::string() : std::format("{} ", export_macro);
     if (need_extern_cxx) {
-      // A variable declared `extern int x;` already carries the storage-class
-      // specifier that `extern "C++"` makes redundant; drop it so the result is
-      // a clean single `extern "C++" int x;`. The declaration may be
-      // `extern int x;` or, when preceded by an attribute macro,
-      // `LIB_API_ extern int x;` — find_extern_spec tries `extern` right
-      // away, then skips a leading attribute-macro identifier and retries
-      // (keeping the macro).
-      if (auto *vd = llvm::dyn_cast<clang::VarDecl>(d))
-        if (vd->getStorageClass() == clang::SC_Extern) {
-          unsigned ex_start = 0, ex_end = 0;
-          if (find_extern_spec(src, off, ex_start, ex_end)) {
-            ModPoint m{ex_start, ex_end - ex_start, ""};
-            if (!route_to.empty())
-              (*external_macro_mods)[route_to].push_back(std::move(m));
-            else
-              mods.push_back(std::move(m));
-          }
-        }
+      // `extern int x;` and `template <class T> extern T f();` carry the
+      // storage-class specifier that `extern "C++"` makes redundant — and
+      // ill-formed next to it. Drop it so the result is a clean single
+      // `extern "C++" int x;`.
+      if (auto m = drop_storage_extern(d, off, src, fid)) {
+        if (!route_to.empty())
+          (*external_macro_mods)[route_to].push_back(std::move(*m));
+        else
+          mods.push_back(std::move(*m));
+      }
       prefix += "extern \"C++\" ";
     }
     ModPoint m{off, 0, std::move(prefix)};

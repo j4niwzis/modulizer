@@ -107,8 +107,11 @@ export bool find_extern_spec(llvm::StringRef text, unsigned from,
   auto try_extern = [&]() {
     while (scan < text.size() && (text[scan] == ' ' || text[scan] == '\t'))
       ++scan;
+    // A whole token: `externalFoo x;` starts with the same six characters and
+    // must not have them cut out of it.
     if (text.size() - scan >= 6 &&
-        std::string_view(text.data() + scan, 6) == "extern") {
+        std::string_view(text.data() + scan, 6) == "extern" &&
+        (text.size() - scan == 6 || !is_ident_char(text[scan + 6]))) {
       start = scan;
       scan += 6;
       while (scan < text.size() && (text[scan] == ' ' || text[scan] == '\t'))
