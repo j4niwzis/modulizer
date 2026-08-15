@@ -66,6 +66,7 @@ public:
     if (is_guard) return;
 
     macros.push_back({std::move(macro_name), std::move(body), hashOff, endOff});
+    macros.back().cond_depth = cond_depth;
   }
 
   void MacroUndefined(const clang::Token &name,
@@ -77,14 +78,39 @@ public:
     // NOTE: StringRef must be converted with .str() — std::format treats a raw
     // StringRef as a range of chars (`['P','R',...]`) and never matches.
     for (auto &m : macros) {
-      if (m.body.starts_with(std::format("#define {}", id->getName().str())))
-        m.undefed = true;
+      if (!m.body.starts_with(std::format("#define {}", id->getName().str())))
+        continue;
+      // An `#undef` nested deeper than the `#define` retracts the macro only
+      // where its branch is taken — the `#undef GMOCK_X` + redefine under
+      // `#if defined(__clang__)` idiom. The definition is still the one in
+      // effect everywhere else, so it stays public; treating it as retracted
+      // leaves the macro undefined on every other compiler.
+      if (cond_depth > m.cond_depth) continue;
+      m.undefed = true;
     }
   }
 
+  void If(clang::SourceLocation loc, clang::SourceRange,
+          ConditionValueKind) override { enter(loc); }
+  void Ifdef(clang::SourceLocation loc, const clang::Token &,
+             const clang::MacroDefinition &) override { enter(loc); }
+  void Ifndef(clang::SourceLocation loc, const clang::Token &,
+              const clang::MacroDefinition &) override { enter(loc); }
+  void Endif(clang::SourceLocation loc, clang::SourceLocation) override {
+    if (sm.isInMainFile(loc) && cond_depth > 0) --cond_depth;
+  }
+
 private:
+  void enter(clang::SourceLocation loc) {
+    if (sm.isInMainFile(loc)) ++cond_depth;
+  }
+
   const clang::SourceManager &sm;
   std::vector<MacroRec> &macros;
+  // Nesting of the `#if` blocks open at the current point. An include guard
+  // counts as one, which is why definitions and undefs are compared to each
+  // other rather than against zero.
+  unsigned cond_depth = 0;
 };
 
 // Textually extract ALL #define lines from the original header, including
@@ -403,6 +429,7 @@ export std::string build_macros_file(
     const std::vector<MacroRec> &export_macros,
     const std::set<std::string> &extra_macro_includes,
     const std::set<std::string> &block_defined_names,
+    const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
     const std::string &original,
     const std::vector<ModPoint> &mods,
     const std::string &export_include) {
@@ -448,8 +475,18 @@ export std::string build_macros_file(
   };
   bool has_marked_macros = false;
   for (auto &m : export_macros) {
-    // Skip bare active definitions covered by an emitted conditional block.
-    if (!m.name.empty() && block_defined_names.count(m.name)) continue;
+    // Skip bare active definitions covered by an emitted conditional block:
+    // one that covers every platform makes any definition of the name dead,
+    // and a definition sitting inside a block travels with it either way —
+    // emitting that one bare would strip its condition and hand every platform
+    // whichever branch happened to be active during the conversion.
+    if (!m.name.empty()) {
+      if (block_defined_names.count(m.name)) continue;
+      bool in_block = false;
+      for (auto &[start, end] : block_ranges)
+        if (m.start_off >= start && m.end_off <= end) { in_block = true; break; }
+      if (in_block) continue;
+    }
     // Move the doc-comment block that precedes the macro into the macros file
     // next to the macro it documents.
     if (!m.name.empty() && m.start_off != 0) {

@@ -372,14 +372,28 @@ public:
     else if (auto *fd =
                  llvm::dyn_cast_or_null<clang::FunctionDecl>(storage_decl))
       extern_spec = fd->getStorageClass() == clang::SC_Extern;
-    if (extern_spec) strip_storage_extern(decl_text);
+    // Only when this declaration is the thing carrying the linkage: under the
+    // whole-body wrapping no `extern "C++"` is prefixed here, and the enclosing
+    // block does not stand in for the keyword — [dcl.link]/7 treats only a
+    // declaration DIRECTLY contained in a linkage-specification as `extern`,
+    // and these are nested in their namespaces. Dropping it there would turn
+    // `extern const char kMarker[];` into a definition of unknown size.
+    if (extern_spec && !extern_cxx) strip_storage_extern(decl_text);
     // The declaration text (namespace wrappers added at emission time so
     // adjacent declarations in the same namespace can be merged into a single
     // `namespace ... { ... }` block).
     std::string block;
     if (extern_cxx)
-      // The whole body already sits inside an extern "C++" block.
-      block += std::format("{}\n", decl_text);
+      // The whole body already sits inside an extern "C++" block, so only the
+      // export marker is left to add — and it is always owed, however the
+      // entity is defined. Attaching a declaration to the global module does
+      // not by itself make it the SAME declaration everywhere: a module that
+      // cannot see this one introduces its own, and the two never merge, so
+      // every signature naming the entity mismatches across the boundary. The
+      // export is what makes the declaration findable, and gcc takes the first
+      // declaration of a name as the one that introduces it, so an unexported
+      // one ahead of the definition leaves the entity unexported for good.
+      block += std::format("export {}\n", decl_text);
     else if (exported && !cross_fwd)
       // A forward declaration of an entity this module defines as a plain
       // module entity: export it normally.
