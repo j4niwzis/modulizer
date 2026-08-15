@@ -223,6 +223,54 @@ public:
         sm, ctx.getLangOpts());
     if (text.empty()) return;
     std::string decl_text = text.str();
+    // A redeclaration must not repeat a default template argument that has
+    // already been declared, and the definition this is copied from declares
+    // them. Taken verbatim the copy carries them along:
+    //
+    //   template <typename C, bool = sizeof(Test<C>(0)) == sizeof(Yes)>
+    //   struct Impl;
+    //
+    //   error: redefinition of default argument for 'bool <anonymous>'
+    //
+    // The declaration arrives from the imported module as well, so the two
+    // collide. Rebuild the parameter list from the AST, which drops the
+    // defaults and keeps everything that identifies the parameters.
+    if (auto *td = llvm::dyn_cast<clang::TemplateDecl>(text_decl)) {
+      if (auto *tpl = td->getTemplateParameters()) {
+        auto begin = sm.getFileOffset(text_decl->getSourceRange().getBegin());
+        auto rangle = sm.getFileOffset(tpl->getRAngleLoc());
+        if (rangle > begin && rangle - begin < decl_text.size()) {
+          auto policy = ctx.getPrintingPolicy();
+          std::string params;
+          for (auto *param : *tpl) {
+            if (!params.empty()) params += ", ";
+            if (auto *tp = llvm::dyn_cast<clang::TemplateTypeParmDecl>(param)) {
+              params += tp->wasDeclaredWithTypename() ? "typename" : "class";
+              if (tp->isParameterPack()) params += "...";
+              if (!tp->getName().empty())
+                params += " " + tp->getName().str();
+            } else if (auto *nt =
+                           llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(
+                               param)) {
+              params += nt->getType().getAsString(policy);
+              if (nt->isParameterPack()) params += "...";
+              if (!nt->getName().empty())
+                params += " " + nt->getName().str();
+            } else {
+              // A template template parameter. Printing it is enough here: its
+              // own defaults are inside its nested list, which the printer
+              // omits with SuppressDefaultTemplateArgs unset only for
+              // arguments, not parameters, so fall back to the source form.
+              params.clear();
+              break;
+            }
+          }
+          if (!params.empty())
+            decl_text = std::format("template <{}>{}", params,
+                                    decl_text.substr(rangle - begin + 1));
+        }
+      }
+    }
     // For a cross-module entity the referenced declaration is a full DEFINITION
     // in another header (e.g. `bool Helper(const A&, const B&) { return true;
     // }`). This module only needs the declaration so the template body's lookup
