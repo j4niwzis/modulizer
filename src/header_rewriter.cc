@@ -714,6 +714,77 @@ export HeaderRewriteResult rewrite_header(
     // interface unit supplies them from its global module fragment, but a
     // classic (non-module) build includes this header and nothing else, so the
     // header has to bring its own macros along in that case.
+    //
+    // Whatever the header goes on to define for itself has to be dropped again
+    // straight after that include, for the same reason the interface unit
+    // drops it (see assemble_interface_cc): the macros file is written before
+    // the standard library is, so a macro derived from a feature-test macro is
+    // computed there against the wrong answer —
+    //
+    //   #if defined(__cpp_lib_three_way_comparison)
+    //   #define LIB_HAS_COMPARE 1
+    //
+    // reaches the macros file as 0 and the header as 1. The header's is the
+    // right one and wins by coming later, so the value was never wrong here,
+    // but every translation unit including the header said so:
+    //
+    //   warning: 'LIB_HAS_COMPARE' macro redefined
+    //
+    // Undefining first leaves the header to establish its own definitions
+    // quietly, and leaves the macros file to cover only what the header no
+    // longer defines — which is what it is for.
+    // Drop the macros file's copy of each macro the header defines for itself,
+    // immediately before that definition rather than in one block up front.
+    //
+    // The values are the reason. The macros file is written before the
+    // standard library is, so a macro derived from a feature-test macro is
+    // computed there against the wrong answer, and the header's own definition
+    // is the one to keep — but until that definition is reached, the macros
+    // file's value is what the header's own conditionals read:
+    //
+    //   #ifdef LIB_IS_THREADSAFE      // decided by a macro the file supplied
+    //   ...
+    //   #define LIB_STATIC_MUTEX_(m)  // and only redefined inside a branch
+    //
+    // Undefining up front takes those away before they are read, silently
+    // selecting a different branch and so a different definition. Undefining
+    // at the point of redefinition leaves every read intact and drops the copy
+    // exactly when it is about to be replaced.
+    // EVERY definition of the name, not only the one that is live here. A
+    // header often sets a default and then replaces it under a condition:
+    //
+    //   #define LIB_WARNING_PUSH()              // default, collides
+    //   #if defined(__clang__)
+    //   #undef LIB_WARNING_PUSH
+    //   #define LIB_WARNING_PUSH() _Pragma(...) // live, what the file carries
+    //
+    // The macros file carries the live one, so it is the default that
+    // redefines it, and an undef placed only at the live definition arrives
+    // after the warning has already been issued.
+    std::vector<std::pair<std::size_t, std::string>> sites;
+    for (auto &m : export_macros) {
+      if (m.name.empty()) continue;
+      auto needle = std::format("#define {}", m.name);
+      for (std::size_t pos = hdr.find(needle); pos != std::string::npos;
+           pos = hdr.find(needle, pos + 1)) {
+        // This very macro, not one whose name merely starts with it, and at
+        // the start of a line.
+        auto after = pos + needle.size();
+        if (after < hdr.size() &&
+            (is_ident_char(hdr[after]) || hdr[after] == '_'))
+          continue;
+        auto ls = hdr.rfind('\n', pos);
+        auto first =
+            hdr.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1);
+        if (first != pos) continue;
+        sites.emplace_back(pos, m.name);
+      }
+    }
+    // Back to front, so the offsets of the sites still to come do not shift.
+    std::ranges::sort(sites, [](auto &a, auto &b) { return a.first > b.first; });
+    for (auto &[pos, name] : sites)
+      hdr.insert(pos, std::format("#undef {}\n", name));
+
     hdr.insert(post_guard_pos,
                std::format("#ifndef {}\n#include \"{}.h\"\n#endif\n",
                            use_modules_macro, macros_name));
