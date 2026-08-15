@@ -148,16 +148,88 @@ jobs:
       matrix:
         libc: [glibc, musl]
         stdlib: [libstdc++, libc++]
-        exclude:
-          # Alpine's libc++-dev ships headers and libc++.so only — no
-          # `std.cppm` and no `libc++.modules.json` — so CMake cannot build the
-          # `std` module against it and `import std;` is unavailable. libc++
-          # coverage comes from the glibc leg, where apt.llvm.org ships them.
-          - libc: musl
-            stdlib: libc++
     steps:
       - uses: actions/checkout@v4
 
       - name: Build and test the generated tree
         run: |
           .github/scripts/build-generated-tree.sh "${{ matrix.libc }}" "${{ matrix.stdlib }}"
+
+  # ── Cross-environment generation ────────────────────────────────────
+  #
+  # The jobs above build a tree that was converted somewhere else, once, by
+  # hand. These convert it here, in one environment, and build it in another.
+  #
+  # That split is the point. What a converter emits must not depend on the
+  # machine that ran it, and the failure mode is silent: the include set a unit
+  # keeps is decided by resolving each use back to the header that owns it, and
+  # a host can bake its own answer into the output. A tree that builds only
+  # where it was made looks perfectly fine until someone else builds it.
+  #
+  # Note the two independent axes. Which standard library modulizer is BUILT
+  # against is forced — it links clang's libraries, and every prebuilt clang is
+  # built against libstdc++. Which one it PARSES with is free, set by the flags
+  # after `--`, and needs no `std` module because conversion only reads headers.
+  # So libc++ generation works even on Alpine, where `import std` cannot build.
+  generate:
+    name: generate (${{ matrix.libc }}, parsed with ${{ matrix.stdlib }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: musl
+            stdlib: libc++
+          - libc: musl
+            stdlib: libstdc++
+          - libc: glibc
+            stdlib: libstdc++
+          - libc: glibc
+            stdlib: libc++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Convert googletest
+        run: .github/scripts/generate-tree.sh "${{ matrix.libc }}" "${{ matrix.stdlib }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tree-${{ matrix.libc }}-${{ matrix.stdlib }}
+          path: generated-tree-${{ matrix.libc }}-${{ matrix.stdlib }}.tar.gz
+          retention-days: 7
+
+  cross-tree:
+    name: ${{ matrix.from }} tree on ${{ matrix.libc }}/${{ matrix.stdlib }}
+    needs: generate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Every pairing is the exact opposite environment on both axes: the
+          # libc and the standard library the conversion parsed against are
+          # both swapped for the build. Nothing the converting host answered
+          # for itself can survive that.
+          - from: musl-libc++
+            libc: glibc
+            stdlib: libstdc++
+          - from: musl-libstdc++
+            libc: glibc
+            stdlib: libc++
+          - from: glibc-libc++
+            libc: musl
+            stdlib: libstdc++
+          # Alpine packages no std.cppm, so `import std` used to rule this
+          # pairing out; alpine-libcxx-modules.sh supplies the module sources
+          # from llvm-project at the matching tag, and it builds in full.
+          - from: glibc-libstdc++
+            libc: musl
+            stdlib: libc++
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tree-${{ matrix.from }}
+      - name: Build and test the generated tree
+        env:
+          TREE_TARBALL: generated-tree-${{ matrix.from }}.tar.gz
+          MODULE_BUILD: ${{ matrix.module_build || 1 }}
+        run: .github/scripts/build-generated-tree.sh "${{ matrix.libc }}" "${{ matrix.stdlib }}"
