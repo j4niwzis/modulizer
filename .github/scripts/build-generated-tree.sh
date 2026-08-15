@@ -3,6 +3,11 @@
 #
 #   build-generated-tree.sh <glibc|musl> <libstdc++|libc++>
 #
+# By default this builds the published fork. Set TREE_TARBALL to a tarball
+# produced by generate-tree.sh to build THAT instead — which is how the
+# cross-environment jobs work: convert in one container, build in another, so
+# nothing the conversion host happened to answer can pass unnoticed.
+#
 # The tree is generated on one machine against one standard library and has to
 # compile everywhere else: that is what emitting no standard-library internals
 # (`bits/…`, `__algorithm/…`) and none of their private guards buys. Building it
@@ -18,6 +23,12 @@ set -euo pipefail
 LIBC=${1:?usage: $0 <glibc|musl> <libstdc++|libc++>}
 STDLIB=${2:?usage: $0 <glibc|musl> <libstdc++|libc++>}
 FORK=${FORK:-https://github.com/j4niwzis/googletest-modules.git}
+TREE_TARBALL=${TREE_TARBALL:-}
+# Set to 0 to build only the classic half. Alpine ships libc++ headers but no
+# `std.cppm` or `libc++.modules.json`, so CMake cannot build the `std` module
+# there and `import std.compat` has nothing to resolve against — the classic
+# half needs none of that and still exercises the emitted headers.
+MODULE_BUILD=${MODULE_BUILD:-1}
 
 case "$STDLIB" in
   libstdc++) CXX_FLAGS="" ;;
@@ -38,9 +49,35 @@ fi
 # well, and these images have no `cc` to fall back on. The generated tree picks
 # the `import std` UUID from the CMake it finds, so the distributions shipping
 # different CMake versions is fine.
-read -r -d '' BUILD <<EOF || true
-set -eux
-git clone --depth 1 "$FORK" /gt
+if [ -n "$TREE_TARBALL" ]; then
+  FETCH_TREE='mkdir -p /gt && tar -C /gt -xzf /tree.tar.gz'
+  MOUNT_TREE="-v $(cd "$(dirname "$TREE_TARBALL")" && pwd)/$(basename "$TREE_TARBALL"):/tree.tar.gz:ro"
+else
+  FETCH_TREE="git clone --depth 1 \"$FORK\" /gt"
+  MOUNT_TREE=""
+fi
+
+# Alpine needs libc++ put together by hand: the unwinder it links against is a
+# separate package (without it the first compiler check dies on "cannot find
+# -lunwind", and the name has moved between releases), and no std.cppm or
+# libc++.modules.json is packaged at all.
+#
+# Built as a variable rather than written inline in the `docker run` command:
+# that command is a double-quoted string, so quotes inside it would close and
+# reopen it, and the shell that eventually runs would see something other than
+# what is written here.
+if [ "$LIBC" = musl ] && [ "$STDLIB" = libc++ ]; then
+  read -r -d '' LIBCXX_SETUP <<'SETUP' || true
+apk add --no-cache libc++-dev
+apk add --no-cache llvm-libunwind-dev || apk add --no-cache libunwind-dev
+sh /repo/.github/scripts/alpine-libcxx-modules.sh
+SETUP
+else
+  LIBCXX_SETUP=':'
+fi
+
+if [ "$MODULE_BUILD" = "1" ]; then
+  read -r -d '' MODULE_PART <<EOF || true
 cmake -S /gt -B /gt/build -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_GMOCK=ON \
@@ -53,6 +90,15 @@ cmake -S /gt -B /gt/build -G Ninja \
   -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS"
 cmake --build /gt/build -j"\$(nproc)"
 ctest --test-dir /gt/build --output-on-failure -j"\$(nproc)"
+EOF
+else
+  MODULE_PART='echo "skipping the module build: no std module for this standard library"'
+fi
+
+read -r -d '' BUILD <<EOF || true
+set -eux
+$FETCH_TREE
+$MODULE_PART
 
 # The other half of the dual tree: the same sources as a classic
 # header-and-source library, which must not need any module machinery.
@@ -69,7 +115,7 @@ EOF
 
 case "$LIBC" in
   glibc)
-    docker run --rm ubuntu:26.04 bash -euxc "
+    docker run --rm $MOUNT_TREE ubuntu:26.04 bash -euxc "
       apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates curl git gnupg lsb-release ninja-build wget \
@@ -109,9 +155,10 @@ case "$LIBC" in
     # and Alpine ships it in clang22-extra-tools rather than clang22 — without
     # it the build dies immediately with
     # CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS-NOTFOUND.
-    docker run --rm alpine:edge sh -euxc "
+    docker run --rm $MOUNT_TREE -v "$PWD:/repo:ro" alpine:edge sh -euxc "
       apk add --no-cache clang22 clang22-extra-tools binutils g++ cmake \
         ninja-build ninja-is-really-ninja git musl-dev linux-headers
+      $LIBCXX_SETUP
       $BUILD
     "
     ;;
