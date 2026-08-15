@@ -116,6 +116,14 @@ llvm::cl::opt<bool> NoExternCxxOpt(
     "no-extern-cxx",
     llvm::cl::desc("Do not wrap module body in extern \"C++\" (headers rewrite)"));
 
+llvm::cl::opt<bool> GccModulesOpt(
+    "gcc-modules",
+    llvm::cl::desc(
+        "Make the extern \"C++\" wrapping build-time selectable, behind "
+        "<PREFIX>_EXTERN_CXX, so one tree serves both a conforming "
+        "implementation (macro undefined: module linkage) and GCC (macro "
+        "defined: C++ language linkage in the global module)"));
+
 llvm::cl::opt<bool> ExternCxxOpt(
     "extern-cxx",
     llvm::cl::desc("Wrap module bodies in extern \"C++\" (full rewrite mode; "
@@ -440,6 +448,11 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   cfg.module_replaces = module_replaces;
   cfg.combined_macros = CombinedMacrosOpt;
   cfg.extern_cxx = !NoExternCxxOpt;
+  if (GccModulesOpt.getValue())
+    cfg.extern_cxx_macro = (MacroPrefixOpt.getValue().empty()
+                                ? macro_prefix(library_name)
+                                : macro_prefix(MacroPrefixOpt.getValue())) +
+                           "_EXTERN_CXX";
   cfg.import_std = ImportStdOpt.getValue();
   cfg.cc_only = CCOnlyOpt.getValue();
   cfg.macro_prefix_override = MacroPrefixOpt.getValue();
@@ -890,6 +903,11 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;
   cfg.extern_cxx = extern_cxx;
+  if (GccModulesOpt.getValue())
+    cfg.extern_cxx_macro = (MacroPrefixOpt.getValue().empty()
+                                ? macro_prefix(library_name)
+                                : macro_prefix(MacroPrefixOpt.getValue())) +
+                           "_EXTERN_CXX";
   cfg.import_std = ImportStdOpt.getValue();
   cfg.cc_only = CCOnlyOpt.getValue();
   cfg.same_module_free_fqns = same_module_free_fqns;
@@ -993,7 +1011,13 @@ export inline int run_full_rewrite(int argc, const char **argv) {
                             WrapperModuleOpt.getValue()
                                 ? std::format("{}.umbrella", library_name)
                                 : std::string{},
-                            dual_impl_macro);
+                            dual_impl_macro, {},
+                            GccModulesOpt.getValue()
+                                ? (MacroPrefixOpt.getValue().empty()
+                                       ? macro_prefix(library_name)
+                                       : macro_prefix(MacroPrefixOpt.getValue())) +
+                                      "_EXTERN_CXX"
+                                : std::string{});
     o.ok = !r.content.empty();
     o.r = std::move(r);
   });

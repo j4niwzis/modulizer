@@ -46,6 +46,13 @@ export struct RewriteOptions {
   std::map<std::string, std::string> include_to_module;
   std::vector<std::string> reachable_fqns;
   bool extern_cxx = true;
+  // When set, the `extern "C++"` block wrapping the purview is written behind
+  // `#ifdef <this macro>` rather than unconditionally. One generated tree then
+  // serves both compilers: left undefined the entities keep module linkage,
+  // which is what a conforming implementation wants; defined, everything is
+  // given C++ language linkage in the global module, which is what GCC's
+  // modules need to link against implementations that are not module units.
+  std::string extern_cxx_macro;
   std::vector<std::string> extra_args;
   bool no_internal_filter = false;
   bool import_std = false;
@@ -384,7 +391,10 @@ std::string assemble_interface_cc(
   // below — must be inside the extern "C++" block to merge with the
   // definitions emitted there.
   if (options.extern_cxx) {
+    if (!options.extern_cxx_macro.empty())
+      cc += std::format("#ifdef {}\n", options.extern_cxx_macro);
     cc += "extern \"C++\" {\n";
+    if (!options.extern_cxx_macro.empty()) cc += "#endif\n";
   }
   // Injected declarations are emitted in dependency order; merge adjacent ones
   // that live in the SAME namespace path into a single `namespace ... { ... }`
@@ -453,7 +463,10 @@ std::string assemble_interface_cc(
   }
 
   if (options.extern_cxx) {
+    if (!options.extern_cxx_macro.empty())
+      cc += std::format("#ifdef {}\n", options.extern_cxx_macro);
     cc += "}  // extern \"C++\"\n";
+    if (!options.extern_cxx_macro.empty()) cc += "#endif\n";
   }
   return cc;
 }
@@ -876,7 +889,12 @@ export SourceRewriteResult rewrite_source(
     const std::string &use_modules_macro = {},
     // Path of the body file as seen from the module unit (defaults to the
     // CLI layout: `impl/<stem>.cc` included from `impl/modules/<stem>.cc`).
-    const std::string &body_include = {}) {
+    const std::string &body_include = {},
+    // When set, the extern "C++" wrapping is written behind `#ifdef <this>`,
+    // matching what the interface units do. The two have to agree: an
+    // interface with module linkage and a body with C++ language linkage
+    // declare and define different entities.
+    const std::string &extern_cxx_macro = {}) {
 
   SourceRewriteResult result;
   result.module_name = module_name.str();
@@ -947,11 +965,36 @@ export SourceRewriteResult rewrite_source(
   // the global module fragment, or is provided by an imported module). In
   // module-unit mode it is deleted from the body; in dual mode the body stays
   // compilable on its own, so the directive is kept and guarded instead.
+  // Marks the body as being compiled inside the module unit rather than on its
+  // own. Derived from the use-modules macro so the two read as a pair.
+  std::string module_unit_macro = use_modules_macro;
+  if (module_unit_macro.ends_with("_USE_MODULES"))
+    module_unit_macro =
+        module_unit_macro.substr(0, module_unit_macro.size() -
+                                        std::strlen("_USE_MODULES")) +
+        "_MODULE_UNIT";
+  else
+    module_unit_macro += "_MODULE_UNIT";
+
   bool dual = !use_modules_macro.empty();
   std::vector<std::pair<unsigned, unsigned>> guarded_spans;
+  // Includes the body still needs when it is compiled as an ordinary
+  // translation unit rather than inside the module unit. A dropped include is
+  // safe to lose only because something else provides what it declared: an
+  // import for a library header, `import std` for a standard one. With no
+  // `import std`, nothing replaces a standard header, and the body compiled on
+  // its own is left without it — so those are guarded against the module unit
+  // instead, which does provide them from its global module fragment.
+  std::vector<std::pair<unsigned, unsigned>> body_needed_spans;
   auto drop_include = [&](const IncludeDirective &inc) {
-    if (dual) guarded_spans.push_back({inc.offset, inc.end_offset});
-    else deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+    if (!dual) {
+      deletions.push_back({inc.offset, inc.end_offset - inc.offset});
+      return;
+    }
+    if (!import_std && !inc.is_quoted)
+      body_needed_spans.push_back({inc.offset, inc.end_offset});
+    else
+      guarded_spans.push_back({inc.offset, inc.end_offset});
   };
 
   // Collect member/entity definitions that must be `extern "C++"` because the
@@ -1161,24 +1204,48 @@ export SourceRewriteResult rewrite_source(
   // `#ifndef LIB_USE_MODULES`, so the file still compiles as a plain
   // translation unit. Directives separated only by whitespace share one guard,
   // so the usual include block at the top of a source gets a single one.
-  if (dual && !guarded_spans.empty()) {
-    std::ranges::sort(guarded_spans);
-    std::vector<std::pair<unsigned, unsigned>> runs;
-    for (auto &span : guarded_spans) {
+  // One ordered pass over both kinds of span. Merging each kind separately and
+  // inserting afterwards interleaves their markers when the two are adjacent —
+  // a library include next to a standard one — producing guards that open in
+  // one order and close in the other. Adjacent spans merge only when they
+  // carry the same guard.
+  if (dual) {
+    std::vector<std::tuple<unsigned, unsigned, const std::string *>> spans;
+    for (auto &[a, b] : guarded_spans)
+      spans.emplace_back(a, b, &use_modules_macro);
+    for (auto &[a, b] : body_needed_spans)
+      spans.emplace_back(a, b, &module_unit_macro);
+    std::ranges::sort(spans, [](auto &x, auto &y) {
+      return std::get<0>(x) < std::get<0>(y);
+    });
+    std::vector<std::tuple<unsigned, unsigned, const std::string *>> runs;
+    for (auto &sp : spans) {
       auto gap = runs.empty()
           ? std::string::npos
-          : original.find_first_not_of(" \t\r\n", runs.back().second);
-      if (!runs.empty() && (gap == std::string::npos || gap >= span.first))
-        runs.back().second = span.second;
+          : original.find_first_not_of(" \t\r\n", std::get<1>(runs.back()));
+      if (!runs.empty() && std::get<2>(runs.back()) == std::get<2>(sp) &&
+          (gap == std::string::npos || gap >= std::get<0>(sp)))
+        std::get<1>(runs.back()) = std::get<1>(sp);
       else
-        runs.push_back(span);
+        runs.push_back(sp);
     }
-    for (auto &run : runs) {
-      deletions.push_back(
-          {run.first, 0, std::format("#ifndef {}\n", use_modules_macro)});
-      deletions.push_back(
-          {run.second, 0, std::format("#endif  // {}\n", use_modules_macro)});
+    // One insertion per offset, built in order. Where a run ends exactly where
+    // the next begins — an include directly followed by another — two separate
+    // insertions at that offset are applied in whichever order the mod list
+    // settles on, and the guards come out crossed:
+    //
+    //   #ifndef A          #ifndef A
+    //   #include x         #include x
+    //   #endif  // A       #ifndef B      <-- opened before A closed
+    //   #ifndef B          #endif  // A
+    //
+    // Concatenating at the offset keeps the order they were generated in.
+    std::map<unsigned, std::string> at;
+    for (auto &[from, to, macro] : runs) {
+      at[from] += std::format("#ifndef {}\n", *macro);
+      at[to] += std::format("#endif  // {}\n", *macro);
     }
+    for (auto &[off, text] : at) deletions.push_back({off, 0, text});
   }
 
   auto body = apply_mods(original, deletions);
@@ -1230,6 +1297,21 @@ export SourceRewriteResult rewrite_source(
   for (auto &m : unique_imports)
     out += std::format("import {};\n", m);
 
+  // Wrapping the body, optionally behind the same macro the interface units
+  // use, so the two always agree about which linkage the entities have.
+  auto open_extern = [&](std::string &o) {
+    if (!extern_cxx) return;
+    if (!extern_cxx_macro.empty()) o += std::format("#ifdef {}\n", extern_cxx_macro);
+    o += "extern \"C++\" {\n";
+    if (!extern_cxx_macro.empty()) o += "#endif\n";
+  };
+  auto close_extern = [&](std::string &o) {
+    if (!extern_cxx) return;
+    if (!extern_cxx_macro.empty()) o += std::format("#ifdef {}\n", extern_cxx_macro);
+    o += "}  // extern \"C++\"\n";
+    if (!extern_cxx_macro.empty()) o += "#endif\n";
+  };
+
   if (dual) {
     // `module;` has to be the first token of the translation unit — clang
     // rejects it even behind an `#ifdef` that is taken — so the two modes
@@ -1238,22 +1320,47 @@ export SourceRewriteResult rewrite_source(
     // this unit defines the use-modules macro.
     out += std::format("\n#ifndef {}\n#define {} 1\n#endif\n",
                        use_modules_macro, use_modules_macro);
+    // Tells the body it is being compiled as part of a module unit, so it
+    // leaves the imports below to this preamble.
+    out += std::format("#define {} 1\n", module_unit_macro);
     out += std::format("#include \"{}\"\n",
                        body_include.empty()
                            ? std::format("../{}.cc", fs_stem)
                            : body_include);
     result.module_content = std::move(out);
+
     std::string dual_body;
-    if (extern_cxx) dual_body += "extern \"C++\" {\n";
+    // The same body is compiled two ways. Included by the module unit above it
+    // is attached to the module and needs nothing; compiled on its own with
+    // modules turned on it is an ordinary translation unit, and an ordinary
+    // translation unit sees the declarations it defines only by importing
+    // them. That second form is what an implementation needs when it cannot
+    // attach implementations to a module at all — the entities are in the
+    // global module (see the extern "C++" wrapping), so defining them here is
+    // exactly right.
+    //
+    // Its own module comes first: `module X;` implied that import, and without
+    // the module declaration nothing else does.
+    dual_body += std::format("#if defined({}) && !defined({})\n",
+                             use_modules_macro, module_unit_macro);
+    dual_body += std::format("import {};\n", module_name.str());
+    if (import_std)
+      dual_body += std::format("import {};\n",
+                               std_module_name(module_replaces));
+    for (auto &m : unique_imports)
+      dual_body += std::format("import {};\n", m);
+    dual_body += "#endif\n";
+
+    open_extern(dual_body);
     dual_body += body;
-    if (extern_cxx) dual_body += "}  // extern \"C++\"\n";
+    close_extern(dual_body);
     result.content = std::move(dual_body);
     return result;
   }
 
-  if (extern_cxx) out += "extern \"C++\" {\n";
+  open_extern(out);
   out += body;
-  if (extern_cxx) out += "}  // extern \"C++\"\n";
+  close_extern(out);
 
   result.content = std::move(out);
   return result;

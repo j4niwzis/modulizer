@@ -289,6 +289,9 @@ export struct RewriteBatchConfig {
   std::set<std::string> same_module_free_fqns;
   bool combined_macros = false;
   bool extern_cxx = false;
+  // Name of the macro the extern "C++" wrapping is written behind, or empty
+  // for an unconditional block. See RewriteOptions::extern_cxx_macro.
+  std::string extern_cxx_macro;
   bool import_std = false;
   bool cc_only = false;
   bool wrapper_module = false;
@@ -323,6 +326,7 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
   o.combined_macros = cfg.combined_macros;
   o.reachable_fqns = reachable_fqns;
   o.extern_cxx = cfg.extern_cxx;
+  o.extern_cxx_macro = cfg.extern_cxx_macro;
   o.extra_args = extra_args;
   o.import_std = cfg.import_std;
   o.macro_modules = cfg.macro_modules;
