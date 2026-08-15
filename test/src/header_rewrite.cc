@@ -2022,3 +2022,53 @@ TEST(HeaderRewrite, HeaderDropsTheMacrosFileCopyOfWhatItRedefines) {
   EXPECT_GT(first_undef, cond)
       << "nothing may be undefined before the conditionals that read it";
 }
+
+TEST(HeaderRewrite, ExternCxxWrappingCanBeSelectedAtBuildTime) {
+  // Wrapping the purview in extern "C++" gives every entity C++ language
+  // linkage in the global module, which is what lets an implementation that is
+  // not a module unit link against it. A conforming implementation does not
+  // need that and is better off with module linkage, so the choice belongs to
+  // whoever builds the tree, not to whoever generated it: emit the block
+  // behind a macro so one tree serves both.
+  auto r = rewrite_header(data_path("test_lib/producer.h"), "test_lib.producer",
+                          {.extern_cxx = true,
+                           .extern_cxx_macro = "TEST_LIB_EXTERN_CXX"});
+
+  auto open_guard = r.cc_content.find("#ifdef TEST_LIB_EXTERN_CXX");
+  ASSERT_NE(open_guard, std::string::npos)
+      << "the wrapping must be conditional, not baked in";
+  auto open_brace = r.cc_content.find("extern \"C++\" {", open_guard);
+  ASSERT_NE(open_brace, std::string::npos);
+  EXPECT_LT(open_guard, open_brace) << "the guard precedes the block it guards";
+
+  // Both the opening and the closing brace need guarding, or the two forms do
+  // not both parse.
+  auto close = r.cc_content.rfind("}  // extern \"C++\"");
+  ASSERT_NE(close, std::string::npos);
+  auto close_guard = r.cc_content.rfind("#ifdef TEST_LIB_EXTERN_CXX", close);
+  ASSERT_NE(close_guard, std::string::npos);
+  EXPECT_GT(close_guard, open_brace)
+      << "the closing brace carries its own guard";
+
+  // Every guard opened is closed: an unbalanced one breaks the file in
+  // whichever configuration is not the one that was eyeballed.
+  auto count = [&](std::string_view needle) {
+    std::size_t n = 0, pos = 0;
+    while ((pos = r.cc_content.find(needle, pos)) != std::string::npos) {
+      ++n;
+      pos += needle.size();
+    }
+    return n;
+  };
+  EXPECT_EQ(count("#ifdef TEST_LIB_EXTERN_CXX"), 2u);
+}
+
+TEST(HeaderRewrite, ExternCxxIsUnconditionalWithoutTheMacro) {
+  // Without a macro named, the block stays unconditional — the existing
+  // behaviour, which the clang-only trees depend on.
+  auto r = rewrite_header(data_path("test_lib/producer.h"), "test_lib.producer",
+                          {.extern_cxx = true});
+  EXPECT_NE(r.cc_content.find("extern \"C++\" {"), std::string::npos);
+  EXPECT_EQ(r.cc_content.find("#ifdef "), std::string::npos)
+      << "no build-time switch unless one was asked for";
+}

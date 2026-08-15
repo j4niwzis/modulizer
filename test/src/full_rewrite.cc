@@ -1036,3 +1036,37 @@ TEST(FullRewrite, ExportPrecedesLinkageSpecification) {
   EXPECT_EQ(cc.find("extern \"C\" SPEC_LIB_EXPORT"), std::string::npos)
       << "`extern \"C\" export` is ill-formed";
 }
+
+TEST(FullRewrite, DualBodyImportsWhenCompiledOutsideTheModuleUnit) {
+  // The dual body is compiled two ways. Included by the module unit it is
+  // attached to the module and needs no imports of its own. Compiled directly
+  // with modules on it is an ordinary translation unit — which is the only
+  // shape available where implementations cannot attach to a module at all —
+  // and an ordinary translation unit sees what it defines only by importing
+  // it. Its own module has to come first: `module X;` implied that import.
+  auto r = rewrite_source(data_path("full_lib/impl.cc"), "full_lib.impl",
+                          {}, {}, false, false, {}, {}, {}, {}, false, {},
+                          "FULL_LIB_USE_MODULES");
+  auto &body = r.content;
+
+  auto guard = body.find(
+      "#if defined(FULL_LIB_USE_MODULES) && !defined(FULL_LIB_MODULE_UNIT)");
+  ASSERT_NE(guard, std::string::npos)
+      << "the imports must be skipped when the module unit includes the body";
+  auto own = body.find("import full_lib.impl;", guard);
+  ASSERT_NE(own, std::string::npos)
+      << "the body must import the module whose entities it defines";
+  auto dep = body.find("import full_lib.a;", guard);
+  EXPECT_NE(dep, std::string::npos) << "and everything it used to include";
+  EXPECT_LT(own, dep) << "its own module first";
+
+  // The module unit defines the marker before pulling the body in, so that
+  // same block is inert there — it must not import its own module.
+  auto &mc = r.module_content;
+  auto marker = mc.find("#define FULL_LIB_MODULE_UNIT 1");
+  ASSERT_NE(marker, std::string::npos)
+      << "the module unit must mark the body as attached";
+  auto include = mc.find("#include \"../impl.cc\"");
+  ASSERT_NE(include, std::string::npos);
+  EXPECT_LT(marker, include) << "marked before the body is included";
+}
