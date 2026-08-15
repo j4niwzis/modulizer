@@ -1991,3 +1991,34 @@ TEST(HeaderRewrite, DoesNotExternCxxFriendTemplateInsideClass) {
       << "friend templates inside class bodies must not be wrapped with "
          "extern \"C++\"";
 }
+
+TEST(HeaderRewrite, HeaderDropsTheMacrosFileCopyOfWhatItRedefines) {
+  // A classic build includes the rewritten header and nothing else, so the
+  // header carries its own macros file. Anything the header then defines for
+  // itself would redefine the copy that file just supplied, and every
+  // translation unit including the header reported it:
+  //
+  //   warning: 'MACREDEF_VALUE' macro redefined
+  //
+  // The copy is dropped at the point of redefinition, NOT in a block after the
+  // include. Until the header reaches its own definition, the macros file's
+  // value is what the header's own conditionals read, and taking it away early
+  // silently selects a different branch — and so a different definition.
+  auto r = rewrite_header(data_path("macredef_lib/defs.h"), "macredef_lib.defs");
+  ASSERT_NE(r.macros_content.find("#define MACREDEF_VALUE"), std::string::npos)
+      << "the macros file carries the macro";
+
+  // Adjacent: the undef belongs to the definition that replaces it.
+  EXPECT_NE(r.h_content.find("#undef MACREDEF_VALUE\n#define MACREDEF_VALUE"),
+            std::string::npos)
+      << "the copy must be dropped immediately before the redefinition";
+
+  // And nowhere else: an undef ahead of the conditional would change which
+  // branch the header takes.
+  auto cond = r.h_content.find("#if defined(MACREDEF_FEATURE)");
+  ASSERT_NE(cond, std::string::npos);
+  auto first_undef = r.h_content.find("#undef MACREDEF_VALUE");
+  ASSERT_NE(first_undef, std::string::npos);
+  EXPECT_GT(first_undef, cond)
+      << "nothing may be undefined before the conditionals that read it";
+}
