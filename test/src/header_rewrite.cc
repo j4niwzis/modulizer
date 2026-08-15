@@ -2080,6 +2080,65 @@ TEST(HeaderRewrite, HeaderDropsTheMacrosFileCopyOfWhatItRedefines) {
       << "nothing may be undefined before the conditionals that read it";
 }
 
+TEST(HeaderRewrite, MacrosFileKeepsWhatAOneSidedOverrideLeavesStanding) {
+  // macoverride_lib/defs.h writes the `#undef X` + redefine idiom under
+  // `#if defined(__clang__)`. The conditional block reaches the macros file
+  // verbatim, but it defines the macros for clang only — every other compiler
+  // uses the definitions preceding it, so those have to travel too or the
+  // macro is undefined there. The definitions INSIDE the block must not also
+  // be emitted bare: that would drop the condition and give every compiler the
+  // branch that happened to be active while converting.
+  auto r = rewrite_header(data_path("macoverride_lib/defs.h"),
+                          "macoverride_lib.defs");
+  auto &m = r.macros_content;
+  EXPECT_NE(m.find("#define MACOVERRIDE_WARN_PUSH()\n"), std::string::npos)
+      << "the definition the override leaves standing must reach the macros "
+         "file";
+  EXPECT_NE(m.find("#define MACOVERRIDE_WARN(Level, Name)"), std::string::npos)
+      << "and so must the second one";
+  auto base = m.find("#define MACOVERRIDE_WARN_PUSH()\n");
+  auto block = m.find("#if defined(__clang__)");
+  ASSERT_NE(block, std::string::npos) << "the conditional block is emitted";
+  EXPECT_LT(base, block) << "the base definition precedes the override";
+  // The clang body appears once — inside the block, never as a bare define.
+  auto first = m.find("_Pragma(\"clang diagnostic push\")");
+  ASSERT_NE(first, std::string::npos);
+  EXPECT_EQ(m.find("_Pragma(\"clang diagnostic push\")", first + 1),
+            std::string::npos)
+      << "a definition inside the block must not be emitted bare as well";
+  EXPECT_GT(first, block) << "the only copy of it is the one in the block";
+}
+
+TEST(HeaderRewrite, WrappedPurviewExportsWhatItSharesAndInlinesConstants) {
+  // Under the whole-body `extern "C++"` wrapping every entity is attached to
+  // the global module, which is not by itself enough to make it ONE entity: a
+  // module that cannot see a declaration introduces its own, and the two never
+  // merge. Every shared declaration therefore carries an export. A constant
+  // needs `inline` besides — an exported const has external linkage only while
+  // it is attached to the module, which the wrapping undoes.
+  auto r = rewrite_header(
+      data_path("blockmode_lib/api.h"), "blockmode_lib.api",
+      RewriteOptions{.extern_cxx = true,
+                     .extern_cxx_macro = "BLOCKMODE_LIB_EXTERN_CXX",
+                     .extra_args = {"-I", gDataDir},
+                     .defined_fqns = {"blockmode_lib::Worker",
+                                      "blockmode_lib::Run"},
+                     .fwd_declared_fqns = {"blockmode_lib::Worker",
+                                           "blockmode_lib::Run"}});
+  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT inline constexpr int kLimit"),
+            std::string::npos)
+      << "an exported constant needs inline to keep external linkage";
+  EXPECT_EQ(r.h_content.find("extern \"C++\" class Worker"), std::string::npos)
+      << "the wrapping supplies the linkage; no per-declaration marker";
+  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT class Worker;"),
+            std::string::npos)
+      << "a declaration of an entity defined elsewhere must still be exported "
+         "so importers merge with it instead of declaring their own";
+  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT void Run(int n);"),
+            std::string::npos)
+      << "and the same for a function";
+}
+
 TEST(HeaderRewrite, ExternCxxWrappingCanBeSelectedAtBuildTime) {
   // Wrapping the purview in extern "C++" gives every entity C++ language
   // linkage in the global module, which is what lets an implementation that is

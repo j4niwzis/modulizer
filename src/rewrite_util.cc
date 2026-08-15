@@ -21,6 +21,11 @@ export struct MacroRec {
   unsigned start_off;     // file offset of '#'
   unsigned end_off;       // file offset after newline
   bool undefed = false;   // #undef'd later → keep in .h
+  // How many `#if` blocks enclose the `#define`. An `#undef` deeper than its
+  // definition is a per-platform override, not a retraction: on the platforms
+  // whose branch is not taken the definition still stands, so it must reach
+  // the macros file.
+  unsigned cond_depth = 0;
 };
 
 namespace {

@@ -153,6 +153,21 @@ public:
     return ModPoint{start, end - start, ""};
   }
 
+  // Whether an exported variable definition needs `inline` to carry the
+  // external linkage an export-declaration requires (see the call site in
+  // addExport). Only a definition of a non-volatile const/constexpr variable
+  // at namespace scope does: `extern` and `static` ones are already decided,
+  // and an array's constness sits on its element type.
+  static bool needs_inline_to_export(const clang::VarDecl *vd) {
+    if (vd->isInlineSpecified() || vd->isStaticDataMember()) return false;
+    if (vd->getStorageClass() != clang::SC_None) return false;
+    if (!vd->hasInit()) return false;  // a declaration, not a definition
+    auto t = vd->getType();
+    while (auto *at = t->getAsArrayTypeUnsafe()) t = at->getElementType();
+    if (t.isVolatileQualified()) return false;
+    return vd->isConstexpr() || t.isConstQualified();
+  }
+
   // Prefix a forward declaration with `extern "C++"` so it attaches to the
   // global module and merges with the entity's definition in another module.
   // For templates the declaration starts at `template`, not at the struct/class
@@ -313,8 +328,18 @@ public:
       if (action == FwdAction::kKeepPrivate) {
         // The defining module is not imported here: keep the declaration as a
         // global-module entity so it merges with the definition.
-        if (!extern_cxx) make_extern_cxx(rd);
-        return true;  // not exported
+        if (!extern_cxx) {
+          make_extern_cxx(rd);
+          return true;  // not exported
+        }
+        // Under the whole-body wrapping the declaration is already in the
+        // global module, but being in the global module is not enough to make
+        // it ONE entity: a module that cannot see this declaration introduces
+        // its own, and the two never merge — every use across the boundary
+        // then mismatches ("ambiguating new declaration"). Exporting it is what
+        // lets importers find and merge with it.
+        addExport(rd);
+        return true;
       }
     }
     bool need_extern = !extern_cxx &&
@@ -333,8 +358,12 @@ public:
       }
       // An internal-namespace class whose members are defined in another
       // module is `extern "C++"`; it must also be exported so the defining
-      // impl unit can see its declaration.
-      if (need_extern) addExport(rd, /*need_extern_cxx=*/true);
+      // impl unit can see its declaration. The export is owed whenever the
+      // entity is one of those, not only when this rewrite is the thing adding
+      // the marker — under the whole-body wrapping the block supplies the
+      // linkage and the export would otherwise be dropped.
+      if (is_extern_cxx_entity(rd->getNameAsString()))
+        addExport(rd, need_extern);
       return true;
     }
     addExport(rd, need_extern);
@@ -381,9 +410,16 @@ public:
       if (action == FwdAction::kDelete) return true;
       if (action == FwdAction::kKeepPrivate) {
         // The defining module is not imported here: keep the declaration as a
-        // global-module entity so it merges with the definition.
-        if (!extern_cxx) make_extern_cxx(fd);
-        return true;  // not exported
+        // global-module entity so it merges with the definition. Under the
+        // whole-body wrapping it must also be exported, or a module that cannot
+        // see it introduces its own entity of the same name (see the record
+        // case above).
+        if (!extern_cxx) {
+          make_extern_cxx(fd);
+          return true;  // not exported
+        }
+        addExport(fd);
+        return true;
       }
     }
     bool need_extern = !extern_cxx &&
@@ -391,8 +427,11 @@ public:
     if (is_internal(fd->getNameAsString())) {
       // An internal-namespace function declared in this header but defined in
       // another module is `extern "C++"`; it must also be exported so the
-      // defining impl unit can see its declaration.
-      if (need_extern) addExport(fd, /*need_extern_cxx=*/true);
+      // defining impl unit can see its declaration. As with records, the export
+      // follows from what the entity is, not from whether this rewrite is the
+      // thing adding the marker.
+      if (is_extern_cxx_entity(fd->getNameAsString()))
+        addExport(fd, need_extern);
       return true;
     }
     addExport(fd, need_extern);
@@ -643,6 +682,22 @@ private:
       }
       prefix += "extern \"C++\" ";
     }
+    // A namespace-scope `const`/`constexpr` variable has internal linkage, and
+    // an export-declaration must declare a name with external linkage. In a
+    // module purview the export itself grants it ([basic.link]/3.2 exempts an
+    // exported variable), but under the `extern "C++"` wrapping the entity is
+    // attached to the global module, where that exemption does not apply:
+    //
+    //   extern "C++" { export constexpr int k = 5; }
+    //   error: exporting declaration 'k' with internal linkage
+    //
+    // `inline` grants external linkage either way, and one shared object is
+    // what an exported constant means in the first place. The header cannot
+    // know which way the wrapping macro will be set at build time, so this is
+    // unconditional rather than tied to the wrapping.
+    if (!specialization)
+      if (auto *vd = llvm::dyn_cast<clang::VarDecl>(d))
+        if (needs_inline_to_export(vd)) prefix += "inline ";
     ModPoint m{off, 0, std::move(prefix)};
     if (!route_to.empty())
       (*external_macro_mods)[route_to].push_back(std::move(m));

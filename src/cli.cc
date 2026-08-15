@@ -882,7 +882,14 @@ export inline int run_full_rewrite(int argc, const char **argv) {
                              friend_fqns.begin(), friend_fqns.end());
   }
 
-  bool extern_cxx = ExternCxxOpt;
+  // --gcc-modules makes the `extern "C++"` wrapping build-time selectable,
+  // which presupposes there is a wrapping to select. Without it the macro gates
+  // nothing: every entity keeps module linkage, the marker is emitted per
+  // cross-module declaration instead, and a tree built with <PREFIX>_EXTERN_CXX
+  // defined is no different from one built without it — the shape GCC cannot
+  // link, since its implementation units are ordinary translation units whose
+  // definitions land in the global module.
+  bool extern_cxx = ExternCxxOpt || GccModulesOpt;
 
   // Merge ALL consumer-traced FQNs from BOTH groups (see run_headers_rewrite
   // for rationale): internal and public consumers both need their referenced

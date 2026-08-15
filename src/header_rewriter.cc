@@ -230,14 +230,61 @@ GmfAndImports classify_includes(
   return out;
 }
 
-// Names of macros (re)defined inside an emitted conditional block. Such blocks
-// are authoritative on every platform and re-defining the macro as a bare
-// unconditional `#define` would cause "macro redefined" diagnostics.
+// Whether a conditional block defines its macros on every path, so that what it
+// defines is what every platform gets. A block with an `#else` at its own level
+// does; a one-sided `#if defined(__clang__)` does not — it overrides the
+// definitions preceding it and leaves every other compiler with those, which is
+// exactly the `#undef X` + redefine idiom.
+bool block_covers_every_platform(std::string_view body) {
+  int depth = 0;
+  std::size_t pos = 0;
+  while (pos < body.size()) {
+    auto nl = body.find('\n', pos);
+    if (nl == std::string_view::npos) nl = body.size();
+    auto line = body.substr(pos, nl - pos);
+    auto ns = line.find_first_not_of(" \t");
+    if (ns != std::string_view::npos) {
+      auto d = line.substr(ns);
+      if (d.starts_with("#if")) ++depth;
+      else if (d.starts_with("#endif")) --depth;
+      else if (depth == 1 && d.starts_with("#else")) return true;
+    }
+    pos = nl + 1;
+  }
+  return false;
+}
+
+// Source ranges of the conditional blocks emitted verbatim. A `#define` inside
+// one of them travels with its block and must not be emitted a second time as a
+// bare definition — which would drop its condition and hand every platform the
+// branch that happened to be active while converting.
+std::vector<std::pair<unsigned, unsigned>> collect_block_ranges(
+    const std::vector<MacroRec> &macros) {
+  std::vector<std::pair<unsigned, unsigned>> ranges;
+  for (auto &m : macros)
+    if (m.name.empty() && m.end_off > m.start_off)
+      ranges.push_back({m.start_off, m.end_off});
+  return ranges;
+}
+
+bool inside_block(const std::vector<std::pair<unsigned, unsigned>> &ranges,
+                  const MacroRec &m) {
+  for (auto &[start, end] : ranges)
+    if (m.start_off >= start && m.end_off <= end) return true;
+  return false;
+}
+
+// Names of macros (re)defined inside an emitted conditional block that covers
+// every platform. Such a block is authoritative and re-defining the macro as a
+// bare unconditional `#define` would cause "macro redefined" diagnostics. A
+// one-sided block is not: the definitions it overrides are what the other
+// platforms use, so they must reach the macros file as well.
 std::set<std::string> collect_block_defined_names(
     const std::vector<MacroRec> &macros) {
   std::set<std::string> names;
   for (auto &m : macros) {
     if (!m.name.empty()) continue;
+    if (!block_covers_every_platform(m.body)) continue;
     std::string_view body(m.body);
     std::size_t pos = 0;
     while (pos < body.size()) {
@@ -603,6 +650,7 @@ export HeaderRewriteResult rewrite_header(
 
   auto stem = std::filesystem::path(header_path.str()).stem().string();
 
+  auto block_ranges = collect_block_ranges(macros);
   std::vector<MacroRec> export_macros, impl_macros;
   for (auto &m : macros) {
     if (m.undefed)
@@ -719,8 +767,8 @@ export HeaderRewriteResult rewrite_header(
 
   if (!export_macros.empty() || !extra_macro_includes.empty()) {
     result.macros_content = build_macros_file(
-        export_macros, extra_macro_includes, block_defined_names, original,
-        mods, export_include);
+        export_macros, extra_macro_includes, block_defined_names, block_ranges,
+        original, mods, export_include);
     result.macros_name = macros_name;
     // The macro definitions moved out of the header into the macros file, and
     // the body still uses them (`GTEST_INTERNAL_HAS_INCLUDE(<span>)`). The
