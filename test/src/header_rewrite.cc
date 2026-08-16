@@ -2231,3 +2231,22 @@ TEST(HeaderRewrite, InterfaceUnitDoesNotTakeTheHeaderSOwnPath) {
   EXPECT_NE(o.rel, o.rel_cc)
       << "the header and its interface unit must not share a path";
 }
+
+TEST(HeaderRewrite, ReadsDirectivesWrittenWithSpaceAfterTheHash) {
+  // `# if` and `#   define` are the same directives as `#if` and `#define`.
+  // A pass that only recognises the unspaced spelling does not see the block
+  // at all: its `#else` goes unnoticed, so the branch taken while converting is
+  // hoisted into the macros file as an unconditional definition and the other
+  // branch is left behind, reaching no one.
+  auto r = rewrite_header(data_path("spacedir_lib/api.h"), "spacedir_lib.api",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto &m = r.macros_content;
+  EXPECT_NE(m.find("# if defined(SPACEDIR_WIN)"), std::string::npos)
+      << "the block's condition must be reproduced, not dropped";
+  EXPECT_NE(m.find("# else"), std::string::npos)
+      << "and with it the branch for the other platform";
+  EXPECT_NE(m.find("#   define SPACEDIR_API_KIND 1"), std::string::npos);
+  EXPECT_NE(m.find("#   define SPACEDIR_API_KIND 2"), std::string::npos)
+      << "both branches travel with the block; hoisting only the taken one "
+         "hands every platform whatever the conversion host happened to be";
+}

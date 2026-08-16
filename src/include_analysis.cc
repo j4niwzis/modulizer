@@ -69,10 +69,12 @@ export struct DirectiveParts {
 };
 
 // Parse a preprocessor directive line into keyword + trailing text.
-// `skip_hash_ws` also skips spaces between '#' and the keyword
-// (parse_includes/annotate_guards do; the header rewriter's include-wrapping
-// and textual-macro passes deliberately do not). `keyword_ends_crlf` includes
-// '\r'/'\n' as keyword terminators. Returns nullopt for non-directive lines.
+// `skip_hash_ws` also skips spaces between '#' and the keyword. Leave it on
+// unless a pass genuinely needs `#` and the keyword adjacent: `# if` and
+// `#   define` are ordinary C++, common in libraries that indent nested
+// conditionals, and a pass that does not recognise them silently treats the
+// line as not a directive at all. `keyword_ends_crlf` includes '\r'/'\n' as
+// keyword terminators. Returns nullopt for non-directive lines.
 export std::optional<DirectiveParts> parse_directive(
     std::string_view line, bool skip_hash_ws = true,
     bool keyword_ends_crlf = true) {

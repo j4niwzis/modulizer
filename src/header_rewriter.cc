@@ -244,10 +244,11 @@ bool block_covers_every_platform(std::string_view body) {
     auto line = body.substr(pos, nl - pos);
     auto ns = line.find_first_not_of(" \t");
     if (ns != std::string_view::npos) {
-      auto d = line.substr(ns);
-      if (d.starts_with("#if")) ++depth;
-      else if (d.starts_with("#endif")) --depth;
-      else if (depth == 1 && d.starts_with("#else")) return true;
+      auto d = parse_directive(line);
+      auto kw = d ? std::string_view(d->keyword) : std::string_view();
+      if (kw.starts_with("if")) ++depth;
+      else if (kw == "endif") --depth;
+      else if (depth == 1 && kw == "else") return true;
     }
     pos = nl + 1;
   }
@@ -292,9 +293,9 @@ std::set<std::string> collect_block_defined_names(
       if (nl == std::string_view::npos) nl = body.size();
       auto line = body.substr(pos, nl - pos);
       auto ns = line.find_first_not_of(" \t");
-      if (ns != std::string_view::npos &&
-          line.substr(ns).starts_with("#define")) {
-        auto rest = line.substr(ns + 7);
+      auto d = parse_directive(line);
+      if (ns != std::string_view::npos && d && d->keyword == "define") {
+        auto rest = std::string_view(d->after);
         auto name_start = rest.find_first_not_of(" \t");
         if (name_start != std::string_view::npos) {
           auto name_end = rest.find_first_of("( \t", name_start);
