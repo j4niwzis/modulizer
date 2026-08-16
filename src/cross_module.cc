@@ -73,12 +73,16 @@ export std::vector<std::string> cross_module_fwd_declared_fqns(
       out.push_back(fqn);
       continue;
     }
-    for (auto &f : files) {
-      if (!it->second.count(f)) {  // fwd-declared in a file that does not define it
-        out.push_back(fqn);
-        break;
-      }
-    }
+    // A name defined by more than one header is a set of overloads split
+    // across files, and a forward declaration of it names whichever overload
+    // lives elsewhere — the declaring file defining an overload of its own does
+    // not make the pair local. The declaration side (fwd_action) decides by
+    // name as well, so this side has to be just as coarse or the two disagree,
+    // leaving a global-module declaration against a module-attached definition.
+    bool cross = it->second.size() > 1;
+    for (auto &f : files)
+      if (!it->second.count(f)) cross = true;  // declared where it is not defined
+    if (cross) out.push_back(fqn);
   }
   return out;
 }

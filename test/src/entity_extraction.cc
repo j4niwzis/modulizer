@@ -45,6 +45,23 @@ TEST(EntityExtraction, ClassDefinedByNoHeaderIsCrossModuleForwardDeclared) {
       << "a class defined where it is declared is a module entity";
 }
 
+TEST(EntityExtraction, OverloadDefinedLocallyDoesNotMaskCrossModulePair) {
+  // traits.h both defines an overload of `dispatch` and forward-declares
+  // another one, whose definition lives in entry.h to break a circular header
+  // dependency. The local overload must not make the pair look local: the
+  // declaration side decides by name, so this side has to be just as coarse or
+  // the two disagree and the definition ends up module-attached against a
+  // global-module declaration.
+  std::vector<std::string> headers = {data_path("splitovl_lib/traits.h"),
+                                      data_path("splitovl_lib/entry.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir};
+  auto fqns = cross_module_fwd_declared_fqns(headers, extra_args);
+  EXPECT_TRUE(std::find(fqns.begin(), fqns.end(),
+                        "splitovl_lib::detail::dispatch") != fqns.end())
+      << "an overload set split across headers is a shared global-module "
+         "entity even where the declaring header defines one of them";
+}
+
 TEST(EntityExtraction, FunctionTemplateCompleteReflectsBody) {
   // fwtpl.h forward-declares the function template `foo` (no body) and defines
   // `bar` (has a body). The `complete` flag must reflect whether a body exists:
