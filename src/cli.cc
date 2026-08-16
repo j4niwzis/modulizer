@@ -770,7 +770,8 @@ export inline int run_full_rewrite(int argc, const char **argv) {
           auto i = it->second;
           return make_template_body_scan_consumer(
               ci, tpl_defined_files, tpl_alias_fqns, path, tpl_raw.outs[i],
-              tpl_raw.aliases[i], tpl_raw.friend_pairs[i]);
+              tpl_raw.aliases[i], tpl_raw.referenced[i], tpl_raw.needed[i],
+              tpl_raw.friend_pairs[i]);
         });
   }
   // Explicit INTERNAL consumer sources (the library's own tests/main, or a
@@ -872,6 +873,14 @@ export inline int run_full_rewrite(int argc, const char **argv) {
       // no injected copy needed.
       for (auto &f : tpl_refs.aliases)
         if (not_exported(f)) alias_reachable.push_back(f);
+      // Internal entities another module of this library names OUTSIDE a
+      // template body. The name resolves where the using module is compiled,
+      // so the entity has to be visible there — which means its own module
+      // must export it. Same route as an alias: export, no injected copy.
+      // A library whose modules use each other's `detail::` helpers is
+      // otherwise left with the helper unexported and unreachable.
+      for (auto &f : tpl_refs.referenced)
+        if (not_exported(f)) alias_reachable.push_back(f);
       // Forward-declarable entities (function/class templates, functions,
       // classes) are re-declared module-locally via `extern "C++"`.
       for (auto &f : tpl_refs.fwd_declared)
@@ -950,11 +959,74 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   reachable_fqns.append_range(macro_reachable);
   reachable_fqns.append_range(alias_reachable);
 
+  // A header that names an entity another header defines, without including
+  // that header, is not self-contained: it compiled only because something
+  // else was included first. A module unit has no such luck, so the module
+  // that defines the entity is imported outright.
+  std::map<std::string, std::set<std::string>> extra_imports;
+  if (!header_paths.empty()) {
+    // Which library headers each one includes, and the transitive closure of
+    // that. An import may only go the way the includes already go: adding one
+    // against the grain closes a loop, and a module graph cannot have one —
+    //
+    //   CMake Error: Circular dependency detected in the C++ module import
+    //   graph.
+    //
+    // Two headers that each name something the other defines are exactly what
+    // include guards let a textual build get away with, and exactly what a
+    // module build cannot. Those keep the injected declarations they already
+    // had; only a need that runs WITH the include order becomes an import.
+    std::map<std::string, std::set<std::string>> reach;
+    for (auto &h : header_paths) {
+      auto src = read_file(h);
+      if (src.empty()) continue;
+      for (auto &inc : parse_includes(src)) {
+        auto resolved = resolve_include(inc.path, h, all_extra);
+        if (!resolved.empty()) reach[h].insert(resolved);
+      }
+    }
+    auto reaches = [&](const std::string &from, const std::string &to) {
+      std::set<std::string> seen;
+      std::vector<std::string> stack{from};
+      while (!stack.empty()) {
+        auto cur = stack.back();
+        stack.pop_back();
+        if (!seen.insert(cur).second) continue;
+        auto it = reach.find(cur);
+        if (it == reach.end()) continue;
+        for (auto &n : it->second) {
+          if (n == to) return true;
+          stack.push_back(n);
+        }
+      }
+      return false;
+    };
+    for (std::size_t i = 0;
+         i < header_paths.size() && i < tpl_raw.needed.size(); ++i) {
+      for (auto &fqn : tpl_raw.needed[i]) {
+        auto it = tpl_defined_files.find(fqn);
+        if (it == tpl_defined_files.end()) continue;
+        for (auto &definer : it->second) {
+          if (definer == header_paths[i]) continue;
+          auto mod = derive_module_name(definer, library_name);
+          if (mod == derive_module_name(header_paths[i], library_name)) continue;
+          // Never the library's own umbrella. It imports every sub-module by
+          // construction, so a sub-module importing it back is a loop no
+          // include graph can show.
+          if (mod == library_name || mod == library_name + ".umbrella") continue;
+          if (reaches(definer, header_paths[i])) continue;  // would close a loop
+          extra_imports[header_paths[i]].insert(mod);
+        }
+      }
+    }
+  }
+
   RewriteBatchConfig cfg;
   cfg.module_name = ModuleNameOpt.getValue();
   cfg.library_name = library_name;
   cfg.public_modules = public_modules;
   cfg.no_internal_filter = ExportAllOpt.getValue();
+  cfg.extra_imports = std::move(extra_imports);
   cfg.module_replaces = module_replaces;
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;

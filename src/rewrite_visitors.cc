@@ -164,6 +164,32 @@ public:
                                : std::string()};
   }
 
+  // A namespace-scope `static` variable cannot be exported: the keyword forces
+  // internal linkage, and an export-declaration must declare a name with
+  // external linkage —
+  //
+  //   error: declaration of 'X' with internal linkage cannot be exported
+  //
+  // Dropping it is what makes the export legal, and costs nothing: an exported
+  // const variable is granted external linkage anyway ([basic.link]), which is
+  // exactly what another module needs to see the one entity rather than its
+  // own copy.
+  std::optional<ModPoint> drop_storage_static(clang::Decl *d, unsigned off,
+                                              llvm::StringRef src,
+                                              clang::FileID fid) {
+    auto *vd = llvm::dyn_cast_or_null<clang::VarDecl>(d);
+    if (!vd || vd->getStorageClass() != clang::SC_Static) return std::nullopt;
+    if (vd->isStaticDataMember()) return std::nullopt;
+    auto begin = vd->getBeginLoc();
+    auto loc = begin.isMacroID() ? sm.getSpellingLoc(begin)
+                                 : sm.getExpansionLoc(begin);
+    if (!loc.isValid() || sm.getFileID(loc) != fid) return std::nullopt;
+    unsigned scan = std::max(sm.getFileOffset(loc), off);
+    unsigned start = 0, end = 0;
+    if (!find_static_spec(src, scan, start, end)) return std::nullopt;
+    return ModPoint{start, end - start, std::string()};
+  }
+
   // Whether an exported variable definition needs `inline` to carry the
   // external linkage an export-declaration requires (see the call site in
   // addExport). Only a definition of a non-volatile const/constexpr variable
@@ -757,6 +783,15 @@ private:
       }
       prefix += extern_cxx ? std::format("{} ", linkage_macro)
                            : std::string("extern \"C++\" ");
+    }
+    // A `static` namespace-scope variable is being exported here — another
+    // module names it — and the keyword forbids exactly that. Drop it; see
+    // drop_storage_static.
+    if (auto m = drop_storage_static(d, off, src, fid)) {
+      if (!route_to.empty())
+        (*external_macro_mods)[route_to].push_back(std::move(*m));
+      else
+        mods.push_back(std::move(*m));
     }
     // A namespace-scope `const`/`constexpr` variable has internal linkage, and
     // an export-declaration must declare a name with external linkage. In a
