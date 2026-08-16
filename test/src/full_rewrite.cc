@@ -393,16 +393,17 @@ TEST(FullRewrite, RedundantFunctionForwardDeclIsRemoved) {
 
 TEST(FullRewrite, CrossModuleFunctionForwardDeclGetsExternCxx) {
   // i.h forward-declares render (defined in j.h, which i.h does NOT include).
-  // The declaration must stay in the module as `extern "C++"` (a global-module
-  // entity) so it merges with j.h's definition, without an export marker.
+  // The declaration carries the shared marker: the linkage macro puts it in the
+  // global module, where it merges with j.h's definition, and the export lets
+  // an importer find it there. The same whether or not the body is wrapped —
+  // only what the macro expands to differs.
   auto r = rewrite_header(data_path("fwd_lib/i.h"), "fwd_lib.i", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::render"}});
-  EXPECT_NE(r.h_content.find("extern \"C++\" std::string render(int value);"),
+  EXPECT_NE(r.h_content.find(
+                "FWD_LIB_EXPORT FWD_LIB_EXTERN_CXX_DECL std::string "
+                "render(int value);"),
             std::string::npos)
-      << "cross-module function forward declaration must be extern \"C++\"";
-  EXPECT_EQ(r.h_content.find("FWD_LIB_EXPORT std::string render(int value);"),
-            std::string::npos)
-      << "a function forward declaration defined in another module must not be "
-         "exported";
+      << "cross-module function forward declaration must carry the shared "
+         "marker so it merges with the definition and importers can find it";
 }
 
 TEST(FullRewrite, CrossModuleFunctionDefinitionGetsExternCxx) {
@@ -828,10 +829,10 @@ TEST(FullRewrite, CrossModuleFunctionInImplGetsExternCxx) {
       << "the impl definition of a cross-module free function must be "
          "extern \"C++\"";
   auto h = rewrite_header(data_path("crossimpl/decl.h"), "crossimpl.decl", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"crossimpl::render"}, .fwd_declared_fqns = {"crossimpl::render"}});
-  EXPECT_NE(h.h_content.find("extern \"C++\" int render("),
+  EXPECT_NE(h.h_content.find("CROSSIMPL_EXTERN_CXX_DECL int render("),
             std::string::npos)
-      << "the header declaration of a cross-module free function must also be "
-         "extern \"C++\"";
+      << "the header declaration of a cross-module free function carries the "
+         "linkage macro, which is extern \"C++\" where the body is unwrapped";
 }
 
 TEST(FullRewrite, CrossModuleVariableInImplGetsExternCxx) {

@@ -439,14 +439,11 @@ public:
       if (action == FwdAction::kDelete) return true;
       if (action == FwdAction::kKeepPrivate) {
         // The defining module is not imported here: keep the declaration as a
-        // global-module entity so it merges with the definition. Under the
-        // whole-body wrapping it must also be exported, or a module that cannot
-        // see it introduces its own entity of the same name (see the record
-        // case above).
-        if (!extern_cxx) {
-          make_extern_cxx(fd);
-          return true;  // not exported
-        }
+        // global-module entity so it merges with the definition, and export it
+        // or a module that cannot see it introduces its own entity of the same
+        // name. The same either way, as for records above — the marker's
+        // linkage macro supplies the `extern "C++"` where the wrapping is
+        // absent, so only the spelling differs.
         addExport(fd, /*need_extern_cxx=*/false, /*shared=*/true);
         return true;
       }
