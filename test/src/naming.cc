@@ -78,6 +78,20 @@ TEST(Naming, DeriveModuleNameFromLibraryRoot) {
   EXPECT_EQ(derive_module_name("/src/mylib/api.h", "mylib"), "mylib.api");
 }
 
+TEST(Naming, DeriveModuleNameEscapesKeywordComponents) {
+  // A module name is a list of identifiers, and `alignof` is not one. Left
+  // alone, `export module mylib.alignof;` declares no module at all and the
+  // build stops at "does not provide a module interface unit".
+  EXPECT_EQ(derive_module_name("mylib/alignof.h", "mylib"), "mylib.alignof_");
+  EXPECT_EQ(derive_module_name("mylib/detail/static_assert.h", "mylib"),
+            "mylib.detail.static_assert_");
+  EXPECT_EQ(derive_module_name("elsewhere/typename.h", "mylib"),
+            "mylib.typename_");
+  // Only exact collisions: a name that merely contains one is fine.
+  EXPECT_EQ(derive_module_name("mylib/alignof_helper.h", "mylib"),
+            "mylib.alignof_helper");
+}
+
 TEST(Naming, DeriveModuleNameFallsBackToStem) {
   // When no path segment matches the library name, fall back to stem naming
   // with dashes replaced by underscores.

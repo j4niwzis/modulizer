@@ -1064,6 +1064,37 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   auto outcomes = rewrite_header_batch(
       header_paths, reachable_fqns, cfg, parser.getCompilations());
 
+  // A macros file carries the macros of the modules it imports by including
+  // their macros files, but a header that defines no macro produces none. The
+  // reference is decided per header, before the run knows which of them ended
+  // up with one, so the ones that did not are dropped here:
+  //
+  //   fatal error: 'lib/thing_macros.h' file not found
+  //
+  {
+    std::set<std::string> emitted;
+    for (auto &o : outcomes)
+      if (o.ok && !o.r.macros_content.empty())
+        emitted.insert(std::format("{}.h", o.r.macros_name));
+    for (auto &o : outcomes) {
+      if (!o.ok || o.r.macros_content.empty()) continue;
+      std::string kept;
+      for (auto line : std::views::split(o.r.macros_content, '\n')) {
+        std::string_view s(line.begin(), line.end());
+        auto inc = parse_include_line(s);
+        if (inc && inc->is_quoted && inc->path.ends_with("_macros.h") &&
+            !emitted.count(inc->path))
+          continue;
+        kept += s;
+        kept += '\n';
+      }
+      if (!o.r.macros_content.empty() && o.r.macros_content.back() != '\n' &&
+          !kept.empty())
+        kept.pop_back();
+      o.r.macros_content = std::move(kept);
+    }
+  }
+
   std::set<std::string> written_export_headers;
   std::set<std::string> interface_modules;
   std::set<std::string> macro_files;

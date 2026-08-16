@@ -79,6 +79,37 @@ export bool is_internal_module(const std::string &path,
 // everything after it (subdirectories + filename stem) becomes module
 // segments. A header whose stem equals the library name (e.g. mylib/mylib.h)
 // is the top-level module and is named just the library name.
+// A module name is a dot-separated list of identifiers, and a keyword is not
+// one: `boost/core/alignof.hpp` would name the module `boost.core.alignof`,
+// which the compiler reads as a keyword where an identifier belongs. The unit
+// then declares no module at all —
+//
+//   CMake Error: Output …/alignof.cc.o is of type `CXX_MODULES` but does not
+//   provide a module interface unit or partition
+//
+// — so a component that collides gets a trailing underscore, the usual way of
+// keeping a name that reads like the file it came from.
+std::string escape_module_part(std::string s) {
+  static const std::set<std::string> kKeywords = {
+      "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand", "bitor",
+      "bool", "break", "case", "catch", "char", "char16_t", "char32_t",
+      "char8_t", "class", "compl", "concept", "const", "const_cast",
+      "consteval", "constexpr", "constinit", "continue", "co_await",
+      "co_return", "co_yield", "decltype", "default", "delete", "do", "double",
+      "dynamic_cast", "else", "enum", "explicit", "export", "extern", "false",
+      "float", "for", "friend", "goto", "if", "inline", "int", "long",
+      "mutable", "namespace", "new", "noexcept", "not", "not_eq", "nullptr",
+      "operator", "or", "or_eq", "private", "protected", "public", "register",
+      "reinterpret_cast", "requires", "return", "short", "signed", "sizeof",
+      "static", "static_assert", "static_cast", "struct", "switch", "template",
+      "this", "thread_local", "throw", "true", "try", "typedef", "typeid",
+      "typename", "union", "unsigned", "using", "virtual", "void", "volatile",
+      "wchar_t", "while", "xor", "xor_eq",
+  };
+  if (kKeywords.count(s)) s += "_";
+  return s;
+}
+
 export std::string derive_module_name(llvm::StringRef header_path,
                                       llvm::StringRef library_name) {
   auto segs = split_path(header_path);
@@ -94,7 +125,7 @@ export std::string derive_module_name(llvm::StringRef header_path,
     for (auto &c : stem) if (c == '-') c = '_';
     return stem == library_name.str()
         ? library_name.str()
-        : std::format("{}.{}", library_name.str(), stem);
+        : std::format("{}.{}", library_name.str(), escape_module_part(stem));
   }
 
   std::vector<std::string> parts;
@@ -105,7 +136,7 @@ export std::string derive_module_name(llvm::StringRef header_path,
       auto dot = s.rfind('.');
       if (dot != std::string::npos) s = s.substr(0, dot);
     }
-    parts.push_back(std::move(s));
+    parts.push_back(escape_module_part(std::move(s)));
   }
   if (parts.empty()) return library_name.str();
   if (parts.size() == 1 && parts[0] == library_name.str())
