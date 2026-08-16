@@ -367,8 +367,12 @@ export std::string apply_mods(std::string src, std::vector<ModPoint> &mods) {
       mods, [](const ModPoint &a, const ModPoint &b) { return a.offset > b.offset; });
   for (auto &m : mods) {
     if (m.len > 0) {
-      if (m.offset + m.len <= src.size())
+      // A deletion, or — with text — a replacement: `extern` giving way to the
+      // macro that puts it back wherever the tree is built wrapped.
+      if (m.offset + m.len <= src.size()) {
         src.erase(m.offset, m.len);
+        if (!m.text.empty()) src.insert(m.offset, m.text);
+      }
     } else {
       if (m.offset <= src.size())
         src.insert(m.offset, m.text);

@@ -81,7 +81,7 @@ public:
       if (!m.body.starts_with(std::format("#define {}", id->getName().str())))
         continue;
       // An `#undef` nested deeper than the `#define` retracts the macro only
-      // where its branch is taken — the `#undef GMOCK_X` + redefine under
+      // where its branch is taken — the `#undef X` + redefine under
       // `#if defined(__clang__)` idiom. The definition is still the one in
       // effect everywhere else, so it stays public; treating it as retracted
       // leaves the macro undefined on every other compiler.

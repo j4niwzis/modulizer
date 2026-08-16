@@ -16,6 +16,9 @@ public:
   HeaderVisitor(clang::SourceManager &sm, std::vector<ModPoint> &mods,
                 const std::regex &internal_re,
                 std::string_view export_macro,
+                std::string_view shared_export_macro,
+                std::string_view linkage_macro,
+                std::string_view extern_decl_macro,
                 const std::vector<std::string> &reachable_fqns,
                 std::vector<std::string> &internal_fqns,
                 bool no_internal_filter = false,
@@ -29,6 +32,9 @@ public:
                     external_macro_mods = nullptr)
       : sm(sm), mods(mods),
         internal_re(internal_re), export_macro(export_macro),
+        shared_export_macro(shared_export_macro),
+        linkage_macro(linkage_macro),
+        extern_decl_macro(extern_decl_macro),
         reachable_fqns(reachable_fqns), internal_fqns(internal_fqns),
         no_internal_filter(no_internal_filter), defined_fqns(defined_fqns),
         extern_cxx(extern_cxx), fwd_declared_fqns(fwd_declared_fqns),
@@ -150,7 +156,12 @@ public:
     unsigned scan = std::max(sm.getFileOffset(loc), off);
     unsigned start = 0, end = 0;
     if (!find_extern_spec(src, scan, start, end)) return std::nullopt;
-    return ModPoint{start, end - start, ""};
+    // Under the macro spelling the keyword is not removed but replaced: it has
+    // to come back wherever the tree is built wrapped, and it has to come back
+    // HERE, after any attribute the declaration carries.
+    return ModPoint{start, end - start,
+                    extern_cxx ? std::format("{} ", extern_decl_macro)
+                               : std::string()};
   }
 
   // Whether an exported variable definition needs `inline` to carry the
@@ -221,7 +232,8 @@ public:
     }
     if (auto m = drop_storage_extern(d, off, src, fid))
       mods.push_back(std::move(*m));
-    mods.push_back({off, 0, "extern \"C++\" "});
+    mods.push_back({off, 0, extern_cxx ? std::format("{} ", linkage_macro)
+                                       : std::string("extern \"C++\" ")});
   }
 
   // Remove the `static` storage-class keyword from a function definition so it
@@ -315,8 +327,7 @@ public:
           }
         }
         if (spec_in_file) {
-          bool need_extern = !extern_cxx &&
-                             is_extern_cxx_entity(rd->getNameAsString());
+          bool need_extern = is_extern_cxx_entity(rd->getNameAsString());
           addExport(rd, need_extern);
           return true;
         }
@@ -328,22 +339,24 @@ public:
       if (action == FwdAction::kKeepPrivate) {
         // The defining module is not imported here: keep the declaration as a
         // global-module entity so it merges with the definition.
+        // Without the wrapping the defining module owns the export and this
+        // declaration stays module-private, merging with the definition through
+        // the global module.
         if (!extern_cxx) {
           make_extern_cxx(rd);
           return true;  // not exported
         }
-        // Under the whole-body wrapping the declaration is already in the
-        // global module, but being in the global module is not enough to make
-        // it ONE entity: a module that cannot see this declaration introduces
-        // its own, and the two never merge — every use across the boundary
-        // then mismatches ("ambiguating new declaration"). Exporting it is what
-        // lets importers find and merge with it.
-        addExport(rd);
+        // With it, being in the global module is not enough to make this ONE
+        // entity: a module that cannot see this declaration introduces its own
+        // and the two never merge, so every use across the boundary mismatches
+        // ("ambiguating new declaration"). The export is what lets importers
+        // find and merge with it; the marker carries the `extern "C++"` for
+        // whichever way the tree is then built.
+        addExport(rd, /*need_extern_cxx=*/false, /*shared=*/true);
         return true;
       }
     }
-    bool need_extern = !extern_cxx &&
-                       is_extern_cxx_entity(rd->getNameAsString());
+    bool need_extern = is_extern_cxx_entity(rd->getNameAsString());
     if (no_internal_filter) { addExport(rd, need_extern); return true; }
     if (is_internal(rd->getNameAsString())) {
       // A forward-declared internal entity that the consumer defines itself
@@ -382,7 +395,7 @@ public:
         return true;  // in-class definition, covered by the class
       auto *cls = llvm::dyn_cast<clang::CXXRecordDecl>(md->getDeclContext());
       if (!cls) return true;
-      if (!extern_cxx && is_extern_cxx_entity(cls->getNameAsString()))
+      if (is_extern_cxx_entity(cls->getNameAsString()))
         make_extern_cxx(fd);
       return true;
     }
@@ -418,12 +431,11 @@ public:
           make_extern_cxx(fd);
           return true;  // not exported
         }
-        addExport(fd);
+        addExport(fd, /*need_extern_cxx=*/false, /*shared=*/true);
         return true;
       }
     }
-    bool need_extern = !extern_cxx &&
-                       is_extern_cxx_entity(fd->getNameAsString());
+    bool need_extern = is_extern_cxx_entity(fd->getNameAsString());
     if (is_internal(fd->getNameAsString())) {
       // An internal-namespace function declared in this header but defined in
       // another module is `extern "C++"`; it must also be exported so the
@@ -508,8 +520,7 @@ public:
     if (is_internal(vd->getNameAsString())) return true;
     // A variable declared in this header but defined in another module must be
     // `extern "C++"` on both sides to stay a single shared entity.
-    bool need_extern = !extern_cxx &&
-                       is_extern_cxx_entity(vd->getNameAsString());
+    bool need_extern = is_extern_cxx_entity(vd->getNameAsString());
     addExport(vd, need_extern);
     return true;
   }
@@ -543,6 +554,13 @@ private:
   std::vector<ModPoint> &mods;
   const std::regex &internal_re;
   std::string_view export_macro;
+  std::string_view shared_export_macro;
+  // How `extern "C++"` is spelled. A tree generated with the wrapping defers
+  // the choice to build time: the macro is nothing when the purview is wrapped
+  // (the block supplies the linkage) and `extern "C++"` when it is not.
+  std::string_view linkage_macro;
+  // The spelling for a declaration whose own `extern` the marker replaces.
+  std::string_view extern_decl_macro;
   const std::vector<std::string> &reachable_fqns;
   bool no_internal_filter = false;
   std::vector<std::string> &internal_fqns;
@@ -576,7 +594,10 @@ private:
     return loc.isValid() && sm.isInMainFile(loc);
   }
 
-  void addExport(clang::Decl *d, bool need_extern_cxx = false) {
+  // `shared`: this declares an entity another module defines, so the marker is
+  // the one whose expansion depends on whether the purview is wrapped.
+  void addExport(clang::Decl *d, bool need_extern_cxx = false,
+                 bool shared = false) {
     // [module.interface]/3: an export-declaration shall not declare a partial
     // or explicit specialization. A specialization is exported together with
     // its primary template, so the marker is simply omitted. (clang accepts
@@ -668,7 +689,9 @@ private:
           off = sm.getFileOffset(ls_loc);
       }
     std::string prefix =
-        specialization ? std::string() : std::format("{} ", export_macro);
+        specialization
+            ? std::string()
+            : std::format("{} ", shared ? shared_export_macro : export_macro);
     if (need_extern_cxx) {
       // `extern int x;` and `template <class T> extern T f();` carry the
       // storage-class specifier that `extern "C++"` makes redundant — and
@@ -680,7 +703,8 @@ private:
         else
           mods.push_back(std::move(*m));
       }
-      prefix += "extern \"C++\" ";
+      prefix += extern_cxx ? std::format("{} ", linkage_macro)
+                           : std::string("extern \"C++\" ");
     }
     // A namespace-scope `const`/`constexpr` variable has internal linkage, and
     // an export-declaration must declare a name with external linkage. In a

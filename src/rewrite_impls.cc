@@ -15,12 +15,19 @@ import std;
 export class ExternCxxDefCollector
     : public clang::RecursiveASTVisitor<ExternCxxDefCollector> {
 public:
+  // `marker` is how `extern "C++"` is spelled here. A tree generated with the
+  // whole-purview wrapping defers the choice to build time and passes the macro
+  // that expands to nothing when the purview is wrapped — the definitions are
+  // then already in the global module — and to `extern "C++"` when it is not.
   ExternCxxDefCollector(const clang::SourceManager &sm,
                         const std::set<std::string> &fwd_declared_fqns,
                         const std::set<std::string> &extern_classes,
-                        std::vector<ModPoint> &mods)
+                        std::vector<ModPoint> &mods,
+                        std::string marker = "extern \"C++\" ",
+                        std::string wrap_guard = {})
       : sm(sm), fwd_declared_fqns(fwd_declared_fqns),
-        extern_classes(extern_classes), mods(mods) {}
+        extern_classes(extern_classes), mods(mods),
+        marker(std::move(marker)), wrap_guard(std::move(wrap_guard)) {}
 
   bool shouldVisitTemplateInstantiations() const { return false; }
   bool shouldVisitImplicitCode() const { return false; }
@@ -71,7 +78,7 @@ public:
             off = p;
           }
         }
-        mods.push_back({off, 0, "extern \"C++\" "});
+        mods.push_back({off, 0, marker});
       }
     }
     return true;
@@ -114,8 +121,19 @@ public:
         unsigned end_off = sm.getFileOffset(end);
         while (end_off < buf.size() && buf[end_off] != ';') ++end_off;
         if (end_off < buf.size()) ++end_off;
-        mods.push_back({begin_off, 0, "extern \"C++\" {\n"});
-        mods.push_back({end_off, 0, "\n}"});
+        // A braced block cannot be spelled with the marker: expanded to
+        // nothing it would leave a bare `{ ... }` at namespace scope. Guard it
+        // instead, so the wrapped build simply has no block here.
+        if (wrap_guard.empty()) {
+          mods.push_back({begin_off, 0, "extern \"C++\" {\n"});
+          mods.push_back({end_off, 0, "\n}"});
+        } else {
+          mods.push_back({begin_off, 0,
+                          std::format("#ifndef {}\nextern \"C++\" {{\n#endif\n",
+                                      wrap_guard)});
+          mods.push_back({end_off, 0,
+                          std::format("\n#ifndef {}\n}}\n#endif\n", wrap_guard)});
+        }
       } else {
         // A definition already written `extern const TypeId x = ...;` carries
         // the storage-class specifier that `extern "C++"` makes redundant.
@@ -127,11 +145,11 @@ public:
           unsigned ex_start = 0, ex_end = 0;
           if (find_extern_spec(buf, begin_off, ex_start, ex_end)) {
             mods.push_back({ex_start, ex_end - ex_start, ""});
-            mods.push_back({ex_start, 0, "extern \"C++\" "});
+            mods.push_back({ex_start, 0, marker});
             replaced = true;
           }
         }
-        if (!replaced) mods.push_back({begin_off, 0, "extern \"C++\" "});
+        if (!replaced) mods.push_back({begin_off, 0, marker});
         // `extern "C++"` acts as the extern storage-class specifier, so a bare
         // definition without an initializer (`int g_x;`) would become a mere
         // declaration. Keep it a definition by adding an empty initializer.
@@ -166,7 +184,7 @@ public:
     if (!extern_classes.count(decl_fqn(rd))) return true;
     auto begin = sm.getExpansionLoc(rd->getBeginLoc());
     if (!begin.isValid()) return true;
-    mods.push_back({sm.getFileOffset(begin), 0, "extern \"C++\" "});
+    mods.push_back({sm.getFileOffset(begin), 0, marker});
     return true;
   }
 
@@ -193,6 +211,8 @@ private:
   const std::set<std::string> &fwd_declared_fqns;
   const std::set<std::string> &extern_classes;
   std::vector<ModPoint> &mods;
+  std::string marker;
+  std::string wrap_guard;
 };
 
 // Collects complete class definitions in an implementation file so the extern
@@ -229,8 +249,11 @@ export class ExternCxxDefsConsumer : public clang::ASTConsumer {
 public:
   ExternCxxDefsConsumer(clang::ASTContext &ctx,
                         const std::set<std::string> &fwd_declared_fqns,
-                        std::vector<ModPoint> &mods)
-      : ctx(ctx), fwd_declared_fqns(fwd_declared_fqns), mods(mods) {}
+                        std::vector<ModPoint> &mods,
+                        std::string marker = "extern \"C++\" ",
+                        std::string wrap_guard = {})
+      : ctx(ctx), fwd_declared_fqns(fwd_declared_fqns), mods(mods),
+        marker(std::move(marker)), wrap_guard(std::move(wrap_guard)) {}
 
   void HandleTranslationUnit(clang::ASTContext &) override {
     std::map<std::string, clang::CXXRecordDecl *> class_defs;
@@ -269,7 +292,7 @@ public:
     }
 
     ExternCxxDefCollector v(ctx.getSourceManager(), fwd_declared_fqns,
-                            extern_classes, mods);
+                            extern_classes, mods, marker, wrap_guard);
     v.TraverseDecl(ctx.getTranslationUnitDecl());
   }
 
@@ -277,4 +300,6 @@ private:
   clang::ASTContext &ctx;
   const std::set<std::string> &fwd_declared_fqns;
   std::vector<ModPoint> &mods;
+  std::string marker;
+  std::string wrap_guard;
 };
