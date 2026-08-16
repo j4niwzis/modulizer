@@ -182,6 +182,22 @@ public:
         // imported definition.
         return;
     }
+    // No definition visible here does not mean none reachable. With the body
+    // unwrapped, an entity its own module EXPORTS arrives through the import of
+    // that module, and a copy declared here is not a spare — it is a second
+    // entity of the same name in the global module, which the imported one
+    // immediately contradicts:
+    //
+    //   error: declaration of 'X' in the global module follows declaration in
+    //          module lib.other
+    //
+    // is_exported_via_import is the question that matters, not whether the
+    // entity is merely public: an entity the library defines in a module this
+    // unit does not import is not exported to it, and that declaration still
+    // has to be injected. Wrapped, the copy is how two declarations are made
+    // one entity, so none of this applies there.
+    if (!def && !extern_cxx && !keep_full && is_exported_via_import(fqn))
+      return;
     if (exported && !cross_fwd && !keep_full) {
       // The definition is in this very module. If it precedes the declaration
       // the reference resolves to, the declaration is redundant: the body
