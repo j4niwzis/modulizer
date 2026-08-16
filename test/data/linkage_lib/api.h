@@ -2,8 +2,8 @@
 
 namespace linkage_lib {
 
-// A const/constexpr variable at namespace scope has internal linkage: a plain
-// exported using declaration cannot name it.
+// A const/constexpr variable at namespace scope has internal linkage, so no
+// using declaration can name it.
 const char kToggle = 127;
 constexpr int kLimit = 8;
 
