@@ -1002,8 +1002,8 @@ TEST(FullRewrite, TemplateBodyScanRidingAnotherParseGivesTheSameResult) {
                          [&, self = path](clang::CompilerInstance &ci) {
                            return make_template_body_scan_consumer(
                                ci, defined_files, alias_fqns, self,
-                               raw.outs[i], raw.aliases[i],
-                               raw.friend_pairs[i]);
+                               raw.outs[i], raw.aliases[i], raw.referenced[i],
+                               raw.needed[i], raw.friend_pairs[i]);
                          });
                    });
   }

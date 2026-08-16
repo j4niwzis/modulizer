@@ -15,6 +15,21 @@ std::map<std::string, std::vector<std::string>> build_header_deps(
     const std::vector<std::string> &extra_args) {
   std::map<std::string, std::vector<std::string>> deps;
 
+  // What this run is scanning, canonicalized. An include that resolves into it
+  // is a dependency on another of these headers whatever it looks like — which
+  // is the answer to trust. Quoting style and path shape are conventions: one
+  // house style writes `#include "lib/thing.h"` with the library first, and a
+  // great many libraries write `#include <vendor/lib/thing.hpp>` with it
+  // second. Reading only the first spelling left libraries of the second kind
+  // with no dependencies at all, and every analysis that rides on this one saw
+  // nothing to do.
+  std::set<std::string> scanned;
+  for (auto &h : header_paths) {
+    std::error_code ec;
+    auto c = std::filesystem::weakly_canonical(std::filesystem::path(h), ec);
+    scanned.insert(ec ? h : c.string());
+  }
+
   for (auto &consumer : header_paths) {
     auto src = read_file(consumer);
     if (src.empty()) continue;
@@ -23,14 +38,18 @@ std::map<std::string, std::vector<std::string>> build_header_deps(
 
     auto lib_prefix = std::format("{}/", library_name.str());
     for (auto &inc : includes) {
-      if (!inc.is_quoted) continue;
       if (is_xmacro_include(inc.path)) continue;
-      if (!inc.path.starts_with(lib_prefix)) continue;
       if (inc.path.contains("/custom/")) continue;
 
       auto resolved = resolve_include(inc.path, consumer, extra_args);
-      if (!resolved.empty())
-        deps[consumer].push_back(resolved);
+      if (resolved.empty()) continue;
+      std::error_code ec;
+      auto canon =
+          std::filesystem::weakly_canonical(std::filesystem::path(resolved), ec);
+      bool ours = scanned.count(ec ? resolved : canon.string()) > 0;
+      if (!ours && (!inc.is_quoted || !inc.path.starts_with(lib_prefix)))
+        continue;
+      deps[consumer].push_back(resolved);
     }
   }
   return deps;

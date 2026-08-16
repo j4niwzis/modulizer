@@ -101,6 +101,10 @@ export std::vector<std::string> cross_module_fwd_declared_fqns(
 export struct TemplateBodyRefResult {
   std::vector<std::string> fwd_declared;
   std::vector<std::string> aliases;
+  // Internal entities another module of this library references outside a
+  // template body. Their defining module must EXPORT them: the name resolves
+  // where the using module is compiled, so the import has to carry it.
+  std::vector<std::string> referenced;
   // Every friend declaration seen while scanning, as (enclosing class FQN,
   // friend target FQN). friend_extern_fqns keeps the targets whose enclosing
   // class is `extern "C++"`, which is decided later — the scan itself does not
@@ -148,10 +152,14 @@ private:
 export struct TemplateBodyRawScan {
   std::vector<std::set<std::string>> outs;
   std::vector<std::set<std::string>> aliases;
+  std::vector<std::set<std::string>> referenced;
+  // Per header: the library entities it names that another header defines.
+  // Kept per file, not folded, because the import belongs to that one header.
+  std::vector<std::set<std::string>> needed;
   std::vector<std::vector<std::pair<std::string, std::string>>> friend_pairs;
 
   explicit TemplateBodyRawScan(std::size_t n = 0)
-      : outs(n), aliases(n), friend_pairs(n) {}
+      : outs(n), aliases(n), referenced(n), needed(n), friend_pairs(n) {}
 };
 
 // Collects the FQNs an entity references from template bodies, restricted to
@@ -163,9 +171,11 @@ public:
       const clang::SourceManager &sm,
       const std::map<std::string, std::set<std::string>> &defined_files,
       const std::set<std::string> &alias_fqns, const std::string &self_path,
-      std::set<std::string> &out, std::set<std::string> &out_aliases)
+      std::set<std::string> &out, std::set<std::string> &out_aliases,
+      std::set<std::string> &out_referenced, std::set<std::string> &out_needed)
       : sm(sm), defined_files(defined_files), alias_fqns(alias_fqns),
-        self_path(self_path), out(out), out_aliases(out_aliases) {}
+        self_path(self_path), out(out), out_aliases(out_aliases),
+        out_referenced(out_referenced), out_needed(out_needed) {}
 
   bool shouldVisitTemplateInstantiations() const { return false; }
   bool shouldVisitImplicitCode() const { return false; }
@@ -199,13 +209,15 @@ public:
     return r;
   }
 
-  void record(clang::NamedDecl *d) {
-    if (!d) return;
+  // The FQN of an internal-namespace entity that another library header
+  // defines, or nothing when this reference is not one of those.
+  std::optional<std::string> cross_module_internal_fqn(clang::NamedDecl *d) {
+    if (!d) return std::nullopt;
     auto *canon = llvm::dyn_cast_or_null<clang::NamedDecl>(d->getCanonicalDecl());
-    if (!canon) return;
+    if (!canon) return std::nullopt;
     auto loc = canon->getLocation();
     if (!loc.isValid() || sm.isInMainFile(loc) || sm.isInSystemHeader(loc))
-      return;
+      return std::nullopt;
     // Only namespace-scope entities are injectable. Skip template parameters
     // (`kFromKind`), enum constants (`kBool`, `kInteger`), locals, etc.
     {
@@ -225,7 +237,7 @@ public:
             llvm::isa<clang::TypeAliasDecl>(dc))
           break;
       }
-      if (!ns_scope) return;
+      if (!ns_scope) return std::nullopt;
     }
     auto fqn = canon->getQualifiedNameAsString();
     // Only INTERNAL-namespace entities need the shared-entity treatment:
@@ -235,10 +247,19 @@ public:
     // `Spec<F>::Call` — `lib::PublicValue` (public) must not
     // be flagged.
     if (!fqn.contains("::internal::") && !fqn.contains("::detail::") &&
-        !fqn.contains("::impl::")) return;
+        !fqn.contains("::impl::")) return std::nullopt;
     auto it = defined_files.find(fqn);
-    if (it == defined_files.end()) return;  // not defined by any library header
-    if (it->second.count(self_path)) return;  // defined here, not cross-module
+    if (it == defined_files.end()) return std::nullopt;  // not a library entity
+    if (it->second.count(self_path)) return std::nullopt;  // defined here
+    return fqn;
+  }
+
+  // A reference from inside a template body: instantiated at the consumer, so
+  // the name resolves there and the entity needs the shared-entity treatment.
+  void record(clang::NamedDecl *d) {
+    auto found = cross_module_internal_fqn(d);
+    if (!found) return;
+    auto &fqn = *found;
     // Alias templates cannot be forward-declared: mark them for EXPORT from
     // the defining module (visible via import) instead of injecting a copy.
     if (alias_fqns.count(fqn)) {
@@ -254,7 +275,8 @@ public:
     // injected too, or the using module's copied definition cannot compile.
     // Recursively scan the definition and record every cross-module entity it
     // mentions.
-    scan_definition(canon);
+    scan_definition(llvm::dyn_cast_or_null<clang::NamedDecl>(
+        d->getCanonicalDecl()));
   }
 
   // Scan the definition of a recorded cross-module entity and record every
@@ -305,44 +327,135 @@ public:
     }
   }
 
+  // A reference made ANYWHERE in this header, template body or not. Outside a
+  // template the name resolves where this module is compiled, so the entity
+  // has to be visible here — and for an internal-namespace entity that means
+  // its own module must export it. Nothing is injected: a copy would be a
+  // second entity beside the one the import already carries. A library whose
+  // modules use each other's `detail::` helpers is otherwise left with
+  //
+  //   error: declaration of 'X' must be imported from module 'lib.other'
+  //          before it is required
+  //
+  // because nothing else looks for this: one analysis wants forward
+  // declarations, the other only looks inside template bodies.
+  void record_referenced(clang::NamedDecl *d) {
+    if (auto fqn = cross_module_internal_fqn(d)) out_referenced.insert(*fqn);
+    record_needed(d);
+  }
+
+  // Every entity of this library that this header names and another header
+  // defines, public ones included. A header that names one without including
+  // the header that defines it is not self-contained: it compiles only where
+  // something else was included first, which a module unit cannot rely on —
+  //
+  //   error: calling 'f' with incomplete return type 'lib::Thing'
+  //
+  // The module that defines it has to be imported, and only this can say so:
+  // there is no include to derive it from.
+  void record_needed(clang::NamedDecl *d) {
+    if (!d) return;
+    auto *canon = llvm::dyn_cast_or_null<clang::NamedDecl>(d->getCanonicalDecl());
+    if (!canon) return;
+    auto loc = canon->getLocation();
+    if (!loc.isValid() || sm.isInMainFile(loc) || sm.isInSystemHeader(loc))
+      return;
+    auto fqn = canon->getQualifiedNameAsString();
+    auto it = defined_files.find(fqn);
+    if (it == defined_files.end()) return;
+    if (it->second.count(self_path)) return;
+    out_needed.insert(fqn);
+  }
+
+  // A call names its function, not the types in its signature — the return type
+  // of `x.f()` is written in the header that declares `f`, not here. Yet using
+  // the result needs that type COMPLETE, so the module defining it has to be
+  // imported as well:
+  //
+  //   error: calling 'f' with incomplete return type 'lib::Thing'
+  //
+  // Asked of every callee, not only of one that is itself a library entity: a
+  // MEMBER function is not one (only namespace-scope entities are), and it is
+  // exactly a member whose return type goes missing this way.
+  void record_signature_types(clang::FunctionDecl *fd) {
+    if (!fd) return;
+    record_type(fd->getReturnType());
+    for (auto *pd : fd->parameters()) record_type(pd->getType());
+  }
+
+  // Record the entity a type names, looking through pointers, references and
+  // template arguments.
+  void record_type(clang::QualType t) {
+    if (t.isNull()) return;
+    t = t.getNonReferenceType();
+    while (!t.isNull() && (t->isPointerType() || t->isArrayType())) {
+      auto next = t->getPointeeType();
+      if (next.isNull()) next = t->getAsArrayTypeUnsafe()
+                                    ? t->getAsArrayTypeUnsafe()->getElementType()
+                                    : clang::QualType();
+      if (next.isNull()) break;
+      t = next;
+    }
+    if (t.isNull()) return;
+    if (auto *td = t->getAsTagDecl()) record_needed(td);
+    if (auto *tst = t->getAs<clang::TemplateSpecializationType>()) {
+      if (auto *td = tst->getTemplateName().getAsTemplateDecl())
+        record_needed(td);
+      for (auto &arg : tst->template_arguments())
+        if (arg.getKind() == clang::TemplateArgument::Type)
+          record_type(arg.getAsType());
+    }
+  }
+
   bool in_main(clang::SourceLocation loc) const {
     return loc.isValid() && sm.isInMainFile(loc);
   }
   bool VisitCallExpr(clang::CallExpr *e) {
-    if (e && template_depth_ > 0 && in_main(e->getExprLoc())) {
-      if (auto *fd = e->getDirectCallee()) record(fd);
-      else if (auto *e2 = e->getCallee()) {
-        if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(e2))
-          record(dre->getDecl());
-        else if (auto *ule = llvm::dyn_cast<clang::UnresolvedLookupExpr>(e2))
-          for (auto *d : ule->decls())
-            record(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
-      }
+    if (!e || !in_main(e->getExprLoc())) return true;
+    auto each = [&](clang::NamedDecl *d) {
+      record_referenced(d);
+      record_signature_types(llvm::dyn_cast_or_null<clang::FunctionDecl>(d));
+      if (template_depth_ > 0) record(d);
+    };
+    if (auto *fd = e->getDirectCallee()) each(fd);
+    else if (auto *e2 = e->getCallee()) {
+      if (auto *dre = llvm::dyn_cast<clang::DeclRefExpr>(e2))
+        each(dre->getDecl());
+      else if (auto *ule = llvm::dyn_cast<clang::UnresolvedLookupExpr>(e2))
+        for (auto *d : ule->decls())
+          each(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
     }
     return true;
   }
 
   bool VisitUnresolvedLookupExpr(clang::UnresolvedLookupExpr *e) {
-    if (!e || template_depth_ <= 0 || !in_main(e->getExprLoc())) return true;
-    for (auto *d : e->decls())
-      record(llvm::dyn_cast_or_null<clang::NamedDecl>(d));
+    if (!e || !in_main(e->getExprLoc())) return true;
+    for (auto *d : e->decls()) {
+      auto *nd = llvm::dyn_cast_or_null<clang::NamedDecl>(d);
+      record_referenced(nd);
+      if (template_depth_ > 0) record(nd);
+    }
     return true;
   }
 
   bool VisitDeclRefExpr(clang::DeclRefExpr *e) {
-    if (e && template_depth_ > 0 && in_main(e->getLocation()))
-      record(e->getDecl());
+    if (!e || !in_main(e->getLocation())) return true;
+    record_referenced(e->getDecl());
+    if (template_depth_ > 0) record(e->getDecl());
     return true;
   }
 
   bool VisitTypeLoc(clang::TypeLoc tl) {
-    if (!tl || template_depth_ <= 0 || !in_main(tl.getBeginLoc())) return true;
+    if (!tl || !in_main(tl.getBeginLoc())) return true;
     auto *t = tl.getTypePtr();
     if (!t) return true;
-    if (auto *td = t->getAsTagDecl()) { record(td); return true; }
+    auto each = [&](clang::NamedDecl *d) {
+      record_referenced(d);
+      if (template_depth_ > 0) record(d);
+    };
+    if (auto *td = t->getAsTagDecl()) { each(td); return true; }
     if (auto *tst = llvm::dyn_cast<clang::TemplateSpecializationType>(t)) {
-      if (auto *td = tst->getTemplateName().getAsTemplateDecl())
-        record(td);
+      if (auto *td = tst->getTemplateName().getAsTemplateDecl()) each(td);
     }
     return true;
   }
@@ -354,6 +467,8 @@ private:
   const std::string &self_path;
   std::set<std::string> &out;
   std::set<std::string> &out_aliases;
+  std::set<std::string> &out_referenced;
+  std::set<std::string> &out_needed;
 };
 
 // Builds the consumers the template-body scan runs for one file, so it can be
@@ -364,14 +479,17 @@ export std::unique_ptr<clang::ASTConsumer> make_template_body_scan_consumer(
     const std::map<std::string, std::set<std::string>> &defined_files,
     const std::set<std::string> &alias_fqns, const std::string &self_path,
     std::set<std::string> &out, std::set<std::string> &out_aliases,
+    std::set<std::string> &out_referenced, std::set<std::string> &out_needed,
     std::vector<std::pair<std::string, std::string>> &friend_pairs) {
   struct Consumer : clang::ASTConsumer {
     Consumer(const std::map<std::string, std::set<std::string>> &df,
              const std::set<std::string> &af, std::string sp,
-             std::set<std::string> &o, std::set<std::string> &oa)
-        : df(df), af(af), sp(std::move(sp)), o(o), oa(oa) {}
+             std::set<std::string> &o, std::set<std::string> &oa,
+             std::set<std::string> &orf, std::set<std::string> &on)
+        : df(df), af(af), sp(std::move(sp)), o(o), oa(oa), orf(orf), on(on) {}
     void HandleTranslationUnit(clang::ASTContext &ctx) override {
-      TemplateBodyRefCollector v(ctx.getSourceManager(), df, af, sp, o, oa);
+      TemplateBodyRefCollector v(ctx.getSourceManager(), df, af, sp, o, oa, orf,
+                                 on);
       v.TraverseDecl(ctx.getTranslationUnitDecl());
     }
     const std::map<std::string, std::set<std::string>> &df;
@@ -379,10 +497,13 @@ export std::unique_ptr<clang::ASTConsumer> make_template_body_scan_consumer(
     std::string sp;
     std::set<std::string> &o;
     std::set<std::string> &oa;
+    std::set<std::string> &orf;
+    std::set<std::string> &on;
   };
   std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
-  consumers.push_back(std::make_unique<Consumer>(defined_files, alias_fqns,
-                                                 self_path, out, out_aliases));
+  consumers.push_back(std::make_unique<Consumer>(
+      defined_files, alias_fqns, self_path, out, out_aliases, out_referenced,
+      out_needed));
   consumers.push_back(
       make_traverse_consumer<FriendPairCollector>(friend_pairs));
   (void)ci;
@@ -391,17 +512,19 @@ export std::unique_ptr<clang::ASTConsumer> make_template_body_scan_consumer(
 
 export TemplateBodyRefResult finalize_template_body_scan(
     const TemplateBodyRawScan &raw) {
-  std::set<std::string> out, out_aliases;
+  std::set<std::string> out, out_aliases, out_referenced;
   TemplateBodyRefResult result;
   for (std::size_t i = 0; i < raw.outs.size(); ++i) {
     out.insert_range(raw.outs[i]);
     out_aliases.insert_range(raw.aliases[i]);
+    out_referenced.insert_range(raw.referenced[i]);
     result.friend_pairs.insert(result.friend_pairs.end(),
                                raw.friend_pairs[i].begin(),
                                raw.friend_pairs[i].end());
   }
   result.fwd_declared = std::ranges::to<std::vector>(out);
   result.aliases = std::ranges::to<std::vector>(out_aliases);
+  result.referenced = std::ranges::to<std::vector>(out_referenced);
   return result;
 }
 
@@ -447,8 +570,11 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
   std::set<std::string> out;
   std::set<std::string> out_aliases;
 
+  std::set<std::string> out_referenced;
   std::vector<std::set<std::string>> partial_outs(paths.size());
   std::vector<std::set<std::string>> partial_aliases(paths.size());
+  std::vector<std::set<std::string>> partial_referenced(paths.size());
+  std::vector<std::set<std::string>> partial_needed(paths.size());
   std::vector<std::vector<std::pair<std::string, std::string>>> partial_friends(
       paths.size());
   parallel_parse(
@@ -456,21 +582,25 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
       [&](std::size_t i, const std::string &path) {
         auto &out = partial_outs[i];
         auto &out_aliases = partial_aliases[i];
+        auto &out_ref = partial_referenced[i];
+        auto &out_need = partial_needed[i];
         auto &out_friends = partial_friends[i];
         return std::make_unique<VisitorFrontendActionFactory>(
             [&, self = path](clang::CompilerInstance &ci) {
               return make_template_body_scan_consumer(
                   ci, defined_files, alias_fqns, self, out, out_aliases,
-                  out_friends);
+                  out_ref, out_need, out_friends);
             });
       });
   for (std::size_t i = 0; i < paths.size(); ++i) {
     out.insert_range(partial_outs[i]);
     out_aliases.insert_range(partial_aliases[i]);
+    out_referenced.insert_range(partial_referenced[i]);
   }
   TemplateBodyRefResult result;
   result.fwd_declared = std::ranges::to<std::vector>(out);
   result.aliases = std::ranges::to<std::vector>(out_aliases);
+  result.referenced = std::ranges::to<std::vector>(out_referenced);
   for (auto &per_file : partial_friends)
     result.friend_pairs.insert(result.friend_pairs.end(), per_file.begin(),
                                per_file.end());

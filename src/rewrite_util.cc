@@ -106,6 +106,27 @@ export unsigned template_header_start(llvm::StringRef text, unsigned pos) {
   return q - 8;
 }
 
+// The `static` storage-class keyword of a declaration starting at `from`, if it
+// has one. Same shape as find_extern_spec, and used for the same reason: the
+// keyword has to go before the declaration can be exported.
+export bool find_static_spec(llvm::StringRef text, unsigned from,
+                             unsigned &start, unsigned &end) {
+  unsigned scan = from;
+  while (scan < text.size() && (text[scan] == ' ' || text[scan] == '\t')) ++scan;
+  // A whole token: `static_thing x;` starts with the same six characters.
+  if (text.size() - scan >= 6 &&
+      std::string_view(text.data() + scan, 6) == "static" &&
+      (text.size() - scan == 6 || !is_ident_char(text[scan + 6]))) {
+    start = scan;
+    scan += 6;
+    while (scan < text.size() && (text[scan] == ' ' || text[scan] == '\t'))
+      ++scan;
+    end = scan;
+    return true;
+  }
+  return false;
+}
+
 export bool find_extern_spec(llvm::StringRef text, unsigned from,
                              unsigned &start, unsigned &end) {
   unsigned scan = from;

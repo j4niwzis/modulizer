@@ -311,6 +311,9 @@ export struct RewriteBatchConfig {
   // otherwise keeps those unexported, and the module that needs one cannot see
   // it through the import that carries it.
   bool no_internal_filter = false;
+  // Per header: modules it must import because it names entities they define
+  // without including the headers that do. See the cli site that builds it.
+  std::map<std::string, std::set<std::string>> extra_imports;
   bool extern_cxx = false;
   // Name of the macro the extern "C++" wrapping is written behind, or empty
   // for an unconditional block. See RewriteOptions::extern_cxx_macro.
@@ -354,6 +357,9 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
   o.import_std = cfg.import_std;
   o.public_modules = cfg.public_modules;
   o.no_internal_filter = cfg.no_internal_filter;
+  if (auto it = cfg.extra_imports.find(std::string(src));
+      it != cfg.extra_imports.end())
+    o.extra_imports = it->second;
   o.internal_mode = cfg.internal_mode;
   o.module_replaces = cfg.module_replaces;
   o.defined_fqns = cfg.defined_fqns;

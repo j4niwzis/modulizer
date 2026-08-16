@@ -74,6 +74,9 @@ export struct RewriteOptions {
   // one of these OTHER headers into RewriteOptions::external_macro_mods (see
   // HeaderRewriteResult), so the defining header's macros file bakes them in.
   std::set<std::string> library_headers;
+  // Modules this header must import outright: it names entities they define
+  // and never included the headers that do.
+  std::set<std::string> extra_imports;
   // Export markers (from HeaderRewriteResult::external_macro_mods of other
   // headers) to bake into THIS header's macros file. Merged into `mods` before
   // build_macros_file so macro bodies whose entities are invoked elsewhere
@@ -1069,6 +1072,16 @@ export HeaderRewriteResult rewrite_header(
   auto [gmf_incs, purview_imports] = classify_includes(
       includes, auto_imports, library_name, module_name, header_path, options,
       imported_modules, used_headers, std_import_guard);
+  // Modules this header names entities from without ever including the headers
+  // that define them. No include can produce these, so they are added outright.
+  for (const auto &mod : options.extra_imports) {
+    if (mod == module_name.str()) continue;
+    auto line = std::format("import {};", mod);
+    if (!std::ranges::contains(purview_imports, line) &&
+        !std::ranges::contains(purview_imports,
+                               std::format("export import {};", mod)))
+      purview_imports.push_back(line);
+  }
 
   // Drop transitive system includes whose parent header is also emitted in
   // the GMF (e.g. <sys/stat.h> also pulls in <bits/stat.h>; keeping both
