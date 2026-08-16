@@ -389,7 +389,9 @@ export std::string wrap_includes_with_guard(
       } else {
         wrapped_hdr += std::format("#ifndef {}\n", use_modules_macro);
         wrapped_hdr += line;
-        wrapped_hdr += "#endif\n";
+        // Named, so the merge below can tell this `#endif` from one the source
+        // already had. Merging on a bare `#endif` deletes the wrong one.
+        wrapped_hdr += std::format("#endif  // {}\n", use_modules_macro);
       }
     } else {
       wrapped_hdr += line;
@@ -398,8 +400,23 @@ export std::string wrap_includes_with_guard(
   }
   hdr = std::move(wrapped_hdr);
 
-  // Merge adjacent #ifndef USE_MODULES blocks
-  auto merge_from = std::format("#endif\n#ifndef {}\n", use_modules_macro);
+  // Merge adjacent wrapper blocks — and only those. A bare `#endif` match
+  // would also catch one the source wrote itself, closing a condition of its
+  // own, whenever a wrapped include happens to follow it:
+  //
+  //   #if !defined(HAS_STRING_VIEW)
+  //   #ifndef LIB_USE_MODULES
+  //   #include <string_view>
+  //   #endif  // LIB_USE_MODULES
+  //   #endif                        <- the source's, eaten by the merge
+  //   #ifndef LIB_USE_MODULES       <- the next include's wrapper
+  //
+  // which leaves that include unwrapped — so it is read in the purview, where
+  // its declarations attach to this module and contradict the copy the global
+  // module fragment already has — and every condition after it nested one
+  // level too deep.
+  auto merge_from =
+      std::format("#endif  // {0}\n#ifndef {0}\n", use_modules_macro);
   for (std::size_t p = 0;
        (p = hdr.find(merge_from, p)) != std::string::npos; ) {
     hdr.erase(p, merge_from.size());

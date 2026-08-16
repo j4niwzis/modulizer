@@ -404,9 +404,26 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
 // since their guard conditions reference macros defined by the macros file
 // itself.
 std::pair<std::vector<IncludeDirective>, std::vector<IncludeDirective>>
-split_gmf_pre_post(std::vector<IncludeDirective> gmf_incs) {
+split_gmf_pre_post(std::vector<IncludeDirective> gmf_incs,
+                   unsigned first_hoisted_macro_off) {
   std::vector<IncludeDirective> pre, post;
   for (auto &inc : gmf_incs) {
+    // An include the source wrote AFTER a macro definition may be there
+    // because of it: a header that defines `LIB_BEGIN_NAMESPACE` and then
+    // includes the file that uses it reads in that order for a reason. The
+    // definition has moved to the macros file, so the include has to follow
+    // it, or the macro is not defined where it is needed:
+    //
+    //   error: unknown type name 'LIB_BEGIN_NAMESPACE'
+    // Only a header with a file extension. A standard-library header has
+    // none (`<version>`, `<compare>`, `<string>`), it cannot depend on a macro
+    // this library defines, and `<version>` in particular has to come FIRST so
+    // the macros file can evaluate the feature-test macros it defines.
+    if (first_hoisted_macro_off != 0 && inc.offset > first_hoisted_macro_off &&
+        std::filesystem::path(inc.path).has_extension()) {
+      post.push_back(inc);
+      continue;
+    }
     // `<compare>` and `<version>` define `__cpp_lib_three_way_comparison`,
     // which the macros file evaluates (e.g. `LIB_INTERNAL_HAS_COMPARE_LIB`).
     // They must come BEFORE the macros file even when guarded in the source —
@@ -439,6 +456,9 @@ std::string assemble_interface_cc(
     const std::string &std_use_guard, const std::string &macros_name,
     bool has_macros, const RewriteOptions &options,
     const std::vector<IncludeDirective> &gmf_incs,
+    // Offset of the first macro definition hoisted into the macros file, or 0.
+    // An include the source wrote after it has to follow the macros file.
+    unsigned first_hoisted_macro_off,
     const std::vector<std::string> &purview_imports,
     const std::vector<std::pair<std::vector<std::string>, std::string>>
         &fwd_decls,
@@ -449,7 +469,8 @@ std::string assemble_interface_cc(
   if (!header_comment.empty()) cc += header_comment + "\n\n";
   cc += "module;\n";
 
-  auto [pre_macros, post_macros] = split_gmf_pre_post(gmf_incs);
+  auto [pre_macros, post_macros] =
+      split_gmf_pre_post(gmf_incs, first_hoisted_macro_off);
   emit_gmf_blocks(cc, pre_macros);
 
   // The interface unit's GMF includes the macros file so that guard conditions
@@ -1096,11 +1117,21 @@ export HeaderRewriteResult rewrite_header(
     redefined_macros = macros_redefined_by_header(hdr, export_macros);
   }
 
+  // The earliest macro definition that moved out of the body. Only a NAMED
+  // macro counts: a conditional block stays in the body as well as being
+  // reproduced, so an include after one still sees it.
+  unsigned first_hoisted_macro_off = 0;
+  for (auto &m : export_macros)
+    if (!m.name.empty() &&
+        (first_hoisted_macro_off == 0 || m.start_off < first_hoisted_macro_off))
+      first_hoisted_macro_off = m.start_off;
+
   result.cc_content = assemble_interface_cc(
       module_name, header_comment, use_modules_macro, std_import_guard,
       std_use_guard, macros_name,
       !export_macros.empty() || !extra_macro_includes.empty(), options,
-      gmf_incs, purview_imports, fwd_decls, hdr, header_path,
+      gmf_incs, first_hoisted_macro_off, purview_imports, fwd_decls, hdr,
+      header_path,
       redefined_macros, export_include);
 
   return result;

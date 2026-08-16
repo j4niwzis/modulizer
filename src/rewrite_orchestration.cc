@@ -436,12 +436,24 @@ export std::vector<HeaderBatchOutcome> rewrite_header_batch(
     o.rel = rel;
     o.rel_cc = rel_cc;
 
-    auto r = rewrite_header(
-        src, per_file_module,
-        make_rewrite_options(cfg, src, extra_args, reachable_fqns,
-                             library_headers, {}));
-    o.ok = !r.h_content.empty();
-    o.r = std::move(r);
+    // A header that cannot be rewritten must not take the run down with it.
+    // Some are not translation units at all — an ABI prefix/suffix fragment
+    // opens conditionals another file closes — and a tool handed one should
+    // say so and carry on with the rest, not abort:
+    //
+    //   terminate called after throwing an instance of 'std::length_error'
+    try {
+      auto r = rewrite_header(
+          src, per_file_module,
+          make_rewrite_options(cfg, src, extra_args, reachable_fqns,
+                               library_headers, {}));
+      o.ok = !r.h_content.empty();
+      o.r = std::move(r);
+    } catch (const std::exception &e) {
+      llvm::errs() << "error: cannot rewrite " << src << ": " << e.what()
+                   << "\n";
+      o.ok = false;
+    }
   });
 
   // Second pass: merge export markers routed from headers that INVOKE a macro
