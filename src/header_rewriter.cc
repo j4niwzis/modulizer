@@ -759,6 +759,33 @@ export HeaderRewriteResult rewrite_header(
       export_macros.push_back(std::move(m));
   }
 
+  // An include the source wrote after a PRIVATE macro definition has to stay
+  // where it is. A private macro is one the header `#undef`s before it ends,
+  // so it never moves to the macros file — and hoisting the include to the
+  // global module fragment would put it ahead of a definition that stays in
+  // the body:
+  //
+  //   #define LIB_BEGIN_NAMESPACE namespace lib {
+  //   #include <other/thing.hpp>        <- uses it
+  //   #undef LIB_BEGIN_NAMESPACE
+  //
+  //   error: unknown type name 'LIB_BEGIN_NAMESPACE'
+  //
+  // Standard-library headers are exempt for the same reason as in the GMF
+  // ordering: they cannot depend on this library's macros.
+  {
+    unsigned first_private_off = 0;
+    for (auto &m : impl_macros)
+      if (!m.name.empty() &&
+          (first_private_off == 0 || m.start_off < first_private_off))
+        first_private_off = m.start_off;
+    if (first_private_off != 0)
+      for (auto &inc : includes)
+        if (!inc.transitive && inc.offset > first_private_off &&
+            std::filesystem::path(inc.path).has_extension())
+          inc.skip_gmf = true;
+  }
+
   // PUBLIC macros (never #undef'd before the end of the header) move to the
   // generated macros file and are stripped from the header body; PRIVATE macros
   // (undef'd before the end) stay in the body, exactly as in the original. A
