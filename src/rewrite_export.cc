@@ -143,6 +143,23 @@ public:
       def = fd->getDefinition();
     else if (auto *ft = llvm::dyn_cast<clang::FunctionTemplateDecl>(d))
       def = ft->getTemplatedDecl()->getDefinition();
+    else if (auto *sd =
+                 llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(d)) {
+      // A specialization is what a reference through a default template
+      // argument looks like (`template <class L = mp_list<>>` yields
+      // `mp_list<>`), and it is a CXXRecordDecl, so the arm below would claim
+      // it. Asking a specialization that nothing instantiated for ITS
+      // definition yields none, which reads here as "the defining module is
+      // not imported" — and a declaration of the primary template is injected
+      // beside the import that already provides it:
+      //
+      //   error: declaration of 'X' in the global module follows declaration
+      //          in module lib.x
+      //
+      // The primary template is the entity this stands for, so ask that.
+      if (auto *ct = sd->getSpecializedTemplate())
+        def = ct->getTemplatedDecl()->getDefinition();
+    }
     else if (auto *rd = llvm::dyn_cast<clang::CXXRecordDecl>(d))
       def = rd->getDefinition();
     else if (auto *ct = llvm::dyn_cast<clang::ClassTemplateDecl>(d)) {
@@ -182,22 +199,6 @@ public:
         // imported definition.
         return;
     }
-    // No definition visible here does not mean none reachable. With the body
-    // unwrapped, an entity its own module EXPORTS arrives through the import of
-    // that module, and a copy declared here is not a spare — it is a second
-    // entity of the same name in the global module, which the imported one
-    // immediately contradicts:
-    //
-    //   error: declaration of 'X' in the global module follows declaration in
-    //          module lib.other
-    //
-    // is_exported_via_import is the question that matters, not whether the
-    // entity is merely public: an entity the library defines in a module this
-    // unit does not import is not exported to it, and that declaration still
-    // has to be injected. Wrapped, the copy is how two declarations are made
-    // one entity, so none of this applies there.
-    if (!def && !extern_cxx && !keep_full && is_exported_via_import(fqn))
-      return;
     if (exported && !cross_fwd && !keep_full) {
       // The definition is in this very module. If it precedes the declaration
       // the reference resolves to, the declaration is redundant: the body
@@ -228,9 +229,14 @@ public:
     // That holds however the tree is built: the declaration is exported either
     // way, taking `extern "C++"` for itself where the wrapping is absent, so
     // the import supplies it and this copy is never the only way to name it.
-    if (extern_cxx && !def && library_headers) {
+    // This applies to the unwrapped build too. The wrapping decides how the
+    // entity is spelled, not who owns it: either way the declaring module
+    // exports it and the import supplies it, so a copy here is redundant. When
+    // a definition IS visible, its file is the one carrying the marker, so ask
+    // about that one rather than the declaration this copy was taken from.
+    if (library_headers) {
       auto &sm = ctx.getSourceManager();
-      auto loc = sm.getExpansionLoc(d->getLocation());
+      auto loc = sm.getExpansionLoc(def ? def->getLocation() : d->getLocation());
       if (loc.isValid() && !sm.isInMainFile(loc)) {
         auto fn = sm.getFilename(loc);
         if (!fn.empty()) {
