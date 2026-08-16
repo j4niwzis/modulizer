@@ -2208,3 +2208,26 @@ TEST(HeaderRewrite, ExternCxxIsUnconditionalWithoutTheMacro) {
   EXPECT_EQ(r.cc_content.find("#ifdef "), std::string::npos)
       << "no build-time switch unless one was asked for";
 }
+
+TEST(HeaderRewrite, InterfaceUnitDoesNotTakeTheHeaderSOwnPath) {
+  // The interface unit is named after the header with a `.cc` extension. A
+  // library that spells its headers `.hpp` (or `.hxx`, or anything else) must
+  // still get two distinct files: deriving the name by stripping `.h` alone
+  // hands both the same path, and whichever is written second destroys the
+  // other — leaving an interface unit that textually includes itself.
+  auto api = data_path("hppext_lib/api.hpp");
+  clang::tooling::FixedCompilationDatabase db(
+      ".", {"-x", "c++", "-std=c++20", "-I", gDataDir});
+  modulizer::RewriteBatchConfig cfg;
+  cfg.module_name = "hppext";
+  cfg.library_name = "hppext";
+  auto outcomes = modulizer::rewrite_header_batch({api}, /*reachable_fqns=*/{},
+                                                   cfg, db);
+  ASSERT_EQ(outcomes.size(), 1u);
+  auto &o = outcomes[0];
+  ASSERT_TRUE(o.ok);
+  EXPECT_TRUE(o.rel.ends_with(".hpp")) << "the header keeps its own extension";
+  EXPECT_TRUE(o.rel_cc.ends_with(".cc")) << "got: " << o.rel_cc;
+  EXPECT_NE(o.rel, o.rel_cc)
+      << "the header and its interface unit must not share a path";
+}
