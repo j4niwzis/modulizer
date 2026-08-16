@@ -318,12 +318,19 @@ std::set<std::string> collect_block_defined_names(
 std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     std::vector<ModPoint> &mods, const std::vector<MacroRec> &export_macros,
     const std::set<std::string> &block_defined_names,
+    const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
     const std::string &original) {
   std::vector<std::pair<unsigned, unsigned>> ranges;
   for (auto &m : export_macros) {
     if (m.name.empty()) continue;  // macro-only conditional block
     if (m.start_off == 0 && m.end_off == 0) continue;  // no source offsets
     if (block_defined_names.count(m.name)) continue;   // kept in its block
+    // A definition inside a conditional block stays in the header body with
+    // its block. Taking it out on its own would leave the `#undef` that
+    // precedes it — the `#undef X` + redefine idiom writes one — with nothing
+    // to retract and no definition after it, so the macro ends up undefined
+    // for everyone who includes the header.
+    if (inside_block(block_ranges, m)) continue;
     ranges.push_back({m.start_off, m.end_off});
     auto guard = override_guard_with_code(original, m.start_off, m.name);
     if (guard.active) {
@@ -703,7 +710,7 @@ export HeaderRewriteResult rewrite_header(
   // the macros file (applied by build_macros_file), never to the header body,
   // where the macro definition is stripped out entirely.
   auto stripped_macro_ranges = collect_stripped_ranges(
-      mods, export_macros, block_defined_names, original);
+      mods, export_macros, block_defined_names, block_ranges, original);
 
   // The header body keeps the raw macro invocation; the export markers the
   // visitor placed INSIDE a macro definition (spelling locations) belong to the
