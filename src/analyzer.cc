@@ -39,6 +39,21 @@ export struct EntityItem {
   // variable/alias: its type / underlying type. Consumed by
   // expand_transitive_types to close reachability over type signatures.
   std::vector<std::string> type_refs;
+  // True when the entity has internal or no linkage, which a wrapper cannot
+  // re-export: an exported using-declaration may not name such an entity
+  // ([module.interface]). Namespace-scope `const`/`constexpr` variables are
+  // the common case (they are internal unless `inline` or `extern`), along
+  // with the enumerators of an unnamed enum, which have no linkage at all.
+  //
+  // Only the re-export is impossible. Exporting the DECLARATION itself is
+  // fine — that is a different path, and one that gives the entity external
+  // linkage ([basic.link]) rather than naming it where it stands.
+  bool no_external_linkage = false;
+  // True when the entity's value is usable in constant expressions, so a
+  // wrapper can hand consumers a copy of it under the same name even though it
+  // cannot name the original. Only meaningful together with
+  // no_external_linkage: an entity that has a linkage to name is named.
+  bool constant_value = false;
 };
 
 export struct EntityModel {
@@ -501,6 +516,24 @@ private:
       item.c_language_linkage = fd->isExternC();
     else if (auto *vd = llvm::dyn_cast_or_null<clang::VarDecl>(d))
       item.c_language_linkage = vd->isExternC();
+    // Asked only of the kinds that reach namespace scope without external
+    // linkage: a `static` function, a `const`/`constexpr` variable, or an
+    // enumerator of an unnamed enum. A class name has external linkage by
+    // construction and a type alias has no linkage of its own to compute, so
+    // asking about either would only invite a wrong answer.
+    if (auto *nd = llvm::dyn_cast_or_null<clang::NamedDecl>(d);
+        nd && (llvm::isa<clang::VarDecl>(d) ||
+               llvm::isa<clang::EnumConstantDecl>(d) ||
+               llvm::isa<clang::FunctionDecl>(d)))
+      item.no_external_linkage =
+          nd->getFormalLinkage() != clang::Linkage::External;
+    // An enumerator is a constant; a variable is one only if it was declared
+    // in a way that lets its value be read at compile time. Anything else
+    // (a `static` mutable global, a `static` function) has no value to copy.
+    if (llvm::isa_and_nonnull<clang::EnumConstantDecl>(d))
+      item.constant_value = true;
+    else if (auto *vd = llvm::dyn_cast_or_null<clang::VarDecl>(d))
+      item.constant_value = vd->isUsableInConstantExpressions(ctx);
     model.items.push_back(std::move(item));
   }
 };

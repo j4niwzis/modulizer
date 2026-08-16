@@ -329,16 +329,49 @@ export inline int run_wrapper(int argc, const char **argv) {
   for (const auto &h : header_paths)
     include_forms.push_back(include_form(h, wrapper_extra));
 
-  auto cc = generate_wrapper_cc(ModuleNameOpt, include_forms, model,
-                                kDefaultInternalFilter,
-                                reachable.reachable_fqns);
   auto h = generate_companion_h(model);
 
   std::string out_dir = OutputDirOpt.empty() ? "." : OutputDirOpt.getValue();
-  std::string cc_path = out_dir + "/" + ModuleNameOpt.getValue() + ".cc";
-  std::string h_path = out_dir + "/" + ModuleNameOpt.getValue() + "_macros.h";
+  std::string base = ModuleNameOpt.getValue();
+  std::string cc_path = out_dir + "/" + base + ".cc";
+  std::string h_path = out_dir + "/" + base + "_macros.h";
+
+  // Constants a using-declaration cannot name need the three-module split; a
+  // library without any keeps the single file it has always produced.
+  bool split = wrapper_needs_constants(model, kDefaultInternalFilter,
+                                       reachable.reachable_fqns);
+  std::string macro_include = base + "_macros.h";
+  auto cc = generate_wrapper_cc(
+      split ? main_module_name(base) : base, include_forms, model,
+      kDefaultInternalFilter, reachable.reachable_fqns);
 
   std::error_code ec;
+  if (split) {
+    std::string main_path = out_dir + "/" + base + "_main.cc";
+    std::string const_path = out_dir + "/" + base + "_constants.cc";
+    llvm::raw_fd_ostream main_file(main_path, ec);
+    if (ec) {
+      llvm::errs() << "error: " << ec.message() << " (" << main_path << ")\n";
+      return 1;
+    }
+    main_file << cc;
+
+    llvm::raw_fd_ostream const_file(const_path, ec);
+    if (ec) {
+      llvm::errs() << "error: " << ec.message() << " (" << const_path << ")\n";
+      return 1;
+    }
+    const_file << generate_constants_cc(base, include_forms, model,
+                                        kDefaultInternalFilter,
+                                        reachable.reachable_fqns);
+
+    cc = generate_facade_cc(base, model, kDefaultInternalFilter,
+                            reachable.reachable_fqns,
+                            h.empty() ? std::vector<std::string>{}
+                                      : std::vector<std::string>{macro_include});
+    llvm::outs() << "Generated " << main_path << " and " << const_path << "\n";
+  }
+
   llvm::raw_fd_ostream cc_file(cc_path, ec);
   if (ec) {
     llvm::errs() << "error: " << ec.message() << " (" << cc_path << ")\n";

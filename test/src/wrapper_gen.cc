@@ -268,13 +268,13 @@ TEST(WrapperGen, SkipsClassMemberAndFriendEntities) {
 TEST(WrapperGen, WrapsTheBodyInExternCxxAndSeparatesCLinkage) {
   // Everything a header wrapper re-exports belongs to the global module — it
   // is declared in a header included in the global module fragment — so the
-  // whole body is one `export extern "C++"` block. That is also what makes
-  // entities with internal linkage re-exportable at all: a plain exported
-  // using declaration naming a `const` variable at namespace scope is rejected
-  // ("using declaration referring to 'X' with internal linkage cannot be
-  // exported"), and `export` has to sit outside the linkage block, not inside
-  // it. Entities with C language linkage cannot be in that block and get their
-  // own `export extern "C"` one.
+  // whole body is one `export extern "C++"` block, and `export` sits outside
+  // that block rather than inside it. Entities with C language linkage cannot
+  // be in it and get their own `export extern "C"` one.
+  //
+  // The block is about language linkage and nothing else. It does not make an
+  // internal-linkage entity nameable: no using-declaration may name one, and
+  // those leave through the constants module instead.
   clang::tooling::FixedCompilationDatabase db(
       ".", {"-x", "c++", "-std=c++20", "-I", gDataDir});
   auto model = analyze_headers_with_cdb(db, {data_path("linkage_lib/api.h")});
@@ -289,12 +289,14 @@ TEST(WrapperGen, WrapsTheBodyInExternCxxAndSeparatesCLinkage) {
   auto c_at = out.find("export extern \"C\" {");
   auto pos = [&](std::string_view needle) { return out.find(needle); };
 
-  // The internal-linkage constants are re-exported, inside the C++ block.
-  ASSERT_NE(pos("using ::linkage_lib::kToggle;"), std::string::npos);
-  EXPECT_GT(pos("using ::linkage_lib::kToggle;"), cxx_at);
-  EXPECT_LT(pos("using ::linkage_lib::kToggle;"), c_at);
-  EXPECT_NE(pos("using ::linkage_lib::kLimit;"), std::string::npos);
-  EXPECT_NE(pos("using ::linkage_lib::compute;"), std::string::npos);
+  // The internal-linkage constants are not named here at all.
+  EXPECT_EQ(pos("using ::linkage_lib::kToggle;"), std::string::npos);
+  EXPECT_EQ(pos("using ::linkage_lib::kLimit;"), std::string::npos);
+  // What has a linkage to name is named, inside the C++ block.
+  ASSERT_NE(pos("using ::linkage_lib::compute;"), std::string::npos);
+  EXPECT_GT(pos("using ::linkage_lib::compute;"), cxx_at);
+  EXPECT_LT(pos("using ::linkage_lib::compute;"), c_at);
+  EXPECT_NE(pos("using ::linkage_lib::kExternalToggle;"), std::string::npos);
   EXPECT_NE(pos("using ::linkage_lib::Widget;"), std::string::npos);
 
   // The C entry point goes after the C block opens.
@@ -397,3 +399,65 @@ TEST(WrapperGen, FacadeWithoutGuardsKeepsNoGlobalModuleFragment) {
   EXPECT_EQ(out.find("wraplib-macros.h"), std::string::npos);
 }
 
+
+TEST(WrapperGen, DoesNotNameWhatHasNoLinkageToName) {
+  // A using-declaration may only name an entity with external linkage. What
+  // the header leaves internal — a namespace-scope `const`, an unnamed enum's
+  // enumerators, a `static` function — has to leave some other way, or not at
+  // all.
+  auto model = analyze_file(data_path("linkexport_lib/api.h"));
+  auto out = generate_wrapper_cc("linkexport", {"linkexport_lib/api.h"}, model);
+
+  for (auto *n : {"kMarker", "kLimit", "kLowBits", "kWidth", "helper"}) {
+    EXPECT_EQ(out.find(std::format("using ::linkexport::{};", n)),
+              std::string::npos)
+        << n << " has no external linkage, so nothing may name it";
+  }
+  for (auto *n : {"kShared", "kDeclared", "kFast", "Mode", "Handle",
+                  "shared_helper"}) {
+    EXPECT_NE(out.find(std::format("using ::linkexport::{};", n)),
+              std::string::npos)
+        << n << " has external linkage and stays a plain re-export";
+  }
+}
+
+TEST(WrapperGen, CarriesUnnameableConstantsAcrossAsValues) {
+  auto model = analyze_file(data_path("linkexport_lib/api.h"));
+  EXPECT_TRUE(wrapper_needs_constants(model));
+
+  // The constants unit includes the header, so it can only publish the values
+  // under a name of its own.
+  auto consts = generate_constants_cc("linkexport", {"linkexport_lib/api.h"},
+                                       model);
+  EXPECT_NE(consts.find("export module linkexport.constants;"),
+            std::string::npos);
+  EXPECT_NE(consts.find("export namespace linkexport_constants::linkexport {"),
+            std::string::npos);
+  EXPECT_NE(consts.find("inline constexpr auto kMarker = ::linkexport::kMarker;"),
+            std::string::npos);
+  EXPECT_NE(consts.find("inline constexpr auto kWidth = ::linkexport::kWidth;"),
+            std::string::npos);
+  // Only the ones nothing else can carry, and only the ones with a value.
+  EXPECT_EQ(consts.find("kShared"), std::string::npos)
+      << "kShared has external linkage; the main module names it";
+  EXPECT_EQ(consts.find("helper"), std::string::npos)
+      << "a function has no value to copy";
+
+  // The facade includes no header, so the real names are free here.
+  auto facade = generate_facade_cc("linkexport", model);
+  EXPECT_NE(facade.find("export module linkexport;"), std::string::npos);
+  EXPECT_NE(facade.find("export import linkexport.main;"), std::string::npos);
+  EXPECT_NE(facade.find("import linkexport.constants;"), std::string::npos);
+  EXPECT_EQ(facade.find("#include"), std::string::npos)
+      << "including a library header would collide with the names it declares";
+  EXPECT_NE(facade.find("export namespace linkexport {"), std::string::npos);
+  EXPECT_NE(facade.find("inline constexpr auto kMarker = "
+                        "::linkexport_constants::linkexport::kMarker;"),
+            std::string::npos);
+}
+
+TEST(WrapperGen, LibraryWithoutSuchConstantsStaysOneModule) {
+  EntityModel model;
+  model.items.push_back({EntityItem::kClass, "Plain", {"wraplib"}});
+  EXPECT_FALSE(wrapper_needs_constants(model));
+}
