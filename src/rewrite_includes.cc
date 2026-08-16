@@ -16,6 +16,14 @@ import std;
 // system include directories — i.e. it is a third-party/system header, not a
 // project-local sibling library header.
 
+// Canonicalized path, matching how the set of headers being rewritten is keyed
+// (both sides must agree or a resolved include never matches one of ours).
+std::string canonical_include_path(llvm::StringRef p) {
+  std::error_code ec;
+  auto c = std::filesystem::weakly_canonical(std::filesystem::path(p.str()), ec);
+  return ec ? p.str() : c.string();
+}
+
 // Result of classifying a quoted (non-`custom/`) library include: whether it is
 // a library header that must become an import, and the module it maps to.
 export struct LibIncludeClass {
@@ -56,18 +64,69 @@ export LibIncludeClass classify_library_include(
   return {is_lib_include, std::move(derived)};
 }
 
-// Compute auto-imports: library-internal quoted includes become module
-// imports (unless they are the umbrella module or the module itself).
+// Compute auto-imports: library-internal includes become module imports
+// (unless they are the umbrella module or the module itself).
+//
+// `converted` is the set of headers this run is rewriting, canonicalized. An
+// include that resolves into it is one of ours whatever it looks like, and
+// that is the answer we trust: quoting style and path shape are conventions,
+// not facts. Google style writes `#include "lib/thing.h"` and puts the library
+// first; a great many libraries write `#include <vendor/lib/thing.hpp>` and put
+// it second. Deciding from the spelling alone left the second kind with no
+// imports at all — every sibling stayed a textual include in the global module
+// fragment, which is not a conversion.
+//
+// The spelling-based rules below still stand for what `converted` cannot
+// answer: a header of a SIBLING library, which this run is not rewriting and so
+// never appears in that set.
 export std::map<std::string, std::string> compute_auto_imports(
     const std::vector<IncludeDirective> &includes,
     llvm::StringRef library_name, llvm::StringRef module_name,
     llvm::StringRef header_path, const std::vector<std::string> &extra_args,
     std::vector<std::pair<std::string, std::string>> &imported_modules,
-    std::set<std::string> &extra_macro_includes, bool hyphen_macros) {
+    std::set<std::string> &extra_macro_includes, bool hyphen_macros,
+    const std::set<std::string> *converted = nullptr) {
   std::map<std::string, std::string> auto_imports;
+  // Records the import and the macro header that must come with it: macros do
+  // not cross a module boundary, so an imported module's macros have to arrive
+  // as an include or every use of one is an undefined-macro error.
+  auto take = [&](const IncludeDirective &inc, const std::string &mod) {
+    auto_imports[inc.path] = mod;
+    imported_modules.push_back({inc.path, mod});
+    auto sep = hyphen_macros ? "-" : "_";
+    auto dir = std::filesystem::path(inc.path).parent_path().string();
+    extra_macro_includes.insert(
+        (dir.empty() ? "" : dir + "/") +
+        macro_base_name(std::filesystem::path(inc.path).stem().string(),
+                        hyphen_macros) +
+        sep + "macros.h");
+  };
+
   for (const auto &inc : includes) {
-    if (!inc.is_quoted) continue;
     if (is_xmacro_include(inc.path)) continue;
+    // A guard does not disqualify one of ours. The rule below — that a guarded
+    // include cannot become an unconditional import — is about headers that may
+    // not exist unless the condition holds (`#if LIB_HAS_ABSL` around an absl
+    // header). A header this run is converting always has a module, whatever
+    // the condition says, and leaving it as an include instead means the
+    // generated tree cannot be built without the ORIGINAL headers on the
+    // include path:
+    //
+    //   fatal error: 'lib/thing.hpp' file not found
+    if (converted && !inc.path.contains("/custom/")) {
+      auto resolved = resolve_include(inc.path, header_path.str(), extra_args);
+      if (!resolved.empty() && converted->count(canonical_include_path(resolved))) {
+        auto mod = derive_module_name(inc.path, library_name);
+        if (mod == module_name.str()) continue;
+        // The umbrella of the CURRENT library would be a cycle.
+        if (mod == library_name.str() &&
+            module_name.str().starts_with(library_name.str() + "."))
+          continue;
+        take(inc, mod);
+        continue;
+      }
+    }
+    if (!inc.is_quoted) continue;
     // A guarded include (e.g. `#if LIB_HAS_ABSL` around an absl header)
     // cannot become an unconditional import, so it is not auto-derived.
     if (!inc.guard_stack.empty()) continue;
@@ -98,19 +157,10 @@ export std::map<std::string, std::string> compute_auto_imports(
     if (root == library_name.str() && mod_name == library_name.str() &&
         module_name.str().starts_with(library_name.str() + "."))
       continue;
-    auto_imports[inc.path] = mod_name;
-    imported_modules.push_back({inc.path, mod_name});
-    auto sep = hyphen_macros ? "-" : "_";
     // The include directive already carries the header's directory within its
     // library's include tree (`mylib/internal/mylib-port.h` → `mylib/internal/`),
     // so the macro file lives there too.
-    auto dir = std::filesystem::path(inc.path).parent_path().string();
-    auto ms = (dir.empty() ? "" : dir + "/") +
-              macro_base_name(
-                  std::filesystem::path(inc.path).stem().string(),
-                  hyphen_macros) +
-              sep + "macros.h";
-    extra_macro_includes.insert(std::move(ms));
+    take(inc, mod_name);
   }
   return auto_imports;
 }

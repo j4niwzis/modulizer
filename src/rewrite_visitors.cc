@@ -284,7 +284,23 @@ public:
   // True when this entity must be `extern "C++"`: either it is declared in a
   // module that does not define it, or it is friend-declared inside an
   // extern "C++" class (which attaches the declaration to the global module).
-  bool is_extern_cxx_entity(llvm::StringRef name) {
+  // `def` is the entity's definition when one is visible, `self` the
+  // declaration being marked. A definition in THIS file, on a declaration that
+  // is not itself that definition, settles the question: the entity is this
+  // module's own, whatever the cross-module analysis concluded elsewhere. Marking a
+  // declaration `extern "C++"` attaches it to the global module, and when the
+  // definition below it in the same file is attached to this one the two are
+  // different entities:
+  //
+  //   error: declaration of 'X' in module lib.thing follows declaration in
+  //          the global module
+  //
+  // A header that forward-declares a template and then defines it a few lines
+  // down — to use it in between — hits this, and that is an ordinary way to
+  // write a header.
+  bool is_extern_cxx_entity(llvm::StringRef name, clang::Decl *def = nullptr,
+                            clang::Decl *self = nullptr) {
+    if (def && self && def != self && isMainFile(def)) return false;
     if (cross_module_fwd_declared(name)) return true;
     if (friend_extern_fqns.empty()) return false;
     auto fqn = fqn_of(ns_path_, name.str());
@@ -356,7 +372,7 @@ public:
         return true;
       }
     }
-    bool need_extern = is_extern_cxx_entity(rd->getNameAsString());
+    bool need_extern = is_extern_cxx_entity(rd->getNameAsString(), rd->getDefinition(), rd);
     if (no_internal_filter) { addExport(rd, need_extern); return true; }
     if (is_internal(rd->getNameAsString())) {
       // A forward-declared internal entity that the consumer defines itself
@@ -365,7 +381,20 @@ public:
       // definition then merges with it and the module's friend declarations
       // keep granting access to the private members. A complete internal
       // definition stays a module entity.
-      if (!rd->isCompleteDefinition() && !extern_cxx) {
+      //
+      // Unless the definition is in THIS file. Then there is no consumer to
+      // merge with and nothing to reach across: the entity belongs to this
+      // module, and putting only its earlier declaration in the global module
+      // splits one entity into two —
+      //
+      //   error: declaration of 'X' in module lib.thing follows declaration
+      //          in the global module
+      //
+      // Declaring a template ahead of its definition so an alias in between
+      // can name it is ordinary; it is not a cross-module signal.
+      bool defined_here =
+          rd->getDefinition() && isMainFile(rd->getDefinition());
+      if (!rd->isCompleteDefinition() && !extern_cxx && !defined_here) {
         make_extern_cxx(rd);
         return true;
       }
@@ -435,7 +464,7 @@ public:
         return true;
       }
     }
-    bool need_extern = is_extern_cxx_entity(fd->getNameAsString());
+    bool need_extern = is_extern_cxx_entity(fd->getNameAsString(), fd->getDefinition(), fd);
     if (is_internal(fd->getNameAsString())) {
       // An internal-namespace function declared in this header but defined in
       // another module is `extern "C++"`; it must also be exported so the
@@ -520,7 +549,7 @@ public:
     if (is_internal(vd->getNameAsString())) return true;
     // A variable declared in this header but defined in another module must be
     // `extern "C++"` on both sides to stay a single shared entity.
-    bool need_extern = is_extern_cxx_entity(vd->getNameAsString());
+    bool need_extern = is_extern_cxx_entity(vd->getNameAsString(), vd->getDefinition(), vd);
     addExport(vd, need_extern);
     return true;
   }

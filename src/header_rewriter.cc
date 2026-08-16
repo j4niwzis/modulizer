@@ -797,7 +797,8 @@ export HeaderRewriteResult rewrite_header(
   auto auto_imports = compute_auto_imports(
       includes, library_name, module_name, header_path, options.extra_args,
       result.imported_modules, extra_macro_includes,
-      options.hyphen_macros);
+      options.hyphen_macros,
+      options.library_headers.empty() ? nullptr : &options.library_headers);
 
   // The macros file lives next to the header that uses it (`mylib/` for a
   // public header, `mylib/internal/` for an internal one) so the deployed
@@ -888,17 +889,28 @@ export HeaderRewriteResult rewrite_header(
         auto first =
             hdr.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1);
         if (first != pos) continue;
-        sites.emplace_back(pos, m.name);
+        sites.emplace_back(pos, std::format("#undef {}\n", m.name));
       }
     }
+    // The guarded include of this header's own macros file belongs to the same
+    // pass. Its offset was measured against the text as it stands now, and so
+    // were the `#undef` offsets above; applying it afterwards would use a
+    // position every `#undef` inserted ahead of it has already moved, landing
+    // that many characters short — inside whatever token now sits there:
+    //
+    //   #define LIB_HPP_INC#ifndef LIB_USE_MODULES
+    //   #include "lib_macros.h"
+    //   #endif
+    //   LUDED
+    //
+    // which is silent: the header still has a `#define`, and the name it
+    // defines is simply the wrong one.
+    sites.emplace_back(post_guard_pos,
+                       std::format("#ifndef {}\n#include \"{}.h\"\n#endif\n",
+                                   use_modules_macro, macros_name));
     // Back to front, so the offsets of the sites still to come do not shift.
     std::ranges::sort(sites, [](auto &a, auto &b) { return a.first > b.first; });
-    for (auto &[pos, name] : sites)
-      hdr.insert(pos, std::format("#undef {}\n", name));
-
-    hdr.insert(post_guard_pos,
-               std::format("#ifndef {}\n#include \"{}.h\"\n#endif\n",
-                           use_modules_macro, macros_name));
+    for (auto &[pos, text] : sites) hdr.insert(pos, text);
   }
 
   // Reproduce the source file's license/copyright header at the very top of the
@@ -992,7 +1004,10 @@ export SourceRewriteResult rewrite_source(
     // matching what the interface units do. The two have to agree: an
     // interface with module linkage and a body with C++ language linkage
     // declare and define different entities.
-    const std::string &extern_cxx_macro = {}) {
+    const std::string &extern_cxx_macro = {},
+    // Headers this run is rewriting, canonicalized. An include resolving into
+    // it is one of ours and becomes an import whatever its spelling.
+    const std::set<std::string> &library_headers = {}) {
 
   SourceRewriteResult result;
   result.module_name = module_name.str();
@@ -1052,7 +1067,8 @@ export SourceRewriteResult rewrite_source(
   std::set<std::string> extra_macro_includes;
   auto auto_imports = compute_auto_imports(
       includes, library_name, module_name, source_path, extra_args, imported,
-      extra_macro_includes, hyphen_macros);
+      extra_macro_includes, hyphen_macros,
+      library_headers.empty() ? nullptr : &library_headers);
   result.imported_modules = std::move(imported);
 
   std::vector<IncludeDirective> gmf_incs;
