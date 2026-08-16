@@ -317,7 +317,7 @@ TEST(MacroAnalysis, InternalModuleReachableViaMacroInOtherFile) {
   std::map<std::string, std::string> include_map = {
     {"test_lib/a_internal.h", "test_lib.a_internal"}
   };
-  auto r = rewrite_header(a, "test_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = true, .extra_args = extra_args, .no_internal_filter = false, .import_std = false, .macro_modules = mm.macro_modules});
+  auto r = rewrite_header(a, "test_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = true, .extra_args = extra_args, .no_internal_filter = false, .import_std = false, .public_modules = mm.macro_modules});
   EXPECT_NE(r.cc_content.find("export import test_lib.a_internal;"),
             std::string::npos)
       << "rewritten header must re-export the internal module reached via macro";
@@ -454,4 +454,22 @@ TEST(MacroAnalysis, EmitsConditionalBlocksInSourceOrder) {
   ASSERT_NE(printf_use, std::string::npos);
   EXPECT_LT(have, printf_use)
       << "the macro must be defined before the conditional that tests it";
+}
+
+TEST(MacroAnalysis, InternalDirHeaderDeclaringPublicNamesCountsAsPublic) {
+  // A header under `detail/` that declares names in the library's PUBLIC
+  // namespace is public API filed in a subdirectory. Treating it as internal
+  // would stop the umbrella re-exporting it, and a consumer could not name
+  // what it imports. The namespace decides, not the directory.
+  std::vector<std::string> headers = {
+      data_path("pubdetail_lib/detail/thing.h"),
+      data_path("pubdetail_lib/detail/hidden.h")};
+  std::vector<std::string> extra_args = {"-I", gDataDir,
+                                         "-Wno-pragma-once-outside-header"};
+  auto mm = modulizer::compute_macro_modules(headers, "pubdetail_lib",
+                                              extra_args);
+  EXPECT_TRUE(mm.public_api_modules.count("pubdetail_lib.detail.thing"))
+      << "thing.h declares pubdetail::Thing, which is public";
+  EXPECT_FALSE(mm.public_api_modules.count("pubdetail_lib.detail.hidden"))
+      << "hidden.h declares only pubdetail::detail:: names";
 }

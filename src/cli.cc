@@ -454,12 +454,17 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   // merged in, never a replacement), because macro-reachable internals
   // would otherwise be silently lost for consumers.
   std::vector<std::string> macro_reachable;
-  std::set<std::string> macro_modules;
+  std::set<std::string> public_modules;
   if (!header_paths.empty()) {
     auto mm = compute_macro_modules(
         header_paths, library_name, all_extra, parse_reachable_fqns());
     macro_reachable = std::move(mm.macro_reachable);
-    macro_modules = std::move(mm.macro_modules);
+    public_modules = std::move(mm.macro_modules);
+    // A header filed under an internal directory that declares names in the
+    // library's public namespace is public API, whatever the directory is
+    // called; importers must `export import` it.
+    public_modules.insert(mm.public_api_modules.begin(),
+                          mm.public_api_modules.end());
     llvm::outs() << "Macro-reachable entities: " << macro_reachable.size()
                   << "\n";
   }
@@ -477,7 +482,7 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   RewriteBatchConfig cfg;
   cfg.module_name = ModuleNameOpt.getValue();
   cfg.library_name = library_name;
-  cfg.macro_modules = macro_modules;
+  cfg.public_modules = public_modules;
   cfg.module_replaces = module_replaces;
   cfg.combined_macros = CombinedMacrosOpt;
   cfg.extern_cxx = !NoExternCxxOpt;
@@ -785,13 +790,18 @@ export inline int run_full_rewrite(int argc, const char **argv) {
 
 
   std::vector<std::string> macro_reachable;
-  std::set<std::string> macro_modules;
+  std::set<std::string> public_modules;
   if (!header_paths.empty()) {
     auto mm = compute_macro_modules(
         header_paths, library_name, all_extra, parse_reachable_fqns(),
         &header_models);
     macro_reachable = std::move(mm.macro_reachable);
-    macro_modules = std::move(mm.macro_modules);
+    public_modules = std::move(mm.macro_modules);
+    // A header filed under an internal directory that declares names in the
+    // library's public namespace is public API, whatever the directory is
+    // called; importers must `export import` it.
+    public_modules.insert(mm.public_api_modules.begin(),
+                          mm.public_api_modules.end());
     llvm::outs() << "Macro-reachable entities: " << macro_reachable.size()
                   << "\n";
   }
@@ -942,7 +952,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   RewriteBatchConfig cfg;
   cfg.module_name = ModuleNameOpt.getValue();
   cfg.library_name = library_name;
-  cfg.macro_modules = macro_modules;
+  cfg.public_modules = public_modules;
   cfg.module_replaces = module_replaces;
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;

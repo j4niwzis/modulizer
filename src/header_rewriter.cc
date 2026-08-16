@@ -56,7 +56,7 @@ export struct RewriteOptions {
   std::vector<std::string> extra_args;
   bool no_internal_filter = false;
   bool import_std = false;
-  std::set<std::string> macro_modules;
+  std::set<std::string> public_modules;
   InternalMode internal_mode = InternalMode::kBoth;
   std::map<std::string, std::set<std::string>> module_replaces;
   std::vector<std::string> defined_fqns;
@@ -120,7 +120,7 @@ GmfAndImports classify_includes(
     if (!replaced_mod.empty() && replaced_mod != "std" &&
         replaced_mod != "std.compat") {
       out.purview_imports.push_back(format_import(
-          inc.path, replaced_mod, options.macro_modules, options.internal_mode));
+          inc.path, replaced_mod, options.public_modules, options.internal_mode));
       imported_modules.insert(replaced_mod);
       continue;
     }
@@ -129,11 +129,11 @@ GmfAndImports classify_includes(
     if (it != options.include_to_module.end()) {
       auto &mname = it->second;
       out.purview_imports.push_back(format_import(
-          inc.path, mname, options.macro_modules, options.internal_mode));
+          inc.path, mname, options.public_modules, options.internal_mode));
     } else if (ait != auto_imports.end()) {
       auto &mname = ait->second;
       out.purview_imports.push_back(format_import(
-          inc.path, mname, options.macro_modules, options.internal_mode));
+          inc.path, mname, options.public_modules, options.internal_mode));
     } else if (!inc.skip_gmf) {
       // A direct include of another library header that auto-imports did not
       // cover — including the library's umbrella/root header. It must be
@@ -153,7 +153,7 @@ GmfAndImports classify_includes(
               !options.umbrella_module.empty())
             cl.derived = options.umbrella_module;
           out.purview_imports.push_back(format_import(
-              inc.path, cl.derived, options.macro_modules,
+              inc.path, cl.derived, options.public_modules,
               options.internal_mode));
           continue;
         }
@@ -210,7 +210,7 @@ GmfAndImports classify_includes(
             cl.derived = options.umbrella_module;
           if (cl.derived == module_name.str()) continue;
           out.purview_imports.push_back(format_import(
-              inc.path, cl.derived, options.macro_modules,
+              inc.path, cl.derived, options.public_modules,
               options.internal_mode));
           imported_modules.insert(cl.derived);
           continue;
