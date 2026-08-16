@@ -29,6 +29,35 @@ TREE_TARBALL=${TREE_TARBALL:-}
 # there and `import std.compat` has nothing to resolve against — the classic
 # half needs none of that and still exercises the emitted headers.
 MODULE_BUILD=${MODULE_BUILD:-1}
+# clang or gcc. GCC cannot attach an implementation to a module, so a tree it
+# builds has to have been converted with --gcc-modules and configured with
+# `gtest_extern_cxx`: the interface units wrap their purview in `extern "C++"`,
+# putting the entities in the global module with C++ language linkage, and the
+# implementation bodies build as the ordinary translation units the tree also
+# emits rather than as module units. Both halves are that one option, which is
+# why it is set here and not as a -D: defining the macro alone would wrap the
+# headers and still hand GCC the implementations it cannot compile.
+#
+# -fno-module-lazy is about GCC, not about this tree. Reading back a BMI it
+# wrote itself fails while chasing an entity's pending definitions:
+#
+#   error: failed to read compiled module cluster 63: Bad file data
+#   fatal error: failed to load pendings for 'std::unique_ptr'
+#
+# Loading eagerly takes the same sources and the same BMIs through cleanly. It
+# reproduces in 22 lines with no standard library involved, so there is nothing
+# here to work around on this side.
+#
+# Both are for the module build only: the classic half compiles these sources
+# as a plain header-and-source library, where neither means anything.
+COMPILER=${COMPILER:-clang}
+case "$COMPILER" in
+  clang) CC_BIN=clang; CXX_BIN=clang++
+         MODULE_CMAKE_ARGS=""; MODULE_CXX_FLAGS="" ;;
+  gcc)   CC_BIN=gcc; CXX_BIN=g++
+         MODULE_CMAKE_ARGS="-Dgtest_extern_cxx=ON"; MODULE_CXX_FLAGS="-fno-module-lazy" ;;
+  *) echo "unknown compiler: $COMPILER" >&2; exit 2 ;;
+esac
 
 case "$STDLIB" in
   libstdc++) CXX_FLAGS="" ;;
@@ -84,9 +113,10 @@ cmake -S /gt -B /gt/build -G Ninja \
   -Dgtest_build_modules=ON \
   -Dgtest_build_tests=ON \
   -Dgmock_build_tests=ON \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_CXX_FLAGS="$CXX_FLAGS" \
+  $MODULE_CMAKE_ARGS \
+  -DCMAKE_C_COMPILER=$CC_BIN \
+  -DCMAKE_CXX_COMPILER=$CXX_BIN \
+  -DCMAKE_CXX_FLAGS="$CXX_FLAGS $MODULE_CXX_FLAGS" \
   -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS"
 cmake --build /gt/build -j"\$(nproc)"
 ctest --test-dir /gt/build --output-on-failure -j"\$(nproc)"
@@ -106,8 +136,8 @@ cmake -S /gt -B /gt/build-classic -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_GMOCK=ON \
   -Dgtest_build_modules=OFF \
-  -DCMAKE_C_COMPILER=clang \
-  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_C_COMPILER=$CC_BIN \
+  -DCMAKE_CXX_COMPILER=$CXX_BIN \
   -DCMAKE_CXX_FLAGS="$CXX_FLAGS" \
   -DCMAKE_EXE_LINKER_FLAGS="$LINK_FLAGS"
 cmake --build /gt/build-classic -j"\$(nproc)"
@@ -119,7 +149,7 @@ case "$LIBC" in
       apt-get update
       DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates curl git gnupg lsb-release ninja-build wget \
-        software-properties-common libstdc++-15-dev
+        software-properties-common libstdc++-15-dev g++
       curl -fsSL https://apt.llvm.org/llvm.sh -o /tmp/llvm.sh
       chmod +x /tmp/llvm.sh
       /tmp/llvm.sh 22 all

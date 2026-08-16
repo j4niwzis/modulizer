@@ -233,3 +233,43 @@ jobs:
           TREE_TARBALL: generated-tree-${{ matrix.from }}.tar.gz
           MODULE_BUILD: ${{ matrix.module_build || 1 }}
         run: .github/scripts/build-generated-tree.sh "${{ matrix.libc }}" "${{ matrix.stdlib }}"
+
+  # ── GCC ─────────────────────────────────────────────────────────────
+  #
+  # GCC cannot attach an implementation to a module, and gives
+  # module-linkage entities names its linker will not match. --gcc-modules
+  # converts for that: the extern "C++" wrapping becomes selectable at build
+  # time, so entities can be put in the global module with C++ language
+  # linkage, and the implementation bodies compile as ordinary translation
+  # units that import rather than attach. The same tree still builds with
+  # module linkage when the macro is left undefined, which the jobs above
+  # cover — this one covers the other setting.
+  generate-gcc:
+    name: convert for gcc (glibc, libstdc++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Convert googletest
+        env:
+          GCC_MODULES: 1
+        run: .github/scripts/generate-tree.sh glibc libstdc++
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tree-gcc
+          path: generated-tree-glibc-libstdc++-gcc.tar.gz
+          retention-days: 7
+
+  gcc-tree:
+    name: build the converted tree with gcc
+    needs: generate-gcc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: tree-gcc
+      - name: Build and test with gcc
+        env:
+          TREE_TARBALL: generated-tree-glibc-libstdc++-gcc.tar.gz
+          COMPILER: gcc
+        run: .github/scripts/build-generated-tree.sh glibc libstdc++
