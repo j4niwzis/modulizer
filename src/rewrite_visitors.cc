@@ -437,8 +437,18 @@ public:
         return true;  // in-class definition, covered by the class
       auto *cls = llvm::dyn_cast<clang::CXXRecordDecl>(md->getDeclContext());
       if (!cls) return true;
-      if (is_extern_cxx_entity(cls->getNameAsString()))
-        make_extern_cxx(fd);
+      // A class nested inside an `extern "C++"` one is attached to the global
+      // module as well, so its members are owed the same treatment even though
+      // only the outer class carries the marker. Walk out to the outermost
+      // enclosing class before deciding, or an out-of-line definition of a
+      // nested class's member becomes a module entity conflicting with the
+      // global-module declaration inside the class.
+      for (auto *c = cls; c;
+           c = llvm::dyn_cast<clang::CXXRecordDecl>(c->getDeclContext()))
+        if (is_extern_cxx_entity(c->getNameAsString())) {
+          make_extern_cxx(fd);
+          break;
+        }
       return true;
     }
     if (fd->getFriendObjectKind() != clang::Decl::FOK_None) return true;
@@ -571,6 +581,23 @@ public:
     if (!ud || ud->isImplicit() || !isMainFile(ud)) return true;
     if (llvm::isa<clang::CXXRecordDecl>(ud->getDeclContext())) return true;
     if (llvm::isa<clang::FunctionDecl>(ud->getDeclContext())) return true;
+    // The declaration may not be exported while what it names is not
+    // ([module.interface]/5) — the name would keep the module linkage the
+    // using-declaration cannot re-expose:
+    //
+    //   error: using declaration referring to 'f' with module linkage cannot
+    //          be exported
+    //
+    // A using-declaration at namespace scope is what makes an internal helper
+    // part of the API, so a target this header declares is exported alongside
+    // it. One with internal linkage cannot be exported at all; there the
+    // declaration stays for the library's own lookups without the marker.
+    for (auto *shadow : ud->shadows()) {
+      auto *target = shadow->getTargetDecl();
+      if (!target || !isMainFile(target)) continue;
+      if (target->getFormalLinkage() == clang::Linkage::Internal) return true;
+      addExport(target);
+    }
     addExport(ud);
     return true;
   }
@@ -630,6 +657,8 @@ public:
 private:
   const clang::SourceManager &sm;
   std::vector<ModPoint> &mods;
+  // Where a marker was already inserted, by (routed-to file, offset).
+  std::set<std::pair<std::string, unsigned>> marked;
   const std::regex &internal_re;
   std::string_view export_macro;
   std::string_view shared_export_macro;
@@ -766,6 +795,11 @@ private:
         if (ls_loc.isValid() && sm.getFileID(ls_loc) == fid)
           off = sm.getFileOffset(ls_loc);
       }
+    // One marker per declaration: an entity can be reached twice (a class and
+    // the variable it declares share a begin location, and a using-declaration
+    // exports a target its own visit already marked), and a second insertion at
+    // the same place would spell `export export`.
+    if (!marked.insert({route_to, off}).second) return;
     std::string prefix =
         specialization
             ? std::string()

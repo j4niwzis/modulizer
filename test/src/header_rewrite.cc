@@ -842,6 +842,26 @@ TEST(HeaderRewrite, InjectedDeclDropsStorageClassExtern) {
       << "the rest of the injected declaration is kept verbatim";
 }
 
+TEST(HeaderRewrite, ExternCxxReachesNestedClassMemberDefinition) {
+  // nestmember_lib/api.h defines a member of `Outer::Inner` out of line. Only
+  // `Outer` carries the marker, but a class nested inside an `extern "C++"`
+  // one is attached to the global module as well — so the definition needs the
+  // same treatment, or it becomes a module entity conflicting with the
+  // declaration inside the class ("declaration of 'compute' in module X
+  // follows declaration in the global module").
+  auto r = rewrite_header(
+      data_path("nestmember_lib/api.h"), "nestmember_lib.api",
+      RewriteOptions{.extern_cxx = false,
+                     .extra_args = {"-I", gDataDir},
+                     .fwd_declared_fqns = {"nestmember_lib::Outer"}});
+  EXPECT_NE(r.h_content.find("extern \"C++\" inline int Outer::Inner::compute"),
+            std::string::npos)
+      << "a member of a nested class inherits the outer class's linkage";
+  EXPECT_NE(r.h_content.find("extern \"C++\" inline int Outer::plain"),
+            std::string::npos)
+      << "a member of the marked class itself is unaffected by the walk";
+}
+
 TEST(HeaderRewrite, ExternCxxDropsStorageClassExtern) {
   // linkspec_lib/api.h declares entities with an `extern` storage-class
   // specifier of their own. Wrapping such a declaration in `extern "C++"`
@@ -2026,6 +2046,24 @@ TEST(HeaderRewrite, ExportsNamespaceUsingDeclaration) {
   EXPECT_NE(r.h_content.find("USINGLIB_EXPORT using internal::Foo;"),
             std::string::npos)
       << "a namespace-scope using-declaration must be exported";
+}
+
+TEST(HeaderRewrite, ExportsTargetOfExportedUsingDeclaration) {
+  // usingtarget_lib/api.h names an internal helper from the public namespace.
+  // The declaration cannot be exported while the entity it names is not
+  // ("using declaration referring to 'compare_entries' with module linkage
+  // cannot be exported"), and the declaration is precisely what makes the
+  // helper public API — so the target is exported alongside it.
+  auto r = rewrite_header(data_path("usingtarget_lib/api.h"),
+                          "usingtarget_lib.api");
+  EXPECT_NE(r.h_content.find(
+                "USINGTARGET_LIB_EXPORT bool compare_entries(int left"),
+            std::string::npos)
+      << "the target of an exported using-declaration must be exported too";
+  EXPECT_NE(r.h_content.find("USINGTARGET_LIB_EXPORT using "
+                             "detail::ordering::compare_entries;"),
+            std::string::npos)
+      << "the using-declaration itself is still exported";
 }
 
 TEST(HeaderRewrite, ExportsNamespaceUsingDirective) {
