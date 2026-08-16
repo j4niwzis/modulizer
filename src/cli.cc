@@ -635,6 +635,10 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
     auto sit = system_includes_by_consumer.find(c);
     if (sit != system_includes_by_consumer.end())
       per_cfg.required_system_includes = sit->second;
+    // A consumer header is included by other consumers, which have imported by
+    // then; what it may carry differs (see ConsumerRewriteOptions::is_header).
+    auto ext = std::filesystem::path(c).extension().string();
+    per_cfg.is_header = ext == ".h" || ext == ".hpp" || ext == ".hh";
     auto out = rewrite_consumer_source(src, per_cfg);
     if (out != src) {
       if (!write_file(c, out)) return 1;
