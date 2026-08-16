@@ -539,13 +539,52 @@ public:
   bool VisitUsingDirectiveDecl(clang::UsingDirectiveDecl *udd) {
     // A namespace-scope `using namespace X;` directive (e.g. a library's
     // `using namespace detail;` inside `namespace lib`) makes X's members
-    // visible in the enclosing namespace. It must be exported so consumers
-    // resolve names like `lib::Foo` (which lives in `lib::detail`)
-    // through the directive.
+    // visible in the enclosing namespace, and consumers resolved names like
+    // `lib::Foo` (which lives in `lib::detail`) through it.
+    //
+    // Exporting the directive does not carry that across a module boundary: a
+    // using-directive declares no name, so there is nothing for the export to
+    // apply to, and an importer's lookup never sees the members —
+    //
+    //   error: 'Foo' is not a member of 'lib'
+    //
+    // (one implementation honours it anyway, which is why this went unnoticed).
+    // A using-DECLARATION does declare a name and does cross the boundary, so
+    // the directive stays for the library's own unqualified lookups and one
+    // exported declaration per name is emitted after it.
     if (!udd || udd->isImplicit() || !isMainFile(udd)) return true;
     if (llvm::isa<clang::CXXRecordDecl>(udd->getDeclContext())) return true;
     if (llvm::isa<clang::FunctionDecl>(udd->getDeclContext())) return true;
-    addExport(udd);
+    auto *ns = udd->getNominatedNamespace();
+    // Only a namespace this header itself declares: `using namespace std;` is
+    // not this rewrite's to re-declare.
+    if (!ns || !isMainFile(ns)) { addExport(udd); return true; }
+    std::set<std::string> names;
+    for (auto *d : ns->decls()) {
+      auto *nd = llvm::dyn_cast<clang::NamedDecl>(d);
+      if (!nd || nd->isImplicit()) continue;
+      if (llvm::isa<clang::UsingDirectiveDecl>(nd) ||
+          llvm::isa<clang::NamespaceDecl>(nd))
+        continue;
+      auto name = nd->getDeclName();
+      if (!name.isIdentifier() || nd->getName().empty()) continue;
+      // One declaration names every overload, so the set does the deduping.
+      names.insert(nd->getName().str());
+    }
+    if (names.empty()) return true;
+    auto end = sm.getExpansionLoc(udd->getEndLoc());
+    if (!end.isValid()) return true;
+    auto fid = sm.getFileID(end);
+    auto buf = sm.getBufferData(fid);
+    unsigned off = sm.getFileOffset(end);
+    while (off < buf.size() && buf[off] != ';') ++off;
+    if (off >= buf.size()) return true;
+    ++off;  // just past the `;`
+    std::string text;
+    for (auto &n : names)
+      text += std::format("\n{} using {}::{};", export_macro,
+                          ns->getNameAsString(), n);
+    mods.push_back({off, 0, std::move(text)});
     return true;
   }
 

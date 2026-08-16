@@ -14,6 +14,14 @@ namespace {
 // Emitted when --import-std is NOT set; --import-std replaces it with
 // `import std;`. Matches the includes consumer code previously received
 // transitively from the library headers.
+// C headers whose DECLARATIONS the std module also provides. Textually in a
+// header, they are re-read after an importing translation unit has already
+// imported std, and the inline overloads (memchr, struct tm, ...) collide.
+const std::set<std::string> kStdProvidedCHeaders = {
+    "string.h", "time.h", "stdio.h", "stdlib.h", "stddef.h",
+    "stdint.h", "wchar.h", "ctype.h", "math.h", "wctype.h",
+};
+
 const std::vector<std::string> kStdIncludes = {
     "algorithm", "cstdio", "cstdlib", "cstring", "exception", "functional",
     "iostream", "iterator", "limits", "map", "memory", "ostream", "set",
@@ -29,6 +37,11 @@ export struct ConsumerHeaderInfo {
 
 export struct ConsumerRewriteOptions {
   bool import_std = false;
+  // This source is a HEADER other consumers include. It must not keep the C
+  // headers `import std` already provides: an including translation unit has
+  // imported by the time it reaches them, and the declarations collide —
+  //   error: redefinition of 'void* memchr(void*, int, size_t)'
+  bool is_header = false;
   std::map<std::string, ConsumerHeaderInfo> include_to_module;
   // System C/POSIX headers the consumer uses macros/symbols from (traced from
   // its source via trace_consumer_system_includes). `import std.compat` cannot
@@ -107,6 +120,8 @@ export std::string rewrite_consumer_source(
   // An include that survives BELOW the block does not spare the block from
   // emitting it: after the imports is exactly where it must not be.
   std::map<std::string, std::size_t> system_include_at;
+  // System includes lifted out of the body because the block sits above them.
+  std::vector<std::string> hoisted_system_includes;
   {
     std::size_t pos = 0;
     // Depth of open #if/#ifdef/#ifndef blocks, and where the outermost
@@ -118,6 +133,11 @@ export std::string rewrite_consumer_source(
       auto sv = line_at(pos, nl);
       std::string line(sv);
       if (nl < src.size()) line += '\n';  // preserve the trailing newline
+      // An `import` the file already carries anchors the block too: consumers
+      // are rewritten once per library they use, and the second pass must put
+      // its includes above the first pass's imports, not after them.
+      if (!insert_at && cond_depth == 0 && sv.starts_with("import "))
+        insert_at = out.size();
       if (auto dir = preprocessor_conditional_kind(sv)) {
         if (*dir == PreprocessorConditional::kOpen) {
           if (cond_depth == 0) outermost_cond_start = out.size();
@@ -127,6 +147,13 @@ export std::string rewrite_consumer_source(
         }
       }
       if (auto inc = parse_include_line(line)) {
+        // A quoted include of another CONVERTED consumer (a test's own header)
+        // imports std itself, so the block must sit above it as well: a C
+        // header below an import is the one order that has to be avoided, and
+        // the import can arrive through an include like this one.
+        if (inc->is_quoted && cond_depth == 0 && !insert_at &&
+            !options.include_to_module.count(inc->path))
+          insert_at = out.size();
         auto it = options.include_to_module.find(inc->path);
         if (it != options.include_to_module.end()) {
           auto &mod = it->second.module;
@@ -152,6 +179,14 @@ export std::string rewrite_consumer_source(
           if (pos >= src.size()) break;
           continue;
         }
+        // In a header, the C headers `import std` provides go too (see
+        // ConsumerRewriteOptions::is_header).
+        if (options.import_std && options.is_header && !inc->is_quoted &&
+            kStdProvidedCHeaders.count(inc->path)) {
+          pos = nl + 1;
+          if (pos >= src.size()) break;
+          continue;
+        }
         if (options.import_std && !inc->is_quoted &&
             kStdHeaders.count(inc->path) && inc->path != "cstdio" &&
             inc->path != "cerrno" && inc->path != "cassert" &&
@@ -161,9 +196,23 @@ export std::string rewrite_consumer_source(
           continue;
         }
       }
-      if (auto inc = parse_include_line(line))
-        if (!inc->is_quoted)
+      if (auto inc = parse_include_line(line)) {
+        if (!inc->is_quoted) {
+          // A system include the block will end up ABOVE has to move into it.
+          // Left where it is, it is read after an import — the order that
+          // redefines whatever the imported module's global module fragment
+          // already provided:
+          //   error: redefinition of 'ssize_t read(int, void*, size_t)'
+          // Only unguarded ones: a platform-guarded include keeps its guard.
+          if (insert_at && cond_depth == 0) {
+            hoisted_system_includes.push_back(line);
+            pos = nl + 1;
+            if (pos >= src.size()) break;
+            continue;
+          }
           system_include_at.try_emplace(inc->path, out.size());
+        }
+      }
       out.push_back(line);
       pos = nl + 1;
       if (pos >= src.size()) break;
@@ -187,6 +236,7 @@ export std::string rewrite_consumer_source(
   };
 
   std::string block;
+  for (auto &l : hoisted_system_includes) block += l;
 
   // Usage-based C-header re-add: `import std.compat;` cannot provide the C
   // library's macros (errno, assert, INT_MAX, ...) or POSIX declarations/types
@@ -209,6 +259,14 @@ export std::string rewrite_consumer_source(
   for (auto &inc : options.required_system_includes)
     if (!already_above_block(inc))
       block += std::format("#include <{}>\n", inc);
+  // A translation unit that imports std but never includes <string.h> makes
+  // gcc compile the module's own definition of memset, and it dies there:
+  //   internal compiler error: in nonnull_arg_p, at tree.cc
+  // Reading the header first is what avoids it. A header must not do this (it
+  // would land below the includer's import), which is why this is .cc only.
+  if (options.import_std && !options.is_header &&
+      !already_above_block("string.h"))
+    block += "#include <string.h>\n";
 
   if (options.import_std) {
     // std.compat (rather than std) also provides the C library's global names

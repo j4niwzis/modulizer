@@ -279,17 +279,24 @@ TEST(HeaderRewrite, ModuleReplacesCrossLibraryAddsImport) {
       << "the replaced header must not stay as a raw include";
 }
 
-TEST(HeaderRewrite, ExportsUsingNamespaceDirective) {
-  // A namespace-scope `using namespace X;` directive (e.g.
-  // `using namespace adl_guard;`) makes X's members visible in the enclosing
-  // namespace. It must ALWAYS be exported (via the export macro, which becomes
-  // `export` under <LIB>_USE_MODULES) so consumers resolve names like
-  // `wraplib::Baz` (which lives in `wraplib::adl_guard`) through it.
+TEST(HeaderRewrite, HoistsUsingNamespaceMembersAsDeclarations) {
+  // A namespace-scope `using namespace X;` makes X's members visible in the
+  // enclosing namespace, and that is how consumers named `wraplib::Baz` (which
+  // lives in `wraplib::adl_guard`). Exporting the directive does not carry it
+  // across a module boundary — a using-directive declares no name, so there is
+  // nothing for the export to apply to and an importer's lookup never sees the
+  // members. A using-DECLARATION does declare a name, so one per member is
+  // emitted after the directive, which stays for the header's own lookups.
   auto r = rewrite_header(data_path("wraplib/producer.h"), "wraplib",
                           RewriteOptions{.cc_only = true});
-  EXPECT_NE(r.cc_content.find("WRAPLIB_EXPORT using namespace adl_guard;"),
+  EXPECT_NE(r.cc_content.find("WRAPLIB_EXPORT using adl_guard::Baz;"),
             std::string::npos)
-      << "a namespace-scope using-namespace directive must be exported";
+      << "each member needs a declaration of its own to cross the boundary";
+  EXPECT_EQ(r.cc_content.find("WRAPLIB_EXPORT using namespace adl_guard;"),
+            std::string::npos)
+      << "and the directive itself is not what carries them";
+  EXPECT_NE(r.cc_content.find("using namespace adl_guard;"), std::string::npos)
+      << "though it stays, for the header's own unqualified lookups";
 }
 
 TEST(HeaderRewrite, InsertsLibraryExport) {
@@ -2023,14 +2030,14 @@ TEST(HeaderRewrite, ExportsNamespaceUsingDeclaration) {
 
 TEST(HeaderRewrite, ExportsNamespaceUsingDirective) {
   // directive.h pulls `adl_guard` members into `usinglib` with a using-DIRECTIVE
-  // (`using namespace adl_guard;`, the ADL-suppression pattern). The directive
-  // must
-  // be exported so consumers resolve names like `usinglib::pointer_thing`
-  // (which lives in `usinglib::adl_guard`) through it.
+  // (`using namespace adl_guard;`, the ADL-suppression pattern). Consumers name
+  // `usinglib::pointer_thing`, which lives in `usinglib::adl_guard`, so each
+  // member gets an exported using-declaration: the directive alone declares no
+  // name and does not reach an importer.
   auto r = rewrite_header(data_path("usinglib/directive.h"), "usinglib.directive");
-  EXPECT_NE(r.h_content.find("USINGLIB_EXPORT using namespace adl_guard;"),
+  EXPECT_NE(r.h_content.find("USINGLIB_EXPORT using adl_guard::pointer_thing;"),
             std::string::npos)
-      << "a namespace-scope using-directive must be exported";
+      << "a using-declaration per member is what an importer can see";
 }
 
 TEST(HeaderRewrite, DoesNotExternCxxFriendTemplateInsideClass) {
