@@ -483,6 +483,7 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   cfg.module_name = ModuleNameOpt.getValue();
   cfg.library_name = library_name;
   cfg.public_modules = public_modules;
+  cfg.no_internal_filter = ExportAllOpt.getValue();
   cfg.module_replaces = module_replaces;
   cfg.combined_macros = CombinedMacrosOpt;
   cfg.extern_cxx = !NoExternCxxOpt;
@@ -953,6 +954,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   cfg.module_name = ModuleNameOpt.getValue();
   cfg.library_name = library_name;
   cfg.public_modules = public_modules;
+  cfg.no_internal_filter = ExportAllOpt.getValue();
   cfg.module_replaces = module_replaces;
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;

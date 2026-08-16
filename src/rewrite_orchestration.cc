@@ -306,6 +306,11 @@ export struct RewriteBatchConfig {
   std::vector<std::string> fwd_declared_fqns;
   std::set<std::string> same_module_free_fqns;
   bool combined_macros = false;
+  // Export every library entity, internal namespaces included. A library whose
+  // own modules use each other's `detail::` names needs it: the internal filter
+  // otherwise keeps those unexported, and the module that needs one cannot see
+  // it through the import that carries it.
+  bool no_internal_filter = false;
   bool extern_cxx = false;
   // Name of the macro the extern "C++" wrapping is written behind, or empty
   // for an unconditional block. See RewriteOptions::extern_cxx_macro.
@@ -348,6 +353,7 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
   o.extra_args = extra_args;
   o.import_std = cfg.import_std;
   o.public_modules = cfg.public_modules;
+  o.no_internal_filter = cfg.no_internal_filter;
   o.internal_mode = cfg.internal_mode;
   o.module_replaces = cfg.module_replaces;
   o.defined_fqns = cfg.defined_fqns;

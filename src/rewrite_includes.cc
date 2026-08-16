@@ -41,9 +41,21 @@ export struct LibIncludeClass {
 // rename.
 export LibIncludeClass classify_library_include(
     const IncludeDirective &inc, llvm::StringRef library_name,
-    llvm::StringRef header_path, const std::vector<std::string> &extra_args) {
+    llvm::StringRef header_path, const std::vector<std::string> &extra_args,
+    // The headers this run is rewriting, canonicalized; see compute_auto_imports.
+    const std::set<std::string> *converted = nullptr) {
   auto segs = split_path(inc.path);
   auto root = segs.empty() ? "" : segs.front();
+  // Under our own include prefix the converted set is the whole truth: a path
+  // that does not resolve into it is not a module of ours, however much it
+  // looks like one. Without this a library name that is a VENDOR prefix claims
+  // every library sharing it — `boost.system` makes the library `boost`, and
+  // Boost.Config's headers then resolve to modules nobody generated.
+  if (converted && root == library_name.str()) {
+    auto resolved = resolve_include(inc.path, header_path.str(), extra_args);
+    if (resolved.empty() || !converted->count(canonical_include_path(resolved)))
+      return {};
+  }
   auto derived = derive_module_name(inc.path, library_name);
   auto lib_prefix = std::format("{}/", library_name.str());
   bool is_lib_include =
@@ -140,6 +152,17 @@ export std::map<std::string, std::string> compute_auto_imports(
     auto segs = split_path(inc.path);
     if (segs.empty()) continue;
     auto root = segs.front();
+    // Under our own include prefix the set above is the whole truth: if the
+    // include did not resolve into it, there is no module of ours behind this
+    // path and the spelling rule must not invent one. It otherwise does, every
+    // time the library name is a VENDOR prefix shared with other libraries —
+    // `boost.system` makes the library `boost`, and then every `boost/...`
+    // include, Boost.Config's among them, looks like one of ours:
+    //
+    //   fatal error: module 'boost.config.compiler.nvcc' not found
+    //
+    // A SIBLING library keeps its own root (`other/other.h`) and is unaffected.
+    if (converted && root == library_name.str()) continue;
     if (root != library_name.str() && is_internal_segment(root)) continue;
     if (inc.path.contains("/custom/")) continue;
     // A header of a *different* library must resolve to a project-local file,

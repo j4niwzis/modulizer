@@ -428,6 +428,9 @@ export OverrideGuardRange override_guard_with_code(const std::string &src,
 export std::string build_macros_file(
     const std::vector<MacroRec> &export_macros,
     const std::set<std::string> &extra_macro_includes,
+    // Include lines the reproduced conditional blocks need in order to be
+    // evaluated here. See the caller.
+    const std::vector<std::string> &block_support_includes,
     const std::set<std::string> &block_defined_names,
     const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
     const std::string &original,
@@ -435,6 +438,8 @@ export std::string build_macros_file(
     const std::string &export_include) {
   std::string mout;
   mout += "#pragma once\n\n";
+  for (const auto &bi : block_support_includes) mout += bi;
+  if (!block_support_includes.empty()) mout += "\n";
   for (const auto &em : extra_macro_includes)
     mout += std::format("#include \"{}\"\n", em);
   if (!extra_macro_includes.empty()) mout += "\n";

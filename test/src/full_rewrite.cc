@@ -290,18 +290,26 @@ TEST(FullRewrite, RedundantForwardDeclIsRemoved) {
 TEST(FullRewrite, CrossModuleForwardDeclGetsExternCxx) {
   // c.h forward-declares Bar (defined in d.h, which c.h does NOT include).
   // A module-private forward declaration would be a distinct type from the
-  // defining module's entity, so the declaration must be `extern "C++"` (a
-  // global-module entity) to merge with the definition across modules. It must
-  // not be exported (the defining module owns the export).
+  // defining module's entity, so the declaration carries the shared marker: the
+  // linkage macro puts it in the global module, where it merges with the
+  // definition, and the export lets an importer find it there. Being in the
+  // global module is not enough on its own — a module that cannot see this
+  // declaration introduces its own and the two never merge.
+  //
+  // The marker is the same whether or not the body is wrapped; only what the
+  // macro expands to differs (`extern "C++"` here, nothing where the enclosing
+  // block already supplies it). Exporting it in one build and not the other
+  // made the two disagree about what a module offers.
   auto r = rewrite_header(data_path("fwd_lib/c.h"), "fwd_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Bar"}});
-  EXPECT_NE(r.h_content.find("extern \"C++\" class Bar;"),
+  EXPECT_NE(
+      r.h_content.find("FWD_LIB_EXPORT FWD_LIB_EXTERN_CXX_DECL class Bar;"),
+      std::string::npos)
+      << "cross-module forward declaration must carry the shared marker so it "
+         "merges with the defining module's entity and importers can find it";
+  EXPECT_NE(r.export_h_content.find(
+                "#define FWD_LIB_EXTERN_CXX_DECL extern \"C++\""),
             std::string::npos)
-      << "cross-module forward declaration must be extern \"C++\" so it "
-         "merges with the defining module's entity";
-  EXPECT_EQ(r.h_content.find("FWD_LIB_EXPORT class Bar;"),
-            std::string::npos)
-      << "a forward declaration of a class defined in another module must not "
-         "be exported";
+      << "and unwrapped, that marker's linkage macro is extern \"C++\"";
   EXPECT_EQ(r.h_content.find("FWD_LIB_EXPORT extern \"C++\" class Bar;"),
             std::string::npos)
       << "the declaration must not be exported even with the extern \"C++\"";
@@ -450,13 +458,12 @@ TEST(FullRewrite, TemplateForwardDeclGetsExternCxx) {
   // `template <...>` clause; inserting it after the template parameter list is
   // ill-formed.
   auto r = rewrite_header(data_path("tpl_lib/a.h"), "tpl_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Foo"}});
-  EXPECT_NE(r.h_content.find("extern \"C++\" template <typename T>"),
+  EXPECT_NE(r.h_content.find("TPL_LIB_EXTERN_CXX_DECL template <typename T>"),
             std::string::npos)
-      << "extern \"C++\" must precede the template clause";
-  EXPECT_EQ(r.h_content.find("template <typename T>\nextern \"C++\""),
+      << "the linkage marker must precede the template clause";
+  EXPECT_EQ(r.h_content.find("template <typename T>\nTPL_LIB_EXTERN_CXX_DECL"),
             std::string::npos)
-      << "extern \"C++\" must not be inserted after the template parameter "
-         "list";
+      << "and must not be inserted after the template parameter list";
 }
 
 TEST(FullRewrite, TemplateDefinitionGetsExternCxx) {
