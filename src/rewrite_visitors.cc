@@ -502,6 +502,9 @@ public:
   bool VisitEnumDecl(clang::EnumDecl *ed) {
     if (!ed || ed->isImplicit() || !isMainFile(ed)) return true;
     if (llvm::isa<clang::CXXRecordDecl>(ed->getDeclContext())) return true;
+    // A block-scope enum — the `enum { count = std::extent<T>::value };` idiom
+    // for a local compile-time constant — is not an entity a module can export.
+    if (llvm::isa<clang::FunctionDecl>(ed->getDeclContext())) return true;
     if (no_internal_filter) { addExport(ed); return true; }
     if (is_internal(ed->getNameAsString())) {
       // An internal enum whose *value* is reachable (e.g. `kFatal` named
@@ -910,6 +913,20 @@ public:
 
   bool VisitCXXConstructExpr(clang::CXXConstructExpr *e) {
     if (e && in_main(e->getExprLoc())) record(e->getConstructor());
+    return true;
+  }
+
+  // A call with a type-dependent argument has no resolved callee — the name is
+  // still a lookup result when the template is only parsed. `std::move(d)` in a
+  // class template's constructor is exactly that, and with nothing crediting
+  // the candidates the header that declares them is dropped from the global
+  // module fragment:
+  //
+  //   error: 'move' must be declared before it is used
+  //
+  bool VisitUnresolvedLookupExpr(clang::UnresolvedLookupExpr *e) {
+    if (!e || !in_main(e->getExprLoc())) return true;
+    for (auto *d : e->decls()) record(d);
     return true;
   }
 

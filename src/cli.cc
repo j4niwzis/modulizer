@@ -976,13 +976,22 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     // include guards let a textual build get away with, and exactly what a
     // module build cannot. Those keep the injected declarations they already
     // had; only a need that runs WITH the include order becomes an import.
-    std::map<std::string, std::set<std::string>> reach;
+    // The graph is kept in MODULE terms, and every import accepted below is
+    // added to it: two headers can each need something the other defines
+    // without either including the other, and then neither edge closes a loop
+    // in the include graph while the two together close one in the module
+    // graph. Only the edges already accepted make that visible.
+    std::set<std::string> header_set(header_paths.begin(), header_paths.end());
+    std::map<std::string, std::set<std::string>> edges;
     for (auto &h : header_paths) {
       auto src = read_file(h);
       if (src.empty()) continue;
+      auto from = derive_module_name(h, library_name);
       for (auto &inc : parse_includes(src)) {
         auto resolved = resolve_include(inc.path, h, all_extra);
-        if (!resolved.empty()) reach[h].insert(resolved);
+        if (resolved.empty() || !header_set.count(resolved)) continue;
+        auto to = derive_module_name(resolved, library_name);
+        if (to != from) edges[from].insert(to);
       }
     }
     auto reaches = [&](const std::string &from, const std::string &to) {
@@ -992,8 +1001,8 @@ export inline int run_full_rewrite(int argc, const char **argv) {
         auto cur = stack.back();
         stack.pop_back();
         if (!seen.insert(cur).second) continue;
-        auto it = reach.find(cur);
-        if (it == reach.end()) continue;
+        auto it = edges.find(cur);
+        if (it == edges.end()) continue;
         for (auto &n : it->second) {
           if (n == to) return true;
           stack.push_back(n);
@@ -1006,15 +1015,17 @@ export inline int run_full_rewrite(int argc, const char **argv) {
       for (auto &fqn : tpl_raw.needed[i]) {
         auto it = tpl_defined_files.find(fqn);
         if (it == tpl_defined_files.end()) continue;
+        auto self = derive_module_name(header_paths[i], library_name);
         for (auto &definer : it->second) {
           if (definer == header_paths[i]) continue;
           auto mod = derive_module_name(definer, library_name);
-          if (mod == derive_module_name(header_paths[i], library_name)) continue;
+          if (mod == self) continue;
           // Never the library's own umbrella. It imports every sub-module by
           // construction, so a sub-module importing it back is a loop no
           // include graph can show.
           if (mod == library_name || mod == library_name + ".umbrella") continue;
-          if (reaches(definer, header_paths[i])) continue;  // would close a loop
+          if (reaches(mod, self)) continue;  // would close a loop
+          edges[self].insert(mod);
           extra_imports[header_paths[i]].insert(mod);
         }
       }

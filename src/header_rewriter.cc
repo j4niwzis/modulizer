@@ -100,6 +100,32 @@ struct GmfAndImports {
 // `classify_replacement` uses to drop headers provided by an imported module.
 // `includes` is moved-from: entries that become GMF includes are moved into
 // the result.
+// An import derived from a conditional include has to keep the condition. A
+// dispatch header picks one of several implementations of the same entities —
+//
+//   #if defined(USE_A)
+//   # include <lib/detail/thing_a.hpp>
+//   #elif defined(USE_B)
+//   # include <lib/detail/thing_b.hpp>
+//
+// — and importing every alternative at once is a redefinition, not a choice:
+//
+//   error: declaration 'thing' attached to named module 'lib.detail.thing_a'
+//          cannot be attached to other modules
+//
+// The preprocessor runs before imports are resolved, so a guarded import is an
+// ordinary one: the build's dependency scanner sees only the live branch.
+std::string guarded_import(const IncludeDirective &inc, std::string line) {
+  auto guards = valid_guards(inc.guard_stack);
+  if (guards.empty()) return line;
+  std::string out;
+  for (auto &g : guards) out += g;
+  out += line + "\n";
+  for (std::size_t i = 1; i < guards.size(); ++i) out += "#endif\n";
+  out += "#endif";
+  return out;
+}
+
 GmfAndImports classify_includes(
     std::vector<IncludeDirective> &includes,
     const std::map<std::string, std::string> &auto_imports,
@@ -131,12 +157,14 @@ GmfAndImports classify_includes(
     auto ait = auto_imports.find(inc.path);
     if (it != options.include_to_module.end()) {
       auto &mname = it->second;
-      out.purview_imports.push_back(format_import(
-          inc.path, mname, options.public_modules, options.internal_mode));
+      out.purview_imports.push_back(guarded_import(
+          inc, format_import(inc.path, mname, options.public_modules,
+                             options.internal_mode)));
     } else if (ait != auto_imports.end()) {
       auto &mname = ait->second;
-      out.purview_imports.push_back(format_import(
-          inc.path, mname, options.public_modules, options.internal_mode));
+      out.purview_imports.push_back(guarded_import(
+          inc, format_import(inc.path, mname, options.public_modules,
+                             options.internal_mode)));
     } else if (!inc.skip_gmf) {
       // A direct include of another library header that auto-imports did not
       // cover — including the library's umbrella/root header. It must be
@@ -156,9 +184,9 @@ GmfAndImports classify_includes(
           if (cl.derived == library_name.str() &&
               !options.umbrella_module.empty())
             cl.derived = options.umbrella_module;
-          out.purview_imports.push_back(format_import(
-              inc.path, cl.derived, options.public_modules,
-              options.internal_mode));
+          out.purview_imports.push_back(guarded_import(
+              inc, format_import(inc.path, cl.derived, options.public_modules,
+                                 options.internal_mode)));
           continue;
         }
       }
@@ -214,9 +242,12 @@ GmfAndImports classify_includes(
               !options.umbrella_module.empty())
             cl.derived = options.umbrella_module;
           if (cl.derived == module_name.str()) continue;
-          out.purview_imports.push_back(format_import(
-              inc.path, cl.derived, options.public_modules,
-              options.internal_mode));
+          // Reached through a dispatch header, the alternatives arrive here as
+          // several transitive includes at once; each keeps the branch it was
+          // found under, which is what tells them apart.
+          out.purview_imports.push_back(guarded_import(
+              inc, format_import(inc.path, cl.derived, options.public_modules,
+                                 options.internal_mode)));
           imported_modules.insert(cl.derived);
           continue;
         }
@@ -942,6 +973,37 @@ export HeaderRewriteResult rewrite_header(
       }
       return false;
     };
+    // A macro whose BODY names another macro this library does not define —
+    // `#define LIB_SPINLOCK_INIT { ATOMIC_FLAG_INIT }`. The name is expanded
+    // wherever the macros file is included, in a module that never sees the
+    // header defining it, so the header the source itself included has to come
+    // along even when it is a standard one. Under --import-std it cannot: a
+    // textual standard header beside `import std;` redeclares what the import
+    // already carries, and that trades one broken build for another.
+    auto body_names_foreign_macro = [&](std::string_view body) {
+      for (std::size_t i = 0; i < body.size(); ++i) {
+        if (!is_ident_char(body[i]) || (i && is_ident_char(body[i - 1]))) continue;
+        auto j = i;
+        while (j < body.size() && is_ident_char(body[j])) ++j;
+        auto id = body.substr(i, j - i);
+        i = j - 1;
+        // Only what is spelled like a macro: an all-caps name of some length.
+        // A lower-case identifier in a macro body is code, and code the macros
+        // file has no business dragging headers in for.
+        if (id.size() < 2) continue;
+        if (std::ranges::any_of(id, [](char c) { return c >= 'a' && c <= 'z'; }))
+          continue;
+        if (!own.count(std::string(id))) return true;
+      }
+      return false;
+    };
+    bool needs_system = false;
+    if (!options.import_std)
+      for (auto &m : export_macros)
+        if (!m.name.empty() && body_names_foreign_macro(m.body)) {
+          needs_system = true;
+          break;
+        }
     bool needs = false;
     for (auto &m : export_macros) {
       if (!m.name.empty() || m.end_off <= m.start_off) continue;
@@ -957,7 +1019,7 @@ export HeaderRewriteResult rewrite_header(
       }
       if (needs) break;
     }
-    if (needs) {
+    if (needs || needs_system) {
       for (auto &inc : includes) {
         // Only what the header writes itself. A transitive include is reached
         // through the header that owns it and often may not be included any
@@ -986,7 +1048,8 @@ export HeaderRewriteResult rewrite_header(
         {
           auto resolved =
               resolve_include(inc.path, header_path.str(), options.extra_args);
-          if (resolved.empty() || resolved_in_system_dir(resolved)) continue;
+          if (resolved.empty()) continue;
+          if (resolved_in_system_dir(resolved) && !needs_system) continue;
         }
         block_support_includes.push_back(
             inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
@@ -1122,13 +1185,23 @@ export HeaderRewriteResult rewrite_header(
       imported_modules, used_headers, std_import_guard);
   // Modules this header names entities from without ever including the headers
   // that define them. No include can produce these, so they are added outright.
+  // What the imports above already bring in, counting the ones sitting behind
+  // a branch condition: a module already imported needs nothing more, and an
+  // unconditional second import of a dispatch header's alternatives would undo
+  // the condition that keeps them apart.
+  std::set<std::string> already_imported;
+  for (const auto &imp : purview_imports) {
+    for (auto line : std::views::split(imp, '\n')) {
+      std::string_view s(line.begin(), line.end());
+      if (s.starts_with("export ")) s.remove_prefix(7);
+      if (!s.starts_with("import ") || !s.ends_with(";")) continue;
+      already_imported.insert(std::string(s.substr(7, s.size() - 8)));
+    }
+  }
   for (const auto &mod : options.extra_imports) {
     if (mod == module_name.str()) continue;
-    auto line = std::format("import {};", mod);
-    if (!std::ranges::contains(purview_imports, line) &&
-        !std::ranges::contains(purview_imports,
-                               std::format("export import {};", mod)))
-      purview_imports.push_back(line);
+    if (already_imported.insert(mod).second)
+      purview_imports.push_back(std::format("import {};", mod));
   }
 
   // Drop transitive system includes whose parent header is also emitted in

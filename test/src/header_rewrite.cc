@@ -1988,17 +1988,57 @@ TEST(HeaderRewrite, DoesNotExportClassMemberTypedefs) {
             std::string::npos);
 }
 
-TEST(HeaderRewrite, ElifIncludesAreSkippedFromGmf) {
+TEST(HeaderRewrite, DispatchHeaderImportsOneAlternative) {
+  // pick.h selects one implementation of `thing` per build. Both alternatives
+  // define it, so importing them together is a redefinition rather than a
+  // choice — the branch condition has to survive into the import. The
+  // conditionals also use the indented `# include` spelling, which the pass
+  // that replaces includes has to recognise as one.
+  std::map<std::string, std::string> include_map = {
+      {"dispatch_lib/impl_a.h", "dispatch_lib.impl_a"},
+      {"dispatch_lib/impl_b.h", "dispatch_lib.impl_b"},
+  };
+  auto r = rewrite_header(data_path("dispatch_lib/pick.h"), "dispatch_lib.pick",
+                          RewriteOptions{.include_to_module = include_map,
+                                         .extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.cc_content.find("#if defined(DISPATCH_LIB_USE_B)\n"
+                              "export import dispatch_lib.impl_b;\n#endif"),
+            std::string::npos)
+      << "the selected branch's import must carry its condition";
+  EXPECT_NE(r.cc_content.find("#if !( defined(DISPATCH_LIB_USE_B))\n"
+                              "export import dispatch_lib.impl_a;\n#endif"),
+            std::string::npos)
+      << "and the other branch must carry its negation";
+  EXPECT_NE(r.h_content.find("#ifndef DISPATCH_LIB_USE_MODULES\n"
+                             "# include \"dispatch_lib/impl_a.h\"\n"),
+            std::string::npos)
+      << "an indented include is an include: the module build drops it like "
+         "any other, and the classic build keeps it";
+}
+
+TEST(HeaderRewrite, DoesNotExportBlockScopeEnum) {
+  // `enum { count = sizeof(T) };` inside a function body is a local constant,
+  // not an entity a module can export.
+  auto r = rewrite_header(data_path("blockenum.h"), "blockenum_lib");
+  EXPECT_EQ(r.h_content.find("BLOCKENUM_LIB_EXPORT enum"), std::string::npos)
+      << "a block-scope enum must not be exported";
+}
+
+TEST(HeaderRewrite, ElifIncludesKeepTheirBranchCondition) {
   auto r = rewrite_header(data_path("elif_else_includes.h"), "test_lib");
-  // #elif-branch includes should NOT appear in the .cc GMF
-  EXPECT_EQ(r.cc_content.find("cond_b.h"), std::string::npos)
-      << "#elif includes must not be in GMF";
+  // A branch past the first is reached only when the ones before it were not,
+  // so its includes carry both its own condition and their negations. Dropping
+  // them instead would leave the GMF without what that branch needs.
+  EXPECT_NE(r.cc_content.find("#if !(COND_A) && (COND_B)\n#include <cond_b.h>"),
+            std::string::npos)
+      << "an #elif include is guarded by its branch, not skipped";
   // #if-branch includes SHOULD appear in GMF (with guard)
   EXPECT_NE(r.cc_content.find("#include <cond_a.h>"), std::string::npos)
       << "#if includes should be in GMF";
-  // #else-branch includes SHOULD appear in GMF (unconditional)
-  EXPECT_NE(r.cc_content.find("#include <cond_c.h>"), std::string::npos)
-      << "#else includes should be in GMF";
+  // #else-branch includes SHOULD appear in GMF (with every branch negated)
+  EXPECT_NE(r.cc_content.find("#if !(COND_A) && !(COND_B)\n#include <cond_c.h>"),
+            std::string::npos)
+      << "an #else after an #elif has more than one branch to negate";
 }
 
 TEST(HeaderRewrite, ElseIncludesEmittedUnconditional) {
