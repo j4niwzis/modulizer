@@ -158,9 +158,9 @@ export bool keep_transitive_system_include(const std::string &resolved,
 
 export std::string format_import(const std::string &path,
                                  const std::string &module,
-                                 const std::set<std::string> &macro_modules,
+                                 const std::set<std::string> &public_modules,
                                  InternalMode internal_mode) {
-  if (!macro_modules.count(module) &&
+  if (!public_modules.count(module) &&
       is_internal_module(path, module, internal_mode))
     return std::format("import {};", module);
   return std::format("export import {};", module);

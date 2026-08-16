@@ -145,6 +145,18 @@ export std::vector<std::string> wrapper_reachable_fqns(
 export struct MacroModuleResult {
   std::vector<std::string> macro_reachable;
   std::set<std::string> macro_modules;
+  // Modules whose path says internal but whose contents say otherwise: a
+  // header under `detail/` that declares names in the library's PUBLIC
+  // namespace is public API filed in a subdirectory, not a hidden
+  // implementation. A layout that uses `detail/` to organise files rather than
+  // to hide names puts real API there — `detail/mp_list.hpp` declaring
+  // `lib::mp_list` — and treating it as internal would stop the umbrella
+  // re-exporting it, leaving consumers unable to name what they import.
+  //
+  // The namespace is what decides. A header under `detail/` declaring only
+  // `lib::detail::` names stays internal, which is the case the directory rule
+  // was written for.
+  std::set<std::string> public_api_modules;
 };
 
 // Given a set of reachable entity FQNs, return the modules that contain them.
@@ -204,21 +216,27 @@ export MacroModuleResult compute_macro_modules(
   for (auto &rf : manual_fqns) mr.reachable_fqns.push_back(rf);
   expand_transitive_types(mr, all_macros);
   out.macro_reachable = std::move(mr.reachable_fqns);
+  std::regex internal_ns(kDefaultInternalFilter.str());
   for (std::size_t i = 0; i < header_paths.size(); ++i) {
     auto &m = per_header[i];
     auto &hp = header_paths[i];
     bool has = false;
+    bool declares_public = false;
     for (auto &item : m.items) {
       auto fqn = fqn_of(item.ns_path, item.name);
       for (auto &mrf : out.macro_reachable) {
         if (matches_reachable(fqn, mrf)) { has = true; break; }
       }
-      if (has) break;
+      if (!declares_public &&
+          std::ranges::none_of(item.ns_path, [&](const std::string &seg) {
+            return std::regex_match(seg, internal_ns);
+          }))
+        declares_public = true;
+      if (has && declares_public) break;
     }
-    if (has) {
-      auto mod = derive_module_name(hp, library_name);
-      out.macro_modules.insert(std::move(mod));
-    }
+    auto mod = derive_module_name(hp, library_name);
+    if (has) out.macro_modules.insert(mod);
+    if (declares_public) out.public_api_modules.insert(std::move(mod));
   }
   return out;
 }
@@ -282,7 +300,7 @@ apply_routed_macro_markers(
 export struct RewriteBatchConfig {
   std::string module_name;
   std::string library_name;
-  std::set<std::string> macro_modules;
+  std::set<std::string> public_modules;
   std::map<std::string, std::set<std::string>> module_replaces;
   std::vector<std::string> defined_fqns;
   std::vector<std::string> fwd_declared_fqns;
@@ -329,7 +347,7 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
   o.extern_cxx_macro = cfg.extern_cxx_macro;
   o.extra_args = extra_args;
   o.import_std = cfg.import_std;
-  o.macro_modules = cfg.macro_modules;
+  o.public_modules = cfg.public_modules;
   o.internal_mode = cfg.internal_mode;
   o.module_replaces = cfg.module_replaces;
   o.defined_fqns = cfg.defined_fqns;

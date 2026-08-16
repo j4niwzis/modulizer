@@ -88,7 +88,7 @@ TEST(FullRewrite, FriendOfExternCxxClassGetsInjectedForwardDecl) {
   // extern "C++" entity, the module needs an `extern "C++"` forward
   // declaration before the friend, otherwise the friend's declaration attaches
   // to the module and conflicts with the global-module definition.
-  auto r = rewrite_header(data_path("friend_lib/def.h"), "friend_lib.def", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"friend_lib::Foo"}, .fwd_declared_fqns = {"friend_lib::Foo"}});
+  auto r = rewrite_header(data_path("friend_lib/def.h"), "friend_lib.def", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"friend_lib::Foo"}, .fwd_declared_fqns = {"friend_lib::Foo"}});
   EXPECT_NE(r.cc_content.find("extern \"C++\" class Foo;"),
             std::string::npos)
       << "a friend declaration of a cross-module extern \"C++\" class needs an "
@@ -100,7 +100,7 @@ TEST(FullRewrite, FriendTargetOfExternCxxClassGetsExternCxx) {
   // a `friend class B;` inside it. The friend declaration attaches to the
   // global module, so B's definition in the same module must also be
   // `extern "C++"` or it conflicts with the friend's global-module declaration.
-  auto r = rewrite_header(data_path("friend_lib/core.h"), "friend_lib.core", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"friend_lib::A"}, .fwd_declared_fqns = {"friend_lib::A"}});
+  auto r = rewrite_header(data_path("friend_lib/core.h"), "friend_lib.core", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"friend_lib::A"}, .fwd_declared_fqns = {"friend_lib::A"}});
   EXPECT_NE(r.h_content.find("FRIEND_LIB_EXPORT extern \"C++\" class A {"),
             std::string::npos)
       << "the cross-module class A must be extern \"C++\"";
@@ -282,7 +282,7 @@ TEST(FullRewrite, RedundantForwardDeclIsRemoved) {
   // a.h forward-declares Foo (defined in b.h, which a.h includes). The
   // defining header becomes an import, so the redundant forward declaration
   // must be deleted from the module.
-  auto r = rewrite_header(data_path("fwd_lib/a.h"), "fwd_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Foo"}});
+  auto r = rewrite_header(data_path("fwd_lib/a.h"), "fwd_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Foo"}});
   EXPECT_EQ(r.h_content.find("class Foo;"), std::string::npos)
       << "redundant forward declaration of an imported class must be removed";
 }
@@ -293,7 +293,7 @@ TEST(FullRewrite, CrossModuleForwardDeclGetsExternCxx) {
   // defining module's entity, so the declaration must be `extern "C++"` (a
   // global-module entity) to merge with the definition across modules. It must
   // not be exported (the defining module owns the export).
-  auto r = rewrite_header(data_path("fwd_lib/c.h"), "fwd_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Bar"}});
+  auto r = rewrite_header(data_path("fwd_lib/c.h"), "fwd_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Bar"}});
   EXPECT_NE(r.h_content.find("extern \"C++\" class Bar;"),
             std::string::npos)
       << "cross-module forward declaration must be extern \"C++\" so it "
@@ -311,7 +311,7 @@ TEST(FullRewrite, CrossModuleDefinitionGetsExternCxx) {
   // d.h defines Bar, which another module (c.h) forward-declares. The
   // definition must carry `extern "C++"` so it is the same entity as the
   // forward declaration in the other module.
-  auto r = rewrite_header(data_path("fwd_lib/d.h"), "fwd_lib.d", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Bar"}, .fwd_declared_fqns = {"fwd_lib::Bar"}});
+  auto r = rewrite_header(data_path("fwd_lib/d.h"), "fwd_lib.d", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Bar"}, .fwd_declared_fqns = {"fwd_lib::Bar"}});
   EXPECT_NE(r.h_content.find("FWD_LIB_EXPORT extern \"C++\" class Bar {"),
             std::string::npos)
       << "definition of a cross-module forward-declared class must be "
@@ -377,7 +377,7 @@ TEST(FullRewrite, ImplUnitKeepsUsedTransitiveSystemInclude) {
 TEST(FullRewrite, RedundantFunctionForwardDeclIsRemoved) {
   // h.h forward-declares format (defined inline in g.h, which h.h includes).
   // The redundant function forward declaration must be removed.
-  auto r = rewrite_header(data_path("fwd_lib/h.h"), "fwd_lib.h", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::format"}});
+  auto r = rewrite_header(data_path("fwd_lib/h.h"), "fwd_lib.h", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::format"}});
   EXPECT_EQ(r.h_content.find("std::string format(int value);"),
             std::string::npos)
       << "redundant function forward declaration must be removed";
@@ -387,7 +387,7 @@ TEST(FullRewrite, CrossModuleFunctionForwardDeclGetsExternCxx) {
   // i.h forward-declares render (defined in j.h, which i.h does NOT include).
   // The declaration must stay in the module as `extern "C++"` (a global-module
   // entity) so it merges with j.h's definition, without an export marker.
-  auto r = rewrite_header(data_path("fwd_lib/i.h"), "fwd_lib.i", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::render"}});
+  auto r = rewrite_header(data_path("fwd_lib/i.h"), "fwd_lib.i", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::render"}});
   EXPECT_NE(r.h_content.find("extern \"C++\" std::string render(int value);"),
             std::string::npos)
       << "cross-module function forward declaration must be extern \"C++\"";
@@ -401,7 +401,7 @@ TEST(FullRewrite, CrossModuleFunctionDefinitionGetsExternCxx) {
   // j.h defines render, which another module (i.h) forward-declares. The
   // definition must carry `extern "C++"` so it is the same entity as the
   // forward declaration in the other module.
-  auto r = rewrite_header(data_path("fwd_lib/j.h"), "fwd_lib.j", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::render"}, .fwd_declared_fqns = {"fwd_lib::render"}});
+  auto r = rewrite_header(data_path("fwd_lib/j.h"), "fwd_lib.j", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::render"}, .fwd_declared_fqns = {"fwd_lib::render"}});
   EXPECT_NE(r.h_content.find(
                 "FWD_LIB_EXPORT extern \"C++\" std::string render(int value)"),
             std::string::npos)
@@ -414,7 +414,7 @@ TEST(FullRewrite, InjectedCrossModuleForwardDeclGetsExternCxx) {
   // imported module) and defined in m.h (not imported here). The module needs
   // its own forward declaration, and it must be `extern "C++"` so it merges
   // with the defining module's entity.
-  auto r = rewrite_header(data_path("fwd_lib/k.h"), "fwd_lib.k", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Baz"}});
+  auto r = rewrite_header(data_path("fwd_lib/k.h"), "fwd_lib.k", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Baz"}});
   EXPECT_NE(r.cc_content.find(
                 "namespace fwd_lib {\nextern \"C++\" class Baz;\n}"),
             std::string::npos)
@@ -432,7 +432,7 @@ TEST(FullRewrite, InjectedSameModuleForwardDeclGetsExternCxx) {
   // [module.interface]/6 only implicitly exports redeclarations of an entity
   // *introduced* by an exported declaration, so the injected declaration
   // preceding the exported definition has to carry the export itself.
-  auto r = rewrite_header(data_path("fwd_lib/n.h"), "fwd_lib.n", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Baz"}, .fwd_declared_fqns = {"fwd_lib::Baz"}});
+  auto r = rewrite_header(data_path("fwd_lib/n.h"), "fwd_lib.n", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwd_lib::Baz"}, .fwd_declared_fqns = {"fwd_lib::Baz"}});
   EXPECT_NE(r.cc_content.find(
                 "namespace fwd_lib {\nexport extern \"C++\" class Baz;\n}"),
             std::string::npos)
@@ -449,7 +449,7 @@ TEST(FullRewrite, TemplateForwardDeclGetsExternCxx) {
   // does NOT include). The `extern "C++"` must be placed before the
   // `template <...>` clause; inserting it after the template parameter list is
   // ill-formed.
-  auto r = rewrite_header(data_path("tpl_lib/a.h"), "tpl_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Foo"}});
+  auto r = rewrite_header(data_path("tpl_lib/a.h"), "tpl_lib.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Foo"}});
   EXPECT_NE(r.h_content.find("extern \"C++\" template <typename T>"),
             std::string::npos)
       << "extern \"C++\" must precede the template clause";
@@ -464,7 +464,7 @@ TEST(FullRewrite, TemplateDefinitionGetsExternCxx) {
   // module). The definition AND its explicit specialization must carry
   // `extern "C++"` before the template clause so they merge with the other
   // module's declaration.
-  auto r = rewrite_header(data_path("tpl_lib/b.h"), "tpl_lib.b", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Foo"}, .fwd_declared_fqns = {"tpl_lib::Foo"}});
+  auto r = rewrite_header(data_path("tpl_lib/b.h"), "tpl_lib.b", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Foo"}, .fwd_declared_fqns = {"tpl_lib::Foo"}});
   EXPECT_NE(r.h_content.find("TPL_LIB_EXPORT extern \"C++\" template <typename T>"),
             std::string::npos)
       << "definition of a cross-module forward-declared class template must be "
@@ -523,7 +523,7 @@ TEST(FullRewrite, MemberTemplateDefinitionExternCxxBeforeOuterHeader) {
   // class and `template <typename U>` from the member). When the class is
   // extern "C++" the marker must go before the OUTERMOST template header, not
   // between the two headers (which is ill-formed C++).
-  auto r = rewrite_header(data_path("memtpl_lib/c.h"), "memtpl_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"memtpl_lib::Box"}, .fwd_declared_fqns = {"memtpl_lib::Box"}});
+  auto r = rewrite_header(data_path("memtpl_lib/c.h"), "memtpl_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"memtpl_lib::Box"}, .fwd_declared_fqns = {"memtpl_lib::Box"}});
   EXPECT_NE(r.h_content.find(
                 "extern \"C++\" template <typename T>\ntemplate <typename U>\n"
                 "Box<T>::Box(U)"),
@@ -541,7 +541,7 @@ TEST(FullRewrite, OutOfLineMemberInHeaderGetsExternCxx) {
   // extern "C++" (a global-module entity), the out-of-line member definition
   // must also be `extern "C++"`, or it would be a distinct module entity that
   // conflicts with the class's global-module member declaration.
-  auto r = rewrite_header(data_path("tpl_lib/c.h"), "tpl_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Baz"}, .fwd_declared_fqns = {"tpl_lib::Baz"}});
+  auto r = rewrite_header(data_path("tpl_lib/c.h"), "tpl_lib.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tpl_lib::Baz"}, .fwd_declared_fqns = {"tpl_lib::Baz"}});
   EXPECT_NE(r.h_content.find(
                 "extern \"C++\" template <typename T>\nBaz<T>::Baz()"),
             std::string::npos)
@@ -703,7 +703,7 @@ TEST(FullRewrite, ReachableStaticHelperIsExported) {
   // use. It is defined only in this header (no forward declaration in another
   // module), so it just needs `static` removed and a plain export — no extern
   // "C++" — for impl units importing the module to use it.
-  auto r = rewrite_header(data_path("helpremit_lib/api.h"), "helpremit_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"helpremit_lib::foo"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
+  auto r = rewrite_header(data_path("helpremit_lib/api.h"), "helpremit_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"helpremit_lib::foo"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
   EXPECT_NE(r.h_content.find(
                 "HELPREMIT_LIB_EXPORT void foo()"),
             std::string::npos)
@@ -747,7 +747,7 @@ TEST(FullRewrite, ReachableStaticTemplateIsExported) {
   // defined in this header (no cross-module forward declaration), so `static`
   // is stripped and it is exported as a plain template — no extern "C++" —
   // for impl units to use.
-  auto r = rewrite_header(data_path("statreach_lib/api.h"), "statreach_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"statreach_lib::Delete"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
+  auto r = rewrite_header(data_path("statreach_lib/api.h"), "statreach_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"statreach_lib::Delete"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
   EXPECT_NE(r.h_content.find("STATREACH_LIB_EXPORT template "
                              "<typename T>\nvoid Delete"),
             std::string::npos)
@@ -761,7 +761,7 @@ TEST(FullRewrite, InternalCrossModuleClassIsExported) {
   // Foo lives in an internal namespace but its members are defined in an
   // impl unit (a different module), so it is extern "C++" AND must be exported
   // for the impl unit to see its declaration.
-  auto r = rewrite_header(data_path("internexport_lib/api.h"), "internexport_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {"internexport_lib::internal::Foo"}});
+  auto r = rewrite_header(data_path("internexport_lib/api.h"), "internexport_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {"internexport_lib::internal::Foo"}});
   EXPECT_NE(r.h_content.find(
                 "INTERNEXPORT_LIB_EXPORT extern \"C++\" class Foo"),
             std::string::npos)
@@ -820,7 +820,7 @@ TEST(FullRewrite, CrossModuleFunctionInImplGetsExternCxx) {
   EXPECT_NE(r.content.find("extern \"C++\" int render("), std::string::npos)
       << "the impl definition of a cross-module free function must be "
          "extern \"C++\"";
-  auto h = rewrite_header(data_path("crossimpl/decl.h"), "crossimpl.decl", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"crossimpl::render"}, .fwd_declared_fqns = {"crossimpl::render"}});
+  auto h = rewrite_header(data_path("crossimpl/decl.h"), "crossimpl.decl", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"crossimpl::render"}, .fwd_declared_fqns = {"crossimpl::render"}});
   EXPECT_NE(h.h_content.find("extern \"C++\" int render("),
             std::string::npos)
       << "the header declaration of a cross-module free function must also be "
@@ -837,7 +837,7 @@ TEST(FullRewrite, CrossModuleVariableInImplGetsExternCxx) {
             std::string::npos)
       << "the impl definition of a cross-module variable must be "
          "extern \"C++\"";
-  auto h = rewrite_header(data_path("crossimpl/vars.h"), "crossimpl.vars", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"crossimpl::g_render_count"}, .fwd_declared_fqns = {"crossimpl::g_render_count"}});
+  auto h = rewrite_header(data_path("crossimpl/vars.h"), "crossimpl.vars", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"crossimpl::g_render_count"}, .fwd_declared_fqns = {"crossimpl::g_render_count"}});
   EXPECT_NE(h.h_content.find("CROSSIMPL_EXPORT extern \"C++\" int g_render_count"),
             std::string::npos)
       << "the header declaration of a cross-module variable must also be "
@@ -918,7 +918,7 @@ TEST(FullRewrite, OutOfLineStaticMemberVarClassGetsExternCxx) {
   // staticvar.cc defines Baz::count (a static member variable) out-of-line.
   // Baz is declared in api2.h (a different module), so its header
   // definition must be `extern "C++"`.
-  auto h = rewrite_header(data_path("impl_lib/api2.h"), "impl_lib.api2", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .macro_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"impl_lib::Baz"}, .fwd_declared_fqns = {"impl_lib::Baz"}});
+  auto h = rewrite_header(data_path("impl_lib/api2.h"), "impl_lib.api2", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"impl_lib::Baz"}, .fwd_declared_fqns = {"impl_lib::Baz"}});
   EXPECT_NE(h.h_content.find("IMPL_LIB_EXPORT extern \"C++\" class Baz"),
             std::string::npos)
       << "a class whose static member variable is defined in an impl module "
