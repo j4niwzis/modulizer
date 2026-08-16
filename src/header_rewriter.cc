@@ -257,6 +257,44 @@ bool block_covers_every_platform(std::string_view body) {
   return false;
 }
 
+// Conditional nesting at `off`, NOT counting the file's own include guard: the
+// guard wraps everything, so counting it would call every line conditional.
+// A guard is an `#ifndef X` whose next line is `#define X`.
+unsigned conditional_depth_at(const std::string &src, unsigned off) {
+  unsigned depth = 0;
+  bool guard_open = false;
+  std::size_t pos = 0;
+  std::string_view sv(src);
+  while (pos < sv.size() && pos < off) {
+    auto nl = sv.find('\n', pos);
+    if (nl == std::string_view::npos) nl = sv.size();
+    auto line = sv.substr(pos, nl - pos);
+    if (auto d = parse_directive(line)) {
+      if (d->keyword.starts_with("if")) {
+        bool is_guard = false;
+        if (!guard_open && depth == 0 && d->keyword == "ifndef") {
+          auto name = d->after.substr(0, d->after.find_first_of(" \t\r"));
+          auto n2 = sv.find('\n', nl + 1);
+          auto next = sv.substr(nl + 1, (n2 == std::string_view::npos ? sv.size()
+                                                                      : n2) -
+                                            (nl + 1));
+          if (auto d2 = parse_directive(next))
+            is_guard = d2->keyword == "define" &&
+                       d2->after.substr(0, d2->after.find_first_of(" \t\r")) ==
+                           name;
+        }
+        if (is_guard) guard_open = true;
+        else ++depth;
+      } else if (d->keyword == "endif") {
+        if (depth > 0) --depth;
+        else guard_open = false;
+      }
+    }
+    pos = nl + 1;
+  }
+  return depth;
+}
+
 // Source ranges of the conditional blocks emitted verbatim. A `#define` inside
 // one of them travels with its block and must not be emitted a second time as a
 // bare definition — which would drop its condition and hand every platform the
@@ -877,8 +915,28 @@ export HeaderRewriteResult rewrite_header(
         //   error: token is not a valid binary operator in a preprocessor
         //          subexpression
         if (inc.transitive) continue;
+        // A conditional include is only reachable when its condition holds —
+        // `#ifdef _WIN32_WCE` around a Windows header. Copying it here without
+        // that condition asks every platform for a header only one of them
+        // has:
+        //
+        //   fatal error: 'winapifamily.h' file not found
+        if (conditional_depth_at(original, inc.offset) > 0) continue;
         if (auto_imports.count(inc.path)) continue;
         if (is_generated_macro_header(inc.path)) continue;
+        // Never a standard-library header. Nothing in `<string>` defines the
+        // kind of function-like configuration macro a condition calls, and a
+        // consumer of this macros file imports std — a textual copy of the
+        // same declarations beside that import is what the conversion exists
+        // to remove:
+        //
+        //   error: type alias template redefinition with different types
+        //   error: requires clause differs in template redeclaration
+        {
+          auto resolved =
+              resolve_include(inc.path, header_path.str(), options.extra_args);
+          if (resolved.empty() || resolved_in_system_dir(resolved)) continue;
+        }
         block_support_includes.push_back(
             inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
                           : std::format("#include <{}>\n", inc.path));
