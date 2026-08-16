@@ -392,7 +392,8 @@ std::string assemble_interface_cc(
     const std::vector<std::pair<std::vector<std::string>, std::string>>
         &fwd_decls,
     const std::string &hdr, llvm::StringRef header_path,
-    const std::vector<std::string> &redefined_macros = {}) {
+    const std::vector<std::string> &redefined_macros = {},
+    const std::string &export_include = {}) {
   std::string cc;
   if (!header_comment.empty()) cc += header_comment + "\n\n";
   cc += "module;\n";
@@ -438,6 +439,11 @@ std::string assemble_interface_cc(
   // below — must be inside the extern "C++" block to merge with the
   // definitions emitted there.
   if (options.extern_cxx) {
+    // The injected declarations below carry the marker whose expansion depends
+    // on this same wrapping, and the header that defines it is included only
+    // further down. Bring the definitions in first — the export header is
+    // nothing but #defines.
+    if (!export_include.empty()) cc += export_include;
     if (!options.extern_cxx_macro.empty())
       cc += std::format("#ifdef {}\n", options.extern_cxx_macro);
     cc += "extern \"C++\" {\n";
@@ -591,6 +597,27 @@ export HeaderRewriteResult rewrite_header(
   auto std_import_guard = prefix + "_IMPORT_STD";
   auto std_use_guard = prefix + "_USE_IMPORT_STD";
   auto export_macro = prefix + "_EXPORT";
+  // A second marker, for a declaration of an entity that another module
+  // defines. Whether it is exported depends on how the tree is BUILT, not on
+  // how it was generated: wrapped, the entity is attached to the global module
+  // and importers have to find this declaration to merge with it; unwrapped, it
+  // stays attached to its own module, where exporting it from here would
+  // declare a second entity of the same name in a second module.
+  // A declaration of an entity another module defines is exported either way —
+  // that is what lets an importer merge with it instead of declaring its own —
+  // and unwrapped it also needs the `extern "C++"` the wrapping would otherwise
+  // have given it, or it attaches to the module declaring it and stops being
+  // the same entity as the definition.
+  auto shared_linkage_macro = prefix + "_EXTERN_CXX_DECL";
+  // Stands where such a declaration's own `extern` keyword was. Wrapped, the
+  // block's braces mean the declaration is not DIRECTLY contained in the
+  // linkage-specification, so [dcl.link]/7 does not supply the keyword and it
+  // has to keep it; unwrapped, `extern "C++"` contains it directly and does.
+  // It stays in the keyword's place rather than joining the marker at the
+  // front, because an attribute may sit between the two and a standard
+  // attribute in the middle of the decl-specifiers is ill-formed.
+  auto extern_decl_macro = prefix + "_EXTERN_DECL";
+  auto shared_marker = std::format("{} {}", export_macro, shared_linkage_macro);
 
   auto includes = parse_includes(original);
   // Transitive includes: system headers go to the GMF; quoted library
@@ -623,9 +650,10 @@ export HeaderRewriteResult rewrite_header(
                                                    macros));
         return std::make_unique<HeaderRewriteConsumer>(
             ci.getASTContext(), mods, internal_re, export_macro,
+            shared_marker, shared_linkage_macro, extern_decl_macro,
             options.reachable_fqns, result.internal_fqns, options.no_internal_filter,
             &used_headers, options.defined_fqns, &fwd_decls, options.extern_cxx,
-            options.fwd_declared_fqns, options.same_module_free_fqns,
+            options.extern_cxx_macro, options.fwd_declared_fqns, options.same_module_free_fqns,
             options.library_headers.empty() ? nullptr : &options.library_headers,
             &result.external_macro_mods);
       });
@@ -708,6 +736,21 @@ export HeaderRewriteResult rewrite_header(
       "#define {1}\n"
       "#endif\n",
       use_modules_macro, export_macro);
+  // The wrapping gives every entity in the purview C++ language linkage in the
+  // global module. Where it is absent, a declaration of an entity another
+  // module defines has to ask for that linkage itself.
+  if (!options.extern_cxx) {
+    prelude += std::format("#define {} extern \"C++\"\n", shared_linkage_macro);
+    prelude += std::format("#define {}\n", extern_decl_macro);
+  } else if (options.extern_cxx_macro.empty()) {
+    prelude += std::format("#define {}\n", shared_linkage_macro);
+    prelude += std::format("#define {} extern\n", extern_decl_macro);
+  } else {
+    prelude += std::format(
+        "#ifdef {0}\n#define {1}\n#define {2} extern\n"
+        "#else\n#define {1} extern \"C++\"\n#define {2}\n#endif\n",
+        options.extern_cxx_macro, shared_linkage_macro, extern_decl_macro);
+  }
 
   // The export header is shared by every header of the library. It lives at
   // the library's include root (`mylib/mylib-export.h`) when the library uses
@@ -898,7 +941,7 @@ export HeaderRewriteResult rewrite_header(
       std_use_guard, macros_name,
       !export_macros.empty() || !extra_macro_includes.empty(), options,
       gmf_incs, purview_imports, fwd_decls, hdr, header_path,
-      redefined_macros);
+      redefined_macros, export_include);
 
   return result;
 }
@@ -1049,14 +1092,28 @@ export SourceRewriteResult rewrite_source(
   // interface declares them that way (cross-module forward-declared entities).
   // Also run when the source defines `main` (which may not be a module entity).
   bool has_main = original.contains("main(");
-  if (!extern_cxx && (!fwd_declared_fqns.empty() || has_main)) {
+  // Also when the tree is generated WITH the wrapping: the body still has to
+  // say what linkage its definitions have, because the wrapping is chosen when
+  // the tree is BUILT. Built wrapped, the marker expands to nothing and the
+  // purview block covers everything; built unwrapped, it is the `extern "C++"`
+  // that keeps a definition the same entity as the declaration it matches.
+  if (!fwd_declared_fqns.empty() || has_main) {
     std::set<std::string> fwd_set(fwd_declared_fqns.begin(),
                                   fwd_declared_fqns.end());
+    std::string marker = "extern \"C++\" ";
+    std::string wrap_guard;
+    if (extern_cxx) {
+      if (extern_cxx_macro.empty()) return result;  // always wrapped: no marker
+      auto prefix = extern_cxx_macro.substr(
+          0, extern_cxx_macro.size() - std::strlen("_EXTERN_CXX"));
+      marker = prefix + "_EXTERN_CXX_DECL ";
+      wrap_guard = extern_cxx_macro;
+    }
     clang::tooling::ClangTool extern_tool(db, sources);
     VisitorFrontendActionFactory extern_factory(
         [&](clang::CompilerInstance &ci) {
           return std::make_unique<ExternCxxDefsConsumer>(
-              ci.getASTContext(), fwd_set, deletions);
+              ci.getASTContext(), fwd_set, deletions, marker, wrap_guard);
         });
     extern_tool.run(&extern_factory);
   }
@@ -1371,6 +1428,17 @@ export SourceRewriteResult rewrite_source(
     // Tells the body it is being compiled as part of a module unit, so it
     // leaves the imports below to this preamble.
     out += std::format("#define {} 1\n", module_unit_macro);
+    // The body carries these markers on its cross-module definitions, and its
+    // own includes are compiled out here, so nothing would define them.
+    if (!extern_cxx_macro.empty()) {
+      auto pfx = extern_cxx_macro.substr(
+          0, extern_cxx_macro.size() - std::strlen("_EXTERN_CXX"));
+      out += std::format(
+          "#ifndef {1}\n#ifdef {0}\n#define {1}\n#define {2} extern\n"
+          "#else\n#define {1} extern \"C++\"\n#define {2}\n"
+          "#endif\n#endif\n",
+          extern_cxx_macro, pfx + "_EXTERN_CXX_DECL", pfx + "_EXTERN_DECL");
+    }
     out += std::format("#include \"{}\"\n",
                        body_include.empty()
                            ? std::format("../{}.cc", fs_stem)

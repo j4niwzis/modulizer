@@ -18,6 +18,9 @@ public:
   HeaderRewriteConsumer(clang::ASTContext &ctx,
                         std::vector<ModPoint> &mods, const std::regex &re,
                         std::string_view export_macro,
+                        std::string_view shared_export_macro,
+                        std::string_view linkage_macro,
+                        std::string_view extern_decl_macro,
                         const std::vector<std::string> &reachable_fqns,
                         std::vector<std::string> &internal_fqns,
                         bool no_internal_filter = false,
@@ -25,15 +28,20 @@ public:
                         const std::vector<std::string> &defined_fqns = {},
                         std::vector<std::pair<std::vector<std::string>, std::string>> *fwd_decls = nullptr,
                         bool extern_cxx = false,
+                        std::string_view extern_cxx_macro = {},
                         const std::vector<std::string> &fwd_declared_fqns = {},
                         const std::set<std::string> &same_module_free_fqns = {},
                         const std::set<std::string> *library_headers = nullptr,
                         std::map<std::string, std::vector<ModPoint>> *external_macro_mods = nullptr)
       : ctx(ctx), mods(mods), re(re), export_macro(export_macro),
+        shared_export_macro(shared_export_macro),
+        linkage_macro(linkage_macro),
+        extern_decl_macro(extern_decl_macro),
         reachable_fqns(reachable_fqns), internal_fqns(internal_fqns),
         no_internal_filter(no_internal_filter), used_headers(used_headers),
         defined_fqns(defined_fqns), fwd_decls(fwd_decls),
-        extern_cxx(extern_cxx), fwd_declared_fqns(fwd_declared_fqns),
+        extern_cxx(extern_cxx), extern_cxx_macro(extern_cxx_macro),
+        fwd_declared_fqns(fwd_declared_fqns),
         same_module_free_fqns(same_module_free_fqns),
         library_headers(library_headers),
         external_macro_mods(external_macro_mods) {}
@@ -48,6 +56,7 @@ public:
       fv.TraverseDecl(ctx.getTranslationUnitDecl());
     }
     HeaderVisitor visitor(ctx.getSourceManager(), mods, re, export_macro,
+                          shared_export_macro, linkage_macro, extern_decl_macro,
                           reachable_fqns, internal_fqns, no_internal_filter,
                           defined_fqns, extern_cxx, fwd_declared_fqns,
                           friend_extern_fqns, same_module_free_fqns,
@@ -187,6 +196,42 @@ public:
           ctx.getSourceManager().isBeforeInTranslationUnit(
               def->getLocation(), d->getLocation()))
         return;
+    }
+    // The declaration this module is about to copy may be the one it already
+    // sees: `d` can be the declaration in an INCLUDED library header, which the
+    // rewrite turns into an import. Whether it arrives through that import
+    // depends on how the tree is BUILT. Wrapped, the declaring module exports
+    // it (that is what the shared marker is for) and a copy here is not a spare
+    // but a second declaration of the same name, which both compilers reject,
+    // each in its own words:
+    //
+    //   error: declaration of 'X' in the global module follows declaration
+    //          in module lib.other
+    //   error: ambiguating new declaration of 'X'
+    //
+    // That holds however the tree is built: the declaration is exported either
+    // way, taking `extern "C++"` for itself where the wrapping is absent, so
+    // the import supplies it and this copy is never the only way to name it.
+    if (extern_cxx && !def && library_headers) {
+      auto &sm = ctx.getSourceManager();
+      auto loc = sm.getExpansionLoc(d->getLocation());
+      if (loc.isValid() && !sm.isInMainFile(loc)) {
+        auto fn = sm.getFilename(loc);
+        if (!fn.empty()) {
+          auto canon =
+              std::filesystem::weakly_canonical(std::filesystem::path(fn.str()))
+                  .string();
+          // The declaring module exports it either the ordinary way (public, or
+          // internal-and-reachable) or as a cross-module declaration, which is
+          // exported exactly so importers merge with it instead of copying it.
+          bool exported_there =
+              visible_via_import(fqn) ||
+              std::ranges::any_of(fwd_declared_fqns, [&](const std::string &f) {
+                return matches_reachable(fqn, f, /*symmetric=*/true);
+              });
+          if (library_headers->count(canon) && exported_there) return;
+        }
+      }
     }
     // The definition lives in another module (not visible in this TU). If that
     // module is imported AND exports the entity (an entity listed as reachable,
@@ -393,7 +438,7 @@ public:
       // export is what makes the declaration findable, and gcc takes the first
       // declaration of a name as the one that introduces it, so an unexported
       // one ahead of the definition leaves the entity unexported for good.
-      block += std::format("export {}\n", decl_text);
+      block += std::format("{} {}\n", shared_export_macro, decl_text);
     else if (exported && !cross_fwd)
       // A forward declaration of an entity this module defines as a plain
       // module entity: export it normally.
@@ -431,7 +476,11 @@ private:
   std::set<std::string> *used_headers = nullptr;
   const std::vector<std::string> &defined_fqns;
   std::vector<std::pair<std::vector<std::string>, std::string>> *fwd_decls;
+  std::string shared_export_macro;
+  std::string linkage_macro;
+  std::string extern_decl_macro;
   bool extern_cxx = false;
+  std::string extern_cxx_macro;
   const std::vector<std::string> &fwd_declared_fqns;
   const std::set<std::string> &same_module_free_fqns;
   const std::set<std::string> *library_headers = nullptr;

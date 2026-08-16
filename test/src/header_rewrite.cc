@@ -2130,13 +2130,26 @@ TEST(HeaderRewrite, WrappedPurviewExportsWhatItSharesAndInlinesConstants) {
       << "an exported constant needs inline to keep external linkage";
   EXPECT_EQ(r.h_content.find("extern \"C++\" class Worker"), std::string::npos)
       << "the wrapping supplies the linkage; no per-declaration marker";
-  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT class Worker;"),
+  // The marker for these is the one gated on the wrapping: exported when the
+  // tree is built wrapped, nothing when it is not — where the entity keeps
+  // module linkage and a second export would declare a second entity.
+  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT "
+                             "BLOCKMODE_LIB_EXTERN_CXX_DECL class Worker;"),
             std::string::npos)
       << "a declaration of an entity defined elsewhere must still be exported "
          "so importers merge with it instead of declaring their own";
-  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT void Run(int n);"),
+  EXPECT_NE(r.h_content.find("BLOCKMODE_LIB_EXPORT "
+                             "BLOCKMODE_LIB_EXTERN_CXX_DECL void Run(int n);"),
             std::string::npos)
       << "and the same for a function";
+  EXPECT_NE(r.export_h_content.find("#ifdef BLOCKMODE_LIB_EXTERN_CXX\n"
+                                    "#define BLOCKMODE_LIB_EXTERN_CXX_DECL\n"),
+            std::string::npos)
+      << "wrapped, the wrapping supplies the linkage and the marker adds none";
+  EXPECT_NE(r.export_h_content.find(
+                "#define BLOCKMODE_LIB_EXTERN_CXX_DECL extern \"C++\""),
+            std::string::npos)
+      << "unwrapped, the declaration asks for that linkage itself";
 }
 
 TEST(HeaderRewrite, ExternCxxWrappingCanBeSelectedAtBuildTime) {
