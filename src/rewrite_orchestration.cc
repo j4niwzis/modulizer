@@ -384,9 +384,17 @@ export std::vector<HeaderBatchOutcome> rewrite_header_batch(
     o.is_main_umbrella = is_main_umbrella;
 
     auto rel = header_output_relpath(src, cfg.library_name);
+    // The interface unit takes the header's name with a `.cc` extension. Match
+    // whatever extension the header actually has rather than `.h` alone: a
+    // library spelling its headers `.hpp` would otherwise get the same path
+    // back for both, and the unit written second would overwrite the first —
+    // leaving an interface unit that textually includes itself.
     auto rel_cc = rel;
-    if (rel_cc.ends_with(".h"))
-      rel_cc = rel_cc.substr(0, rel_cc.size() - 2) + ".cc";
+    auto slash = rel_cc.rfind('/');
+    auto dot = rel_cc.rfind('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+      rel_cc = rel_cc.substr(0, dot);
+    rel_cc += ".cc";
     // The umbrella's interface unit is written under its renamed module name so
     // it doesn't collide with the wrapper module that takes `<lib>.cc`. The file
     // uses `_umbrella.cc` / `-umbrella.cc` (matching the macro-header naming);
