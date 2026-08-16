@@ -28,7 +28,11 @@ esac
 FORK=${FORK:-https://github.com/j4niwzis/googletest-modules.git}
 GTEST_REPO=${GTEST_REPO:-https://github.com/google/googletest.git}
 GTEST_BASE=${GTEST_BASE:-49495eac}
-OUT=generated-tree-$LIBC-$STDLIB.tar.gz
+# Convert for GCC: the extern "C++" wrapping becomes selectable at build time
+# so the same tree serves a conforming implementation and GCC both.
+GCC_MODULES=${GCC_MODULES:-0}
+[ "$GCC_MODULES" = 1 ] && GCC_FLAG=--gcc-modules || GCC_FLAG=
+OUT=generated-tree-$LIBC-$STDLIB${GCC_FLAG:+-gcc}.tar.gz
 
 # Any non-empty std.compat list switches the emitted `import std;` to
 # `import std.compat;`; which C++ headers are actually replaced is detected per
@@ -81,7 +85,7 @@ ARGS="-x c++ -std=c++20 $PARSE_STDLIB -Wno-pragma-once-outside-header -resource-
       -DGTEST_ENABLE_CATCH_EXCEPTIONS_=1
       -Igoogletest/include -Igoogletest -Igooglemock/include -Igooglemock"
 FLAGS="--dual-impl --import-std --wrapper-module --hyphen-macros
-       --internal-mode=both --module-replaces=$STD_COMPAT"
+       --internal-mode=both $GCC_FLAG --module-replaces=$STD_COMPAT"
 STAGE=\$(mktemp -d)
 
 gtest_headers="googletest/include/gtest/*.h googletest/include/gtest/internal/*.h googletest/src/gtest-internal-inl.h"
