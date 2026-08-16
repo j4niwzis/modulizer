@@ -95,9 +95,12 @@ TEST(IncludeParse, ResolveIncludeFindsRelativeAndIncludeDirs) {
             "");
 }
 
-TEST(IncludeParse, AnnotateGuardsSkipsElifAndTracksElse) {
-  // An include under an active `#else` branch gets the negated guard; an
-  // include under an `#elif` branch is skipped from the GMF.
+TEST(IncludeParse, AnnotateGuardsCombinesElifBranchConditions) {
+  // A branch past the first is reached only when every branch before it was
+  // not, so its guard is its own condition plus their negations. A dispatch
+  // header — one implementation per branch, all defining the same entities —
+  // depends on that: without the negated priors the alternatives all look
+  // unconditional and land in the same translation unit at once.
   std::string src =
       "#if defined(A)\n"
       "#include \"a.h\"\n"
@@ -113,12 +116,14 @@ TEST(IncludeParse, AnnotateGuardsSkipsElifAndTracksElse) {
   EXPECT_EQ(incs[0].guard_stack.size(), 1u);
   EXPECT_NE(incs[0].guard_stack[0].find("#if defined(A)"),
             std::string::npos);
-  EXPECT_TRUE(incs[1].skip_gmf)
-      << "an include in an #elif branch must be skipped from the GMF";
+  EXPECT_FALSE(incs[1].skip_gmf);
+  ASSERT_EQ(incs[1].guard_stack.size(), 1u);
+  EXPECT_EQ(incs[1].guard_stack[0], "#if !(defined(A)) && (defined(B))\n")
+      << "an #elif include carries its own condition and the one it followed";
   EXPECT_FALSE(incs[2].skip_gmf);
-  EXPECT_EQ(incs[2].guard_stack.size(), 1u);
-  EXPECT_NE(incs[2].guard_stack[0].find("#if !("), std::string::npos)
-      << "an include under #else must carry the negated guard";
+  ASSERT_EQ(incs[2].guard_stack.size(), 1u);
+  EXPECT_EQ(incs[2].guard_stack[0], "#if !(defined(A)) && !(defined(B))\n")
+      << "an #else after an #elif negates every branch before it";
 }
 
 TEST(IncludeParse, AnnotateGuardsStripsFileIncludeGuard) {

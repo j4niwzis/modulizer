@@ -392,6 +392,9 @@ public:
   void record_type(clang::QualType t) {
     if (t.isNull()) return;
     t = t.getNonReferenceType();
+    // See VisitTypeLoc: the typedef is the name the code writes, and what it
+    // stands for is not a substitute for it.
+    if (auto *tt = t->getAs<clang::TypedefType>()) record_referenced(tt->getDecl());
     while (!t.isNull() && (t->isPointerType() || t->isArrayType())) {
       auto next = t->getPointeeType();
       if (next.isNull()) next = t->getAsArrayTypeUnsafe()
@@ -462,6 +465,16 @@ public:
       record_referenced(d);
       if (template_depth_ > 0) record(d);
     };
+    // A typedef is a name in its own right, and the one the code actually
+    // writes. `getAsTagDecl()` resolves straight through it to what it stands
+    // for — often a standard-library type, which is nobody's to export — so a
+    // module naming `lib::detail::handle_t` would find the defining module
+    // exporting nothing by that name:
+    //
+    //   error: declaration of 'handle_t' must be imported from module
+    //          'lib.detail.handle' before it is required
+    //
+    if (auto *tt = llvm::dyn_cast<clang::TypedefType>(t)) each(tt->getDecl());
     if (auto *td = t->getAsTagDecl()) { each(td); return true; }
     if (auto *tst = llvm::dyn_cast<clang::TemplateSpecializationType>(t)) {
       if (auto *td = tst->getTemplateName().getAsTemplateDecl()) each(td);

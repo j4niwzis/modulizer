@@ -62,6 +62,24 @@ TEST(FullRewrite, WrapperExportsOnlyPublicConsumerReachableInternals) {
       << "public API entities must always be re-exported";
 }
 
+TEST(FullRewrite, InternalTypedefNamedByAnotherModuleIsExported) {
+  // use.h writes `detail::handle_t`, a typedef defs.h declares. The name has to
+  // resolve where use.h's module is compiled, so defs.h's module must export
+  // it — and only recording the typedef itself will do: what it stands for is
+  // a builtin, which is nobody's to export.
+  //
+  //   error: declaration of 'handle_t' must be imported from module
+  //          'tdref_lib.defs' before it is required
+  //
+  std::vector<std::string> headers = {data_path("tdref_lib/defs.h"),
+                                      data_path("tdref_lib/use.h")};
+  auto scan = cross_module_template_body_referenced_fqns(headers,
+                                                         {"-I", gDataDir});
+  EXPECT_TRUE(std::ranges::contains(scan.referenced, "tdref_lib::detail::handle_t"))
+      << "a typedef another module names must be exported by the one "
+         "declaring it";
+}
+
 TEST(FullRewrite, InternalAliasUsedViaDependentNameIsExported) {
   // producer.h defines an alias template in an internal namespace, referenced
   // by another module through `typename Foo<...>::type`. The alias must

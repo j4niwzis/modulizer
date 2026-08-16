@@ -151,8 +151,10 @@ export struct IncludeRef {
 
 // Parse a single `#include "path"` / `#include <path>` line. Returns nullopt
 // when the line is not an include directive or has no path. `skip_hash_ws`
-// must mirror the caller's directive-parsing rules (parse_includes skips
-// spaces after '#'; the header rewriter's include-wrapping pass does not).
+// must mirror the caller's directive-parsing rules, and every pass that works
+// against the list `parse_includes` produced has to match it: `# include`,
+// indented under a conditional, is an include to one side and plain text to
+// the other.
 export std::optional<IncludeRef> parse_include_line(
     std::string_view line, bool skip_hash_ws = true) {
   auto d = parse_directive(line, skip_hash_ws, /*keyword_ends_crlf=*/false);
@@ -347,14 +349,58 @@ export std::string resolve_include(llvm::StringRef inc_path,
   return {};
 }
 
+// The condition a guard line tests, as an expression that can be combined into
+// a larger `#if`. A trailing line comment is dropped: the expression is about
+// to be parenthesised into the middle of a line, where `//` would comment out
+// everything after it.
+std::string guard_condition(std::string_view line) {
+  std::string_view s = line;
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+    s.remove_suffix(1);
+  auto hash = s.find('#');
+  if (hash == std::string_view::npos) return {};
+  auto i = hash + 1;
+  while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+  auto rest = s.substr(i);
+  auto arg = [&](std::size_t n) {
+    auto a = rest.substr(n);
+    if (auto c = a.find("//"); c != std::string_view::npos) a = a.substr(0, c);
+    auto ns = a.find_first_not_of(" \t");
+    if (ns == std::string_view::npos) return std::string_view();
+    a.remove_prefix(ns);
+    while (!a.empty() && (a.back() == ' ' || a.back() == '\t'))
+      a.remove_suffix(1);
+    return a;
+  };
+  auto name = [&](std::size_t n) {
+    auto a = arg(n);
+    auto e = a.find_first_of(" \t");
+    return e == std::string_view::npos ? a : a.substr(0, e);
+  };
+  if (rest.starts_with("ifdef")) return std::format("defined({})", name(5));
+  if (rest.starts_with("ifndef")) return std::format("!defined({})", name(6));
+  if (rest.starts_with("elif")) return std::format("({})", arg(4));
+  if (rest.starts_with("if")) return std::format("({})", arg(2));
+  return {};
+}
+
 export void annotate_guards(const std::string &src,
                             std::vector<IncludeDirective> &includes) {
   // guard_stack entry: {guard text, state} where state 0 = if-branch,
   // 1 = elif-branch, 2 = else-branch. Multi-line guards (state 3) are
   // tracked for nesting but never emitted to the GMF. The header's own
   // full-file include guard (file_guard) is tracked but never emitted.
+  //
+  // A branch past the first is only reached when every branch before it was
+  // not, so `cond` (this branch's own condition) and `prior` (the ones it had
+  // to fail) together are what guards an include inside it. A dispatch header
+  // — `#if <this platform> … #elif <that one> …`, each branch including a
+  // different implementation of the same entities — depends on it: without the
+  // negated priors every alternative would look unconditional at once.
   struct GuardRec {
     std::string text;
+    std::string cond;
+    std::vector<std::string> prior;
     int state = 0;
     bool file_guard = false;
   };
@@ -372,7 +418,9 @@ export void annotate_guards(const std::string &src,
         bool multiline = false;
         std::size_t nl = 0;
         auto full = read_guard_line(src, line_start, nl, &multiline);
-        guard_stack.push_back({std::move(full), multiline ? 3 : 0, false});
+        auto cond = multiline ? std::string() : guard_condition(full);
+        guard_stack.push_back(
+            {std::move(full), std::move(cond), {}, multiline ? 3 : 0, false});
         // The first directive at depth 0 of the form `#ifndef X` is a
         // candidate for the header's own include guard; it is confirmed
         // when `#define X` follows immediately.
@@ -390,11 +438,23 @@ export void annotate_guards(const std::string &src,
         }
         if (nl >= src.size()) i = src.size() - 1;
       } else if (kw == "elif") {
-        if (!guard_stack.empty() && guard_stack.back().state != 3)
-          guard_stack.back().state = 1;
+        if (!guard_stack.empty() && guard_stack.back().state != 3) {
+          auto &g = guard_stack.back();
+          bool multiline = false;
+          std::size_t nl = 0;
+          auto full = read_guard_line(src, line_start, nl, &multiline);
+          if (!g.cond.empty()) g.prior.push_back(g.cond);
+          g.cond = multiline ? std::string() : guard_condition(full);
+          g.state = g.cond.empty() ? 3 : 1;
+          if (nl >= src.size()) i = src.size() - 1;
+        }
       } else if (kw == "else") {
-        if (!guard_stack.empty() && guard_stack.back().state != 3)
-          guard_stack.back().state = 2;
+        if (!guard_stack.empty() && guard_stack.back().state != 3) {
+          auto &g = guard_stack.back();
+          if (!g.cond.empty()) g.prior.push_back(g.cond);
+          g.cond.clear();
+          g.state = 2;
+        }
       } else if (kw == "define" && pending_file_guard.has_value() &&
                  !guard_stack.empty()) {
         auto after = dir->after;
@@ -417,10 +477,8 @@ export void annotate_guards(const std::string &src,
       if (inc.transitive) continue;
       if (inc.offset >= line_start && inc.offset <= i && !guard_stack.empty()
           && inc.guard_stack.empty()) {
-        bool skip = false;
         std::vector<std::string> guards;
         for (auto &g : guard_stack) {
-          if (g.state == 1) { skip = true; break; }
           if (g.state == 3) {
             // Multi-line guards are kept: read_guard_line joins the
             // continuations into a single valid line (no backslash). They were
@@ -431,11 +489,25 @@ export void annotate_guards(const std::string &src,
             continue;
           }
           if (g.file_guard) continue;
-          if (g.state == 2) guards.push_back(negate_guard(g.text));
-          else guards.push_back(g.text);
+          // The first branch is its own condition, spelled the way the source
+          // spelled it. Anything later also has to say which branches it is
+          // standing in for; an `#else` after a single `#if` is just that one
+          // negated, which reads better as `#ifndef` than as `#if !(…)`.
+          if (g.prior.empty()) {
+            guards.push_back(g.state == 2 ? negate_guard(g.text) : g.text);
+            continue;
+          }
+          if (g.prior.size() == 1 && g.state == 2) {
+            guards.push_back(negate_guard(g.text));
+            continue;
+          }
+          std::string expr;
+          for (auto &p : g.prior)
+            expr += (expr.empty() ? "" : " && ") + std::format("!{}", p);
+          if (!g.cond.empty()) expr += " && " + g.cond;
+          guards.push_back(std::format("#if {}\n", expr));
         }
-        if (skip) inc.skip_gmf = true;
-        else inc.guard_stack = std::move(guards);
+        inc.guard_stack = std::move(guards);
       }
     }
     line_start = i + 1;

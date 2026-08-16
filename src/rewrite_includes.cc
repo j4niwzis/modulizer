@@ -372,7 +372,12 @@ export std::string wrap_includes_with_guard(
     auto line = std::string_view(hdr).substr(pos, nl - pos + 1);
     bool is_include = false;
     std::string inc_path;
-    auto inc = parse_include_line(line, /*skip_hash_ws=*/false);
+    // Same rules as parse_includes, which produced `includes`: a line it
+    // recorded and this pass does not recognise is left textual, and a library
+    // include left textual in a module unit defines that library's entities a
+    // second time. `# include` (indented under a conditional) is exactly the
+    // shape where the two used to disagree.
+    auto inc = parse_include_line(line, /*skip_hash_ws=*/true);
     if (inc && !is_xmacro_include(inc->path)) {
       inc_path = std::move(inc->path);
       is_include = true;
