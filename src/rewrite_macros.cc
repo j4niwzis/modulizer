@@ -139,7 +139,7 @@ std::string strip_block_includes(std::string full) {
     auto lnl = full.find('\n', lpos);
     if (lnl == std::string::npos) lnl = full.size();
     auto line = std::string_view(full).substr(lpos, lnl - lpos);
-    auto ld = parse_directive(line, /*skip_hash_ws=*/false,
+    auto ld = parse_directive(line, /*skip_hash_ws=*/true,
                               /*keyword_ends_crlf=*/true);
     bool keep = true;
     if (ld && ld->keyword == "include") {
@@ -235,7 +235,7 @@ export void extract_textual_macros(const std::string &original,
     auto nl = src.find('\n', pos);
     if (nl == std::string_view::npos) break;
     auto line = src.substr(pos, nl - pos);
-    auto d = parse_directive(line, /*skip_hash_ws=*/false,
+    auto d = parse_directive(line, /*skip_hash_ws=*/true,
                              /*keyword_ends_crlf=*/true);
     if (d) {
       auto &dir = d->keyword;
@@ -365,7 +365,7 @@ export OverrideGuardRange override_guard_with_code(const std::string &src,
   std::string_view gline(src.data() + guard_line);
   auto gnl = gline.find('\n');
   std::string_view gl = gnl == std::string_view::npos ? gline : gline.substr(0, gnl);
-  auto d = parse_directive(gl, /*skip_hash_ws=*/false,
+  auto d = parse_directive(gl, /*skip_hash_ws=*/true,
                            /*keyword_ends_crlf=*/true);
   if (!d) return out;
   std::string cond;
@@ -396,7 +396,7 @@ export OverrideGuardRange override_guard_with_code(const std::string &src,
     auto eol = src.find('\n', i);
     if (eol == std::string_view::npos) break;
     std::string_view line(src.data() + i, eol - i);
-    auto d2 = parse_directive(line, /*skip_hash_ws=*/false,
+    auto d2 = parse_directive(line, /*skip_hash_ws=*/true,
                               /*keyword_ends_crlf=*/true);
     if (d2) {
       auto &k = d2->keyword;
