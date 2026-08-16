@@ -412,6 +412,11 @@ public:
   }
   bool VisitCallExpr(clang::CallExpr *e) {
     if (!e || !in_main(e->getExprLoc())) return true;
+    // The type of the call itself — what the result IS. Reaching it through
+    // the callee's declaration does not always work (a member function is not
+    // a library entity in its own right), and this is the value the code goes
+    // on to use, so it is the one that has to be complete.
+    record_type(e->getType());
     auto each = [&](clang::NamedDecl *d) {
       record_referenced(d);
       record_signature_types(llvm::dyn_cast_or_null<clang::FunctionDecl>(d));

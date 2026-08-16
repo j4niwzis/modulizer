@@ -248,11 +248,25 @@ export bool is_xmacro_include(const std::string &path) {
 }
 
 export std::string read_file(llvm::StringRef path) {
+  // A directory opens as a stream, and its "size" is not one: tellg answers
+  // -1, which as a length is every byte there could ever be —
+  //
+  //   terminate called after throwing an instance of 'std::length_error'
+  //     what():  basic_string::_M_create
+  //
+  // and an include CAN resolve to a directory: `lib/detail/type_traits` names
+  // one, next to the `type_traits/negation.hpp` the header actually asked for.
+  // The tellg check stands on its own for anything else that opens but cannot
+  // be measured.
+  std::error_code ec;
+  if (!std::filesystem::is_regular_file(std::filesystem::path(path.str()), ec))
+    return {};
   std::ifstream f(std::string(path), std::ios::binary | std::ios::ate);
   if (!f) return {};
   auto sz = f.tellg();
+  if (sz < 0) return {};
   f.seekg(0);
-  std::string content(sz, '\0');
+  std::string content(static_cast<std::size_t>(sz), '\0');
   f.read(content.data(), sz);
   return content;
 }
