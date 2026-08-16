@@ -229,11 +229,17 @@ public:
     // That holds however the tree is built: the declaration is exported either
     // way, taking `extern "C++"` for itself where the wrapping is absent, so
     // the import supplies it and this copy is never the only way to name it.
-    // This applies to the unwrapped build too. The wrapping decides how the
-    // entity is spelled, not who owns it: either way the declaring module
-    // exports it and the import supplies it, so a copy here is redundant. When
-    // a definition IS visible, its file is the one carrying the marker, so ask
-    // about that one rather than the declaration this copy was taken from.
+    // The wrapping decides how an entity is SPELLED, not who owns it, so this
+    // holds either way: the declaring module exports the entity and the import
+    // supplies it, so a copy here is redundant. That rests on the declaring
+    // module actually exporting it — which it now does in both builds, the
+    // forward declaration of a cross-module entity included (see the
+    // kKeepPrivate branch in the header visitor). While one build exported it
+    // and the other did not, this said "exported" in a tree where it was not,
+    // and dropped the copy that was the only way to name it.
+    //
+    // When a definition IS visible, its file is the one carrying the marker, so
+    // ask about that one rather than the declaration this copy was taken from.
     if (library_headers) {
       auto &sm = ctx.getSourceManager();
       auto loc = sm.getExpansionLoc(def ? def->getLocation() : d->getLocation());

@@ -143,8 +143,9 @@ GmfAndImports classify_includes(
       // already be a textual include cycle.)
       if (inc.is_quoted && !inc.transitive &&
           !inc.path.contains("/custom/")) {
-        auto cl = classify_library_include(inc, library_name, header_path,
-                                           options.extra_args);
+        auto cl = classify_library_include(
+                                           inc, library_name, header_path, options.extra_args,
+                                           options.library_headers.empty() ? nullptr : &options.library_headers);
         if (cl.is_lib_include) {
           // In wrapper-module mode the umbrella module is renamed; sub-modules
           // that include the umbrella header must import the renamed module,
@@ -199,8 +200,9 @@ GmfAndImports classify_includes(
           // segment as the library root). The consumer's own code may use the
           // transitively-reached entities directly (the umbrella does not
           // re-export every sub-module), so import the derived module too.
-          auto cl = classify_library_include(inc, library_name, header_path,
-                                             options.extra_args);
+          auto cl = classify_library_include(
+                                             inc, library_name, header_path, options.extra_args,
+                                             options.library_headers.empty() ? nullptr : &options.library_headers);
           if (!cl.is_lib_include) continue;
           // In wrapper-module mode the umbrella module is renamed; a sub-module
           // that transitively reaches the umbrella header imports the renamed
@@ -817,10 +819,77 @@ export HeaderRewriteResult rewrite_header(
     imported_modules.insert("std.compat");
   }
 
+  // A conditional block is reproduced verbatim, and its condition is evaluated
+  // wherever this file is included. A condition that CALLS a macro — `#if
+  // LIB_WORKAROUND(LIB_GCC, < 60000)` — is a hard error where that macro is not
+  // defined, and the header got it from an include this file does not have:
+  //
+  //   error: function-like macro 'LIB_WORKAROUND' is not defined
+  //
+  // So carry the header's includes, but only for that case. Doing it whenever a
+  // block exists would drag system headers along with it, and those must not be
+  // here: the consumer has the imported modules for those declarations, and a
+  // textual copy redefines what their global module fragments already carry.
+  // A plain `#ifdef` of an undefined name needs nothing — it is simply false.
+  // A library header of our own is never carried: it becomes an import, and its
+  // macros arrive through the chain of generated macros files above.
+  std::vector<std::string> block_support_includes;
+  {
+    std::set<std::string> own;
+    for (auto &m : export_macros)
+      if (!m.name.empty()) own.insert(m.name);
+    for (auto &m : impl_macros)
+      if (!m.name.empty()) own.insert(m.name);
+    auto condition_calls_foreign_macro = [&](std::string_view cond) {
+      for (std::size_t i = 0; i < cond.size(); ++i) {
+        if (!is_ident_char(cond[i]) || (i && is_ident_char(cond[i - 1]))) continue;
+        auto j = i;
+        while (j < cond.size() && is_ident_char(cond[j])) ++j;
+        auto k = j;
+        while (k < cond.size() && (cond[k] == ' ' || cond[k] == '\t')) ++k;
+        if (k >= cond.size() || cond[k] != '(') continue;
+        auto id = std::string(cond.substr(i, j - i));
+        if (id != "defined" && !own.count(id)) return true;
+      }
+      return false;
+    };
+    bool needs = false;
+    for (auto &m : export_macros) {
+      if (!m.name.empty() || m.end_off <= m.start_off) continue;
+      std::string_view body(m.body);
+      for (std::size_t pos = 0; pos < body.size() && !needs;) {
+        auto nl = body.find('\n', pos);
+        if (nl == std::string_view::npos) nl = body.size();
+        auto d = parse_directive(body.substr(pos, nl - pos));
+        if (d && (d->keyword == "if" || d->keyword == "elif") &&
+            condition_calls_foreign_macro(d->after))
+          needs = true;
+        pos = nl + 1;
+      }
+      if (needs) break;
+    }
+    if (needs) {
+      for (auto &inc : includes) {
+        // Only what the header writes itself. A transitive include is reached
+        // through the header that owns it and often may not be included any
+        // other way — writing one here puts it outside the context it expects:
+        //
+        //   error: token is not a valid binary operator in a preprocessor
+        //          subexpression
+        if (inc.transitive) continue;
+        if (auto_imports.count(inc.path)) continue;
+        if (is_generated_macro_header(inc.path)) continue;
+        block_support_includes.push_back(
+            inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
+                          : std::format("#include <{}>\n", inc.path));
+      }
+    }
+  }
+
   if (!export_macros.empty() || !extra_macro_includes.empty()) {
     result.macros_content = build_macros_file(
-        export_macros, extra_macro_includes, block_defined_names, block_ranges,
-        original, mods, export_include);
+        export_macros, extra_macro_includes, block_support_includes,
+        block_defined_names, block_ranges, original, mods, export_include);
     result.macros_name = macros_name;
     // The macro definitions moved out of the header into the macros file, and
     // the body still uses them (`GTEST_INTERNAL_HAS_INCLUDE(<span>)`). The

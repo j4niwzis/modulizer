@@ -337,21 +337,24 @@ public:
       apply_fwd_action(rd, action);
       if (action == FwdAction::kDelete) return true;
       if (action == FwdAction::kKeepPrivate) {
-        // The defining module is not imported here: keep the declaration as a
-        // global-module entity so it merges with the definition.
-        // Without the wrapping the defining module owns the export and this
-        // declaration stays module-private, merging with the definition through
-        // the global module.
-        if (!extern_cxx) {
-          make_extern_cxx(rd);
-          return true;  // not exported
-        }
-        // With it, being in the global module is not enough to make this ONE
-        // entity: a module that cannot see this declaration introduces its own
-        // and the two never merge, so every use across the boundary mismatches
+        // The defining module is not imported here, so this declaration has to
+        // be a global-module entity that merges with the definition. Being in
+        // the global module is not enough to make it ONE entity, though: a
+        // module that cannot see this declaration introduces its own and the
+        // two never merge, so every use across the boundary mismatches
         // ("ambiguating new declaration"). The export is what lets importers
-        // find and merge with it; the marker carries the `extern "C++"` for
-        // whichever way the tree is then built.
+        // find and merge with it.
+        //
+        // The same either way. The wrapping decides how the marker is SPELLED —
+        // it expands to `extern "C++"` where the wrapping is absent and to
+        // nothing where the enclosing block already supplies it — not whether
+        // the declaration is exported. Leaving it unexported without the
+        // wrapping made the two builds disagree about what a module offers, and
+        // an importer that was told the entity is exported found nothing:
+        //
+        //   error: declaration of 'X' must be imported from module 'lib.other'
+        //          before it is required
+        //   note: declaration here is not visible
         addExport(rd, /*need_extern_cxx=*/false, /*shared=*/true);
         return true;
       }
