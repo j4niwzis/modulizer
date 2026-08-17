@@ -1477,6 +1477,28 @@ TEST(HeaderRewrite, MacroDeclaredEntitiesCarryExportInMacrosFile) {
          "file";
 }
 
+TEST(HeaderRewrite, SpecifierMacroDoesNotTakeTheMarkerWithIt) {
+  // `SPECMACRO_LIB_CONSTEXPR int answer()` begins inside a macro defined in
+  // another library header, so the declaration's begin location spells there —
+  // the same shape as a macro that declares an entity, which routes its marker
+  // into the defining header. This one declares nothing: the marker belongs at
+  // the declaration, and routing it away leaves `answer` unexported and the
+  // keyword exported wherever it expands.
+  auto config = data_path("specmacro_lib/config.h");
+  auto api = data_path("specmacro_lib/api.h");
+  auto canon = [](const std::string &p) {
+    return std::filesystem::weakly_canonical(std::filesystem::path(p)).string();
+  };
+  auto r = rewrite_header(api, "specmacro_lib.api",
+                          {.extra_args = {"-I", gDataDir},
+                           .library_headers = {canon(config), canon(api)}});
+  EXPECT_NE(r.h_content.find("SPECMACRO_LIB_EXPORT SPECMACRO_LIB_CONSTEXPR int answer"),
+            std::string::npos)
+      << "the declaration keeps its own marker";
+  EXPECT_TRUE(r.external_macro_mods.empty())
+      << "nothing is owed to the header that spells the specifier";
+}
+
 TEST(HeaderRewrite, CrossFileMacroBodyCarriesExportInDefiningMacrosFile) {
   // The macro is defined in defs.h but INVOKED in use.h (the
   // declaration-macro pattern: defined in one header, invoked in another).
