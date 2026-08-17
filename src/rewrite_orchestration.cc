@@ -88,8 +88,8 @@ std::string canonical_path(llvm::StringRef p) {
 // `mylib`) maps to `internal/mylib-port.h`, so headers that share a basename
 // (e.g. mylib-port.h in different directories) never collide. Falls back to
 // the flat basename when the path has no library-root segment.
-std::string header_output_relpath(llvm::StringRef header_path,
-                                  llvm::StringRef library_name) {
+export std::string header_output_relpath(llvm::StringRef header_path,
+                                         llvm::StringRef library_name) {
   auto segs = split_path(header_path);
   std::size_t start = segs.size();
   for (std::size_t i = 0; i < segs.size(); ++i) {
@@ -314,6 +314,12 @@ export struct RewriteBatchConfig {
   // Per header: modules it must import because it names entities they define
   // without including the headers that do. See the cli site that builds it.
   std::map<std::string, std::set<std::string>> extra_imports;
+  // Per header: the flags that make it parse. A header written to be included
+  // from one particular point does not parse anywhere else, and a rewrite
+  // driven by the wreckage of such a parse is worth nothing — the exports are
+  // computed from declarations clang could not finish reading. See
+  // discover_header_contexts.
+  std::map<std::string, std::vector<std::string>> context_args;
   bool extern_cxx = false;
   // Name of the macro the extern "C++" wrapping is written behind, or empty
   // for an unconditional block. See RewriteOptions::extern_cxx_macro.
@@ -354,6 +360,10 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
   o.extern_cxx = cfg.extern_cxx;
   o.extern_cxx_macro = cfg.extern_cxx_macro;
   o.extra_args = extra_args;
+  if (auto it = cfg.context_args.find(std::string(src));
+      it != cfg.context_args.end())
+    o.extra_args.insert(o.extra_args.end(), it->second.begin(),
+                        it->second.end());
   o.import_std = cfg.import_std;
   o.public_modules = cfg.public_modules;
   o.no_internal_filter = cfg.no_internal_filter;

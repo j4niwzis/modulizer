@@ -671,6 +671,180 @@ export std::vector<std::string> macros_redefined_by_header(
   return out;
 }
 
+namespace {
+
+// Includes the generated macros file needs beside the macros themselves.
+// A conditional block is reproduced verbatim, and its condition is evaluated
+// wherever this file is included. A condition that CALLS a macro — `#if
+// LIB_WORKAROUND(LIB_GCC, < 60000)` — is a hard error where that macro is not
+// defined, and the header got it from an include this file does not have:
+//
+//   error: function-like macro 'LIB_WORKAROUND' is not defined
+//
+// So carry the header's includes, but only for that case. Doing it whenever a
+// block exists would drag system headers along with it, and those must not be
+// here: the consumer has the imported modules for those declarations, and a
+// textual copy redefines what their global module fragments already carry.
+// A plain `#ifdef` of an undefined name needs nothing — it is simply false.
+// A library header of our own is never carried: it becomes an import, and its
+// macros arrive through the chain of generated macros files above.
+std::vector<std::string> macros_file_support_includes(
+    const std::vector<MacroRec> &export_macros,
+    const std::vector<MacroRec> &impl_macros,
+    const std::vector<IncludeDirective> &includes,
+    const std::string &original,
+    const std::map<std::string, std::string> &auto_imports,
+    llvm::StringRef header_path, const RewriteOptions &options) {
+  std::vector<std::string> block_support_includes;
+  std::set<std::string> own;
+  for (auto &m : export_macros)
+    if (!m.name.empty()) own.insert(m.name);
+  for (auto &m : impl_macros)
+    if (!m.name.empty()) own.insert(m.name);
+  auto condition_calls_foreign_macro = [&](std::string_view cond) {
+    for (std::size_t i = 0; i < cond.size(); ++i) {
+      if (!is_ident_char(cond[i]) || (i && is_ident_char(cond[i - 1]))) continue;
+      auto j = i;
+      while (j < cond.size() && is_ident_char(cond[j])) ++j;
+      auto k = j;
+      while (k < cond.size() && (cond[k] == ' ' || cond[k] == '\t')) ++k;
+      if (k >= cond.size() || cond[k] != '(') continue;
+      auto id = std::string(cond.substr(i, j - i));
+      if (id != "defined" && !own.count(id)) return true;
+    }
+    return false;
+  };
+  // A macro whose BODY names another macro this library does not define —
+  // `#define LIB_SPINLOCK_INIT { ATOMIC_FLAG_INIT }`. The name is expanded
+  // wherever the macros file is included, in a module that never sees the
+  // header defining it, so the header the source itself included has to come
+  // along even when it is a standard one. Under --import-std it cannot: a
+  // textual standard header beside `import std;` redeclares what the import
+  // already carries, and that trades one broken build for another.
+  auto body_names_foreign_macro = [&](std::string_view body) {
+    for (std::size_t i = 0; i < body.size(); ++i) {
+      if (!is_ident_char(body[i]) || (i && is_ident_char(body[i - 1]))) continue;
+      auto j = i;
+      while (j < body.size() && is_ident_char(body[j])) ++j;
+      auto id = body.substr(i, j - i);
+      i = j - 1;
+      // Only what is spelled like a macro: an all-caps name of some length.
+      // A lower-case identifier in a macro body is code, and code the macros
+      // file has no business dragging headers in for.
+      if (id.size() < 2) continue;
+      if (std::ranges::any_of(id, [](char c) { return c >= 'a' && c <= 'z'; }))
+        continue;
+      if (!own.count(std::string(id))) return true;
+    }
+    return false;
+  };
+  bool needs_system = false;
+  if (!options.import_std)
+    for (auto &m : export_macros)
+      if (!m.name.empty() && body_names_foreign_macro(m.body)) {
+        needs_system = true;
+        break;
+      }
+  bool needs = false;
+  for (auto &m : export_macros) {
+    if (!m.name.empty() || m.end_off <= m.start_off) continue;
+    std::string_view body(m.body);
+    for (std::size_t pos = 0; pos < body.size() && !needs;) {
+      auto nl = body.find('\n', pos);
+      if (nl == std::string_view::npos) nl = body.size();
+      auto d = parse_directive(body.substr(pos, nl - pos));
+      if (d && (d->keyword == "if" || d->keyword == "elif") &&
+          condition_calls_foreign_macro(d->after))
+        needs = true;
+      pos = nl + 1;
+    }
+    if (needs) break;
+  }
+  if (needs || needs_system) {
+    for (auto &inc : includes) {
+      // Only what the header writes itself. A transitive include is reached
+      // through the header that owns it and often may not be included any
+      // other way — writing one here puts it outside the context it expects:
+      //
+      //   error: token is not a valid binary operator in a preprocessor
+      //          subexpression
+      if (inc.transitive) continue;
+      // A conditional include is only reachable when its condition holds —
+      // `#ifdef _WIN32_WCE` around a Windows header. Copying it here without
+      // that condition asks every platform for a header only one of them
+      // has:
+      //
+      //   fatal error: 'winapifamily.h' file not found
+      if (conditional_depth_at(original, inc.offset) > 0) continue;
+      if (auto_imports.count(inc.path)) continue;
+      if (is_generated_macro_header(inc.path)) continue;
+      // Never a standard-library header. Nothing in `<string>` defines the
+      // kind of function-like configuration macro a condition calls, and a
+      // consumer of this macros file imports std — a textual copy of the
+      // same declarations beside that import is what the conversion exists
+      // to remove:
+      //
+      //   error: type alias template redefinition with different types
+      //   error: requires clause differs in template redeclaration
+      {
+        auto resolved =
+            resolve_include(inc.path, header_path.str(), options.extra_args);
+        if (resolved.empty()) continue;
+        if (resolved_in_system_dir(resolved) && !needs_system) continue;
+      }
+      block_support_includes.push_back(
+          inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
+                        : std::format("#include <{}>\n", inc.path));
+    }
+  }
+  return block_support_includes;
+}
+
+}  // namespace
+
+// Files that define the macros the header expands. A header included for its
+// macros alone is invisible to the AST — no declaration of its is referenced —
+// so nothing keeps it in the global module fragment once the header that
+// brought it in has become an import, and the body is left naming something
+// that no longer exists:
+//
+//   error: unknown type name 'BOOST_CXX14_CONSTEXPR'
+//
+// The whole include chain is recorded, not just the defining file: a library's
+// configuration header is a facade over a dozen private ones, and the facade
+// is what a program may include.
+class UsedMacroCollector : public clang::PPCallbacks {
+public:
+  UsedMacroCollector(const clang::SourceManager &sm, std::set<std::string> &used)
+      : sm(sm), used(used) {}
+
+  void MacroExpands(const clang::Token &, const clang::MacroDefinition &md,
+                    clang::SourceRange range, const clang::MacroArgs *) override {
+    auto use = sm.getExpansionLoc(range.getBegin());
+    if (!use.isValid() || !sm.isInMainFile(use)) return;
+    auto *mi = md.getMacroInfo();
+    if (!mi) return;
+    auto loc = mi->getDefinitionLoc();
+    if (!loc.isValid() || sm.isInMainFile(loc)) return;
+    auto f = sm.getFilename(loc);
+    if (f.empty()) return;
+    used.insert(f.str());
+    auto fid = sm.getFileID(loc);
+    for (unsigned guard = 0; guard < 64; ++guard) {
+      auto inc_loc = sm.getIncludeLoc(fid);
+      if (!inc_loc.isValid() || sm.isInMainFile(inc_loc)) break;
+      auto inc_f = sm.getFilename(inc_loc);
+      if (inc_f.empty()) break;
+      used.insert(inc_f.str());
+      fid = sm.getFileID(inc_loc);
+    }
+  }
+
+private:
+  const clang::SourceManager &sm;
+  std::set<std::string> &used;
+};
+
 export HeaderRewriteResult rewrite_header(
     llvm::StringRef header_path,
     llvm::StringRef module_name,
@@ -751,6 +925,9 @@ export HeaderRewriteResult rewrite_header(
         ci.getPreprocessor().addPPCallbacks(
             std::make_unique<HeaderMacroCollector>(ci.getSourceManager(),
                                                    macros));
+        ci.getPreprocessor().addPPCallbacks(
+            std::make_unique<UsedMacroCollector>(ci.getSourceManager(),
+                                                 used_headers));
         return std::make_unique<HeaderRewriteConsumer>(
             ci.getASTContext(), mods, internal_re, export_macro,
             shared_marker, shared_linkage_macro, extern_decl_macro,
@@ -939,124 +1116,9 @@ export HeaderRewriteResult rewrite_header(
     imported_modules.insert("std.compat");
   }
 
-  // A conditional block is reproduced verbatim, and its condition is evaluated
-  // wherever this file is included. A condition that CALLS a macro — `#if
-  // LIB_WORKAROUND(LIB_GCC, < 60000)` — is a hard error where that macro is not
-  // defined, and the header got it from an include this file does not have:
-  //
-  //   error: function-like macro 'LIB_WORKAROUND' is not defined
-  //
-  // So carry the header's includes, but only for that case. Doing it whenever a
-  // block exists would drag system headers along with it, and those must not be
-  // here: the consumer has the imported modules for those declarations, and a
-  // textual copy redefines what their global module fragments already carry.
-  // A plain `#ifdef` of an undefined name needs nothing — it is simply false.
-  // A library header of our own is never carried: it becomes an import, and its
-  // macros arrive through the chain of generated macros files above.
-  std::vector<std::string> block_support_includes;
-  {
-    std::set<std::string> own;
-    for (auto &m : export_macros)
-      if (!m.name.empty()) own.insert(m.name);
-    for (auto &m : impl_macros)
-      if (!m.name.empty()) own.insert(m.name);
-    auto condition_calls_foreign_macro = [&](std::string_view cond) {
-      for (std::size_t i = 0; i < cond.size(); ++i) {
-        if (!is_ident_char(cond[i]) || (i && is_ident_char(cond[i - 1]))) continue;
-        auto j = i;
-        while (j < cond.size() && is_ident_char(cond[j])) ++j;
-        auto k = j;
-        while (k < cond.size() && (cond[k] == ' ' || cond[k] == '\t')) ++k;
-        if (k >= cond.size() || cond[k] != '(') continue;
-        auto id = std::string(cond.substr(i, j - i));
-        if (id != "defined" && !own.count(id)) return true;
-      }
-      return false;
-    };
-    // A macro whose BODY names another macro this library does not define —
-    // `#define LIB_SPINLOCK_INIT { ATOMIC_FLAG_INIT }`. The name is expanded
-    // wherever the macros file is included, in a module that never sees the
-    // header defining it, so the header the source itself included has to come
-    // along even when it is a standard one. Under --import-std it cannot: a
-    // textual standard header beside `import std;` redeclares what the import
-    // already carries, and that trades one broken build for another.
-    auto body_names_foreign_macro = [&](std::string_view body) {
-      for (std::size_t i = 0; i < body.size(); ++i) {
-        if (!is_ident_char(body[i]) || (i && is_ident_char(body[i - 1]))) continue;
-        auto j = i;
-        while (j < body.size() && is_ident_char(body[j])) ++j;
-        auto id = body.substr(i, j - i);
-        i = j - 1;
-        // Only what is spelled like a macro: an all-caps name of some length.
-        // A lower-case identifier in a macro body is code, and code the macros
-        // file has no business dragging headers in for.
-        if (id.size() < 2) continue;
-        if (std::ranges::any_of(id, [](char c) { return c >= 'a' && c <= 'z'; }))
-          continue;
-        if (!own.count(std::string(id))) return true;
-      }
-      return false;
-    };
-    bool needs_system = false;
-    if (!options.import_std)
-      for (auto &m : export_macros)
-        if (!m.name.empty() && body_names_foreign_macro(m.body)) {
-          needs_system = true;
-          break;
-        }
-    bool needs = false;
-    for (auto &m : export_macros) {
-      if (!m.name.empty() || m.end_off <= m.start_off) continue;
-      std::string_view body(m.body);
-      for (std::size_t pos = 0; pos < body.size() && !needs;) {
-        auto nl = body.find('\n', pos);
-        if (nl == std::string_view::npos) nl = body.size();
-        auto d = parse_directive(body.substr(pos, nl - pos));
-        if (d && (d->keyword == "if" || d->keyword == "elif") &&
-            condition_calls_foreign_macro(d->after))
-          needs = true;
-        pos = nl + 1;
-      }
-      if (needs) break;
-    }
-    if (needs || needs_system) {
-      for (auto &inc : includes) {
-        // Only what the header writes itself. A transitive include is reached
-        // through the header that owns it and often may not be included any
-        // other way — writing one here puts it outside the context it expects:
-        //
-        //   error: token is not a valid binary operator in a preprocessor
-        //          subexpression
-        if (inc.transitive) continue;
-        // A conditional include is only reachable when its condition holds —
-        // `#ifdef _WIN32_WCE` around a Windows header. Copying it here without
-        // that condition asks every platform for a header only one of them
-        // has:
-        //
-        //   fatal error: 'winapifamily.h' file not found
-        if (conditional_depth_at(original, inc.offset) > 0) continue;
-        if (auto_imports.count(inc.path)) continue;
-        if (is_generated_macro_header(inc.path)) continue;
-        // Never a standard-library header. Nothing in `<string>` defines the
-        // kind of function-like configuration macro a condition calls, and a
-        // consumer of this macros file imports std — a textual copy of the
-        // same declarations beside that import is what the conversion exists
-        // to remove:
-        //
-        //   error: type alias template redefinition with different types
-        //   error: requires clause differs in template redeclaration
-        {
-          auto resolved =
-              resolve_include(inc.path, header_path.str(), options.extra_args);
-          if (resolved.empty()) continue;
-          if (resolved_in_system_dir(resolved) && !needs_system) continue;
-        }
-        block_support_includes.push_back(
-            inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
-                          : std::format("#include <{}>\n", inc.path));
-      }
-    }
-  }
+  auto block_support_includes = macros_file_support_includes(
+      export_macros, impl_macros, includes, original, auto_imports,
+      header_path, options);
 
   if (!export_macros.empty() || !extra_macro_includes.empty()) {
     result.macros_content = build_macros_file(

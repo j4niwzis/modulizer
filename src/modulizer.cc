@@ -24,6 +24,7 @@ export import modulizer.rewrite_macros;
 export import modulizer.rewrite_orchestration;
 export import modulizer.rewrite_util;
 export import modulizer.rewrite_visitors;
+export import modulizer.self_contained;
 export import modulizer.trace_visitors;
 export import modulizer.util;
 export import modulizer.wrapper_gen;

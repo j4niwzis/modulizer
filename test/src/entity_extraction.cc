@@ -213,3 +213,45 @@ TEST(EntityExtraction, InternalReachableViaPublicMacro) {
   }
   EXPECT_TRUE(found) << "internal::foo should be reachable via MACRO";
 }
+
+TEST(SelfContained, FindsTheContextANonSelfContainedHeaderNeeds) {
+  // uses_thing.h names `thing` by value but never includes the header that
+  // defines it: api.h includes that one first. Alone it does not parse, so the
+  // pass reports what has to come ahead of it.
+  std::vector<std::string> headers = {data_path("needctx_lib/thing.h"),
+                                      data_path("needctx_lib/uses_thing.h"),
+                                      data_path("needctx_lib/api.h")};
+  auto found = discover_header_contexts(headers, {"-I", gDataDir});
+  auto it = found.contexts.find(data_path("needctx_lib/uses_thing.h"));
+  ASSERT_NE(it, found.contexts.end())
+      << "a header that does not parse alone must be given its usage context";
+  EXPECT_TRUE(std::ranges::contains(it->second, data_path("needctx_lib/thing.h")))
+      << "the context is what its usage site had already included";
+  EXPECT_FALSE(found.contexts.count(data_path("needctx_lib/thing.h")))
+      << "a header that parses alone needs nothing";
+  EXPECT_TRUE(found.fragments.empty())
+      << "a header with one workable context is a module, not a fragment";
+}
+
+TEST(SelfContained, BracketHalvesAreFragmentsNotModules) {
+  // Each half opens or closes pragma state the other one balances. Pragma
+  // state does not cross a module boundary, so neither half can be a module
+  // however well it parses on its own.
+  std::vector<std::string> headers = {data_path("needctx_lib/bracket_open.h"),
+                                      data_path("needctx_lib/bracket_close.h"),
+                                      data_path("needctx_lib/thing.h")};
+  auto found = discover_header_contexts(headers, {"-I", gDataDir});
+  EXPECT_TRUE(found.fragments.count(data_path("needctx_lib/bracket_open.h")))
+      << "the half that pushes ends with the state still open";
+  EXPECT_TRUE(found.fragments.count(data_path("needctx_lib/bracket_close.h")))
+      << "the half that pops has nothing to pop";
+  EXPECT_FALSE(found.fragments.count(data_path("needctx_lib/thing.h")))
+      << "an ordinary header is unaffected";
+}
+
+TEST(SelfContained, ContextArgsAreIncludeFlags) {
+  auto args = context_args({{"a.h", {"/x/one.h", "/x/two.h"}}});
+  ASSERT_TRUE(args.count("a.h"));
+  EXPECT_EQ(args["a.h"], (std::vector<std::string>{"-include", "/x/one.h",
+                                                   "-include", "/x/two.h"}));
+}

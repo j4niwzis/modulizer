@@ -384,26 +384,53 @@ std::string guard_condition(std::string_view line) {
   return {};
 }
 
+// One entry of the conditional stack an include sits inside. `state` is
+// 0 = if-branch, 1 = elif-branch, 2 = else-branch, 3 = multi-line (tracked for
+// nesting but never rebuilt). The header's own full-file include guard
+// (file_guard) is tracked but never emitted.
+//
+// A branch past the first is only reached when every branch before it was not,
+// so `cond` (this branch's own condition) and `prior` (the ones it had to
+// fail) together are what guards an include inside it.
+struct GuardRec {
+  std::string text;
+  std::string cond;
+  std::vector<std::string> prior;
+  int state = 0;
+  bool file_guard = false;
+};
+
+// The guard to emit for an include sitting inside this branch, or nullopt when
+// the branch is the file's own include guard and guards nothing.
+//
+// A dispatch header — `#if <this platform> … #elif <that one> …`, each branch
+// including a different implementation of the same entities — depends on the
+// negated priors: without them every alternative looks unconditional and they
+// all land in the same translation unit at once.
+std::optional<std::string> branch_guard(const GuardRec &g) {
+  // Multi-line guards are kept as spelled: read_guard_line joins the
+  // continuations into a single valid line (no backslash). They were
+  // previously dropped because the raw `\`-terminated text is not a valid
+  // single-line expression; valid_guards filters any residual backslash guard
+  // at emission time.
+  if (g.state == 3) return g.text;
+  if (g.file_guard) return std::nullopt;
+  // The first branch is its own condition, spelled the way the source spelled
+  // it. Anything later also has to say which branches it is standing in for;
+  // an `#else` after a single `#if` is just that one negated, which reads
+  // better as `#ifndef` than as `#if !(…)`.
+  if (g.prior.empty())
+    return g.state == 2 ? negate_guard(g.text) : g.text;
+  if (g.prior.size() == 1 && g.state == 2) return negate_guard(g.text);
+  std::string expr;
+  for (auto &p : g.prior)
+    expr += (expr.empty() ? "" : " && ") + std::format("!{}", p);
+  if (!g.cond.empty()) expr += " && " + g.cond;
+  return std::format("#if {}\n", expr);
+}
+
 export void annotate_guards(const std::string &src,
                             std::vector<IncludeDirective> &includes) {
-  // guard_stack entry: {guard text, state} where state 0 = if-branch,
-  // 1 = elif-branch, 2 = else-branch. Multi-line guards (state 3) are
-  // tracked for nesting but never emitted to the GMF. The header's own
-  // full-file include guard (file_guard) is tracked but never emitted.
-  //
-  // A branch past the first is only reached when every branch before it was
-  // not, so `cond` (this branch's own condition) and `prior` (the ones it had
-  // to fail) together are what guards an include inside it. A dispatch header
-  // — `#if <this platform> … #elif <that one> …`, each branch including a
-  // different implementation of the same entities — depends on it: without the
-  // negated priors every alternative would look unconditional at once.
-  struct GuardRec {
-    std::string text;
-    std::string cond;
-    std::vector<std::string> prior;
-    int state = 0;
-    bool file_guard = false;
-  };
   std::vector<GuardRec> guard_stack;
   std::optional<std::string> pending_file_guard;
   std::size_t line_start = 0;
@@ -478,35 +505,8 @@ export void annotate_guards(const std::string &src,
       if (inc.offset >= line_start && inc.offset <= i && !guard_stack.empty()
           && inc.guard_stack.empty()) {
         std::vector<std::string> guards;
-        for (auto &g : guard_stack) {
-          if (g.state == 3) {
-            // Multi-line guards are kept: read_guard_line joins the
-            // continuations into a single valid line (no backslash). They were
-            // previously dropped because the raw `\`-terminated text is not a
-            // valid single-line expression; valid_guards filters any residual
-            // backslash guard at emission time.
-            guards.push_back(g.text);
-            continue;
-          }
-          if (g.file_guard) continue;
-          // The first branch is its own condition, spelled the way the source
-          // spelled it. Anything later also has to say which branches it is
-          // standing in for; an `#else` after a single `#if` is just that one
-          // negated, which reads better as `#ifndef` than as `#if !(…)`.
-          if (g.prior.empty()) {
-            guards.push_back(g.state == 2 ? negate_guard(g.text) : g.text);
-            continue;
-          }
-          if (g.prior.size() == 1 && g.state == 2) {
-            guards.push_back(negate_guard(g.text));
-            continue;
-          }
-          std::string expr;
-          for (auto &p : g.prior)
-            expr += (expr.empty() ? "" : " && ") + std::format("!{}", p);
-          if (!g.cond.empty()) expr += " && " + g.cond;
-          guards.push_back(std::format("#if {}\n", expr));
-        }
+        for (auto &g : guard_stack)
+          if (auto guard = branch_guard(g)) guards.push_back(*std::move(guard));
         inc.guard_stack = std::move(guards);
       }
     }
@@ -551,12 +551,20 @@ export void expand_include_closure(
       if (is_xmacro_include(di.path)) continue;
       di.transitive = true;
       di.parent_resolved = resolved;
-      if (inside_system && kStdHeaders.count(di.path)) {
+      if (kStdHeaders.count(di.path)) {
         // A public standard header stays a candidate wherever it was found,
-        // but the conditions it was found *under* belong to the standard
-        // library, not to this program: `<cerrno>` inside `<bits/atomic_wait.h>`
-        // sits behind `#if __glibcxx_atomic_wait`, and emitting that guard
-        // would pin the output to one libstdc++ version.
+        // but the conditions it was found *under* belong to the header that
+        // found it, not to this program: `<cerrno>` inside
+        // `<bits/atomic_wait.h>` sits behind `#if __glibcxx_atomic_wait`, and
+        // emitting that guard would pin the output to one libstdc++ version.
+        // A library header's conditions travel no better — the global module
+        // fragment has no `BOOST_WORKAROUND` to evaluate them with:
+        //
+        //   error: token is not a valid binary operator in a preprocessor
+        //          subexpression
+        //
+        // and a standard header is always there to include, so dropping the
+        // condition costs nothing either way.
         di.guard_stack.clear();
       } else if (inside_system) {
         di.system_internal = true;
