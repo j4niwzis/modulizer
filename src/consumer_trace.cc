@@ -194,13 +194,19 @@ export struct HeaderScan {
   InternalEntityIndex internal;
 };
 
-export HeaderScan scan_headers(const std::vector<std::string> &paths,
-                               const std::vector<std::string> &extra_args) {
+export HeaderScan scan_headers(
+    const std::vector<std::string> &paths,
+    const std::vector<std::string> &extra_args,
+    // Per-header context flags: a header that does not parse alone is given
+    // what its usage site had already included (see discover_header_contexts).
+    const std::map<std::string, std::vector<std::string>> *per_path = nullptr) {
   HeaderScan scan;
   scan.models.resize(paths.size());
   std::vector<std::vector<std::string>> ifdef_macros(paths.size());
   std::vector<std::set<std::string>> internal(paths.size());
-  parallel_parse(paths, extra_args, /*delayed_template_parsing=*/false,
+  ParseOptions scan_opts(/*delayed_template_parsing=*/false);
+  scan_opts.per_path_args = per_path;
+  parallel_parse(paths, extra_args, scan_opts,
                  [&](std::size_t i, const std::string &) {
                    auto &entities = internal[i];
                    return std::make_unique<EntityExtractionFactory>(
@@ -226,7 +232,9 @@ trace_consumer_reachability(
     const std::vector<std::string> &extra_args,
     const InternalEntityIndex *precomputed = nullptr,
     const std::function<std::unique_ptr<clang::ASTConsumer>(
-        clang::CompilerInstance &, const std::string &)> &extra = {}) {
+        clang::CompilerInstance &, const std::string &)> &extra = {},
+    // See scan_headers: the context a non-self-contained header needs.
+    const std::map<std::string, std::vector<std::string>> *per_path = nullptr) {
 
   // Whatever a caller already scanned is reused; anything it did not cover —
   // implementation sources, say, when only the headers were scanned — is
@@ -275,8 +283,10 @@ trace_consumer_reachability(
     for (auto &[c, p] : transitive_deps) consumers.push_back(c);
     std::vector<std::map<std::string, std::set<std::string>>> partials(
         consumers.size());
+    ParseOptions trace_opts(/*delayed_template_parsing=*/true);
+    trace_opts.per_path_args = per_path;
     parallel_parse(
-        consumers, extra_args, /*delayed_template_parsing=*/true,
+        consumers, extra_args, trace_opts,
         [&](std::size_t i, const std::string &path) {
           auto &local = partials[i];
           return std::make_unique<VisitorFrontendActionFactory>(

@@ -10,6 +10,7 @@ import modulizer.include_analysis;
 import modulizer.macro_analyzer;
 import modulizer.naming;
 import modulizer.rewrite_orchestration;
+import modulizer.self_contained;
 import modulizer.util;
 import modulizer.wrapper_gen;
 import libtooling;
@@ -693,6 +694,66 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
 // Full rewrite mode: headers become module interface units and implementation
 // files (.cpp/.cc/.cxx) become module implementation units. Extern "C++"
 // wrapping is OFF by default (enable with --extern-cxx).
+// A macros file carries the macros of the modules it imports by including
+// their macros files, but a header that defines no macro produces none. The
+// reference is decided per header, before the run knows which of them ended
+// up with one, so the ones that did not are dropped here:
+//
+//   fatal error: 'lib/thing_macros.h' file not found
+//
+void prune_dangling_macro_includes(std::vector<HeaderBatchOutcome> &outcomes) {
+  std::set<std::string> emitted;
+  for (auto &o : outcomes)
+    if (o.ok && !o.r.macros_content.empty())
+      emitted.insert(std::format("{}.h", o.r.macros_name));
+  for (auto &o : outcomes) {
+    if (!o.ok || o.r.macros_content.empty()) continue;
+    std::string kept;
+    for (auto line : std::views::split(o.r.macros_content, '\n')) {
+      std::string_view s(line.begin(), line.end());
+      auto inc = parse_include_line(s);
+      if (inc && inc->is_quoted && inc->path.ends_with("_macros.h") &&
+          !emitted.count(inc->path))
+        continue;
+      kept += s;
+      kept += '\n';
+    }
+    if (!o.r.macros_content.empty() && o.r.macros_content.back() != '\n' &&
+        !kept.empty())
+      kept.pop_back();
+    o.r.macros_content = std::move(kept);
+  }
+}
+
+// Split the headers into those that can be modules and those that cannot,
+// reporting both. Fragments are dropped from `header_paths`: they stay textual
+// includes, copied through to the output so the includes of them still
+// resolve.
+std::pair<std::map<std::string, std::vector<std::string>>, std::set<std::string>>
+classify_headers(std::vector<std::string> &header_paths,
+                 const std::vector<std::string> &all_extra) {
+  if (header_paths.empty()) return {};
+  auto found = discover_header_contexts(header_paths, all_extra);
+  if (!found.contexts.empty())
+    llvm::outs() << "  " << found.contexts.size()
+                 << " headers parse only in the context they are included "
+                    "from\n";
+  // A header that parses in some of the places it is included and not others
+  // is text meant to be pasted where it lands, not a translation unit:
+  // whichever context a module were built in would be the wrong one
+  // everywhere else.
+  if (!found.fragments.empty()) {
+    llvm::outs() << "  " << found.fragments.size()
+                 << " headers are include fragments, not modules:\n";
+    for (const auto &f : found.fragments)
+      llvm::outs() << "    " << f << "\n";
+    std::erase_if(header_paths, [&](const std::string &p) {
+      return found.fragments.count(p) > 0;
+    });
+  }
+  return {context_args(found.contexts), std::move(found.fragments)};
+}
+
 export inline int run_full_rewrite(int argc, const char **argv) {
   auto parser_opt = open_options_parser(argc, argv);
   if (!parser_opt) return 1;
@@ -728,16 +789,28 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   //    AND are re-exported by the wrapper.
   std::map<std::string, std::vector<std::string>> internal_reachable;
   std::map<std::string, std::vector<std::string>> public_reachable;
+  // The compile arguments come from the same set as before the headers are
+  // narrowed below, so they do not depend on what the sweep finds.
+  std::vector<std::string> arg_paths = header_paths;
+  arg_paths.insert(arg_paths.end(), source_paths.begin(), source_paths.end());
+  auto all_extra = first_extra_args(parser.getCompilations(), arg_paths);
+  // Which headers are translation units at all, and what the ones that are not
+  // need in order to become one. Everything below reads these headers' ASTs; a
+  // rewrite driven by a parse that stopped at the first error exports what
+  // clang managed to read and no more.
+  auto [header_ctx_args, fragment_headers] =
+      classify_headers(header_paths, all_extra);
+
   // Consumers include implementation files, so trace over the full set.
   std::vector<std::string> trace_paths = header_paths;
   trace_paths.insert(trace_paths.end(), source_paths.begin(), source_paths.end());
-  auto all_extra = first_extra_args(parser.getCompilations(), trace_paths);
 
   // One sweep of the headers yields both the per-file entity models that four
   // analyses below want and the internal-entity index the reachability trace
   // needs; each used to parse the whole header set for itself.
   HeaderScan header_scan;
-  if (!header_paths.empty()) header_scan = scan_headers(header_paths, all_extra);
+  if (!header_paths.empty())
+    header_scan = scan_headers(header_paths, all_extra, &header_ctx_args);
   std::vector<EntityModel> &header_models = header_scan.models;
 
   // The template-body scan wants the same parse of the same headers as the
@@ -772,7 +845,8 @@ export inline int run_full_rewrite(int argc, const char **argv) {
               ci, tpl_defined_files, tpl_alias_fqns, path, tpl_raw.outs[i],
               tpl_raw.aliases[i], tpl_raw.referenced[i], tpl_raw.needed[i],
               tpl_raw.friend_pairs[i]);
-        });
+        },
+        &header_ctx_args);
   }
   // Explicit INTERNAL consumer sources (the library's own tests/main, or a
   // sibling library): entities they reference are exported from their defining
@@ -1053,6 +1127,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   cfg.public_modules = public_modules;
   cfg.no_internal_filter = ExportAllOpt.getValue();
   cfg.extra_imports = std::move(extra_imports);
+  cfg.context_args = header_ctx_args;
   cfg.module_replaces = module_replaces;
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;
@@ -1079,36 +1154,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   auto outcomes = rewrite_header_batch(
       header_paths, reachable_fqns, cfg, parser.getCompilations());
 
-  // A macros file carries the macros of the modules it imports by including
-  // their macros files, but a header that defines no macro produces none. The
-  // reference is decided per header, before the run knows which of them ended
-  // up with one, so the ones that did not are dropped here:
-  //
-  //   fatal error: 'lib/thing_macros.h' file not found
-  //
-  {
-    std::set<std::string> emitted;
-    for (auto &o : outcomes)
-      if (o.ok && !o.r.macros_content.empty())
-        emitted.insert(std::format("{}.h", o.r.macros_name));
-    for (auto &o : outcomes) {
-      if (!o.ok || o.r.macros_content.empty()) continue;
-      std::string kept;
-      for (auto line : std::views::split(o.r.macros_content, '\n')) {
-        std::string_view s(line.begin(), line.end());
-        auto inc = parse_include_line(s);
-        if (inc && inc->is_quoted && inc->path.ends_with("_macros.h") &&
-            !emitted.count(inc->path))
-          continue;
-        kept += s;
-        kept += '\n';
-      }
-      if (!o.r.macros_content.empty() && o.r.macros_content.back() != '\n' &&
-          !kept.empty())
-        kept.pop_back();
-      o.r.macros_content = std::move(kept);
-    }
-  }
+  prune_dangling_macro_includes(outcomes);
 
   std::set<std::string> written_export_headers;
   std::set<std::string> interface_modules;
@@ -1144,6 +1190,18 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     if (!r.macros_content.empty())
       macro_files.insert(std::format("{}.h", r.macros_name));
     llvm::outs() << "\n";
+  }
+
+  // Include fragments are not modules, but the headers that include them are,
+  // and those includes have to resolve against the generated tree rather than
+  // the originals. They are copied through as they are.
+  for (const auto &f : fragment_headers) {
+    auto rel = header_output_relpath(f, library_name);
+    auto dst = std::format("{}/{}", OutputDirOpt.getValue(), rel);
+    if (!ensure_parent_dir(dst)) return 1;
+    auto text = read_file(f);
+    if (!write_file(dst, text)) return 1;
+    llvm::outs() << "Copied " << dst << " (include fragment)\n";
   }
 
   // Implementation files → module implementation units, written under an

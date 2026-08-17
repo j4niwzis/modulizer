@@ -440,6 +440,26 @@ public:
     return true;
   }
 
+  // The member a call names, even when the call itself did not survive. A
+  // header that calls a function whose return type it never included the
+  // definition of is precisely what the injected import exists for — and it is
+  // also where the parse breaks, so there is no callee left to read the
+  // signature from:
+  //
+  //   error: calling 'default_error_condition' with incomplete return type
+  //          'error_condition'
+  //
+  // The member expression is intact either way: the lookup succeeded, only
+  // what came back could not be used.
+  bool VisitMemberExpr(clang::MemberExpr *e) {
+    if (!e || !in_main(e->getMemberLoc())) return true;
+    auto *d = e->getMemberDecl();
+    record_referenced(d);
+    record_signature_types(llvm::dyn_cast_or_null<clang::FunctionDecl>(d));
+    if (template_depth_ > 0) record(d);
+    return true;
+  }
+
   bool VisitUnresolvedLookupExpr(clang::UnresolvedLookupExpr *e) {
     if (!e || !in_main(e->getExprLoc())) return true;
     for (auto *d : e->decls()) {

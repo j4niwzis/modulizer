@@ -384,9 +384,18 @@ export std::string wrap_includes_with_guard(
     }
     if (is_include) {
       auto *inc = find_inc(includes, inc_path);
-      bool has_conditional_guard = inc && inc->guard_stack.size() > 1;
-      if (inc && (inc->skip_gmf || has_conditional_guard)) {
-        wrapped_hdr += line;  // keep original guards
+      // A nested conditional is still a conditional the module build must not
+      // walk into: the global module fragment already included what is in
+      // there, and a header without an include guard of its own (Boost's
+      // `assert.hpp` is deliberately re-includable) is then declared twice,
+      // once in each module —
+      //
+      //   error: declaration of 'assertion_failed' in module lib.thing follows
+      //          declaration in the global module
+      //
+      // Only `skip_gmf` keeps its include, since nothing else brought it in.
+      if (inc && inc->skip_gmf) {
+        wrapped_hdr += line;  // kept in the body with the macros it needs
       } else if (remove) {
         // Drop the include entirely (cc-only mode: USE_MODULES is always
         // defined in the interface unit, so these includes are dead — the

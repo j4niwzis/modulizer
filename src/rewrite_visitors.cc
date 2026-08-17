@@ -307,6 +307,21 @@ public:
     return false;
   }
 
+  // Whether this class, or any class it is nested in, is `extern "C++"`. A
+  // class nested inside one is attached to the global module as well, so its
+  // members are owed the same treatment even though only the outer class
+  // carries the marker — otherwise an out-of-line definition of a nested
+  // class's member becomes a module entity conflicting with the global-module
+  // declaration inside the class.
+  bool in_extern_cxx_class(clang::CXXRecordDecl *cls) {
+    for (auto *c = cls; c;
+         c = llvm::dyn_cast<clang::CXXRecordDecl>(c->getDeclContext()))
+      if (is_extern_cxx_entity(c->getNameAsString()) ||
+          is_extern_cxx_fqn(c->getQualifiedNameAsString()))
+        return true;
+    return false;
+  }
+
   // The same question asked about an entity that already knows its full name.
   // An out-of-line member definition is often written qualified at file scope
   // (`void lib::detail::Thing::f() {}`), where the visitor's namespace path is
@@ -336,6 +351,11 @@ public:
     if (!rd || rd->isImplicit() || !isMainFile(rd)) return true;
     if (llvm::isa<clang::CXXRecordDecl>(rd->getDeclContext())) return true;
     if (llvm::isa<clang::FunctionDecl>(rd->getDeclContext())) return true;
+    // A tag declared inside a declarator — `typedef error_info<struct tag_,
+    // char const*> alias;`, the tag-as-a-label idiom — is not a declaration a
+    // marker can precede: it would land in the middle of a template argument
+    // list. The declaration it is embedded in carries the export instead.
+    if (rd->isEmbeddedInDeclarator()) return true;
     if (rd->getFriendObjectKind() != clang::Decl::FOK_None) return true;
     // A friend class TEMPLATE (`template <typename T> friend class X;`) marks
     // its described ClassTemplateDecl as the friend, not the inner record; the
@@ -449,19 +469,7 @@ public:
         return true;  // in-class definition, covered by the class
       auto *cls = llvm::dyn_cast<clang::CXXRecordDecl>(md->getDeclContext());
       if (!cls) return true;
-      // A class nested inside an `extern "C++"` one is attached to the global
-      // module as well, so its members are owed the same treatment even though
-      // only the outer class carries the marker. Walk out to the outermost
-      // enclosing class before deciding, or an out-of-line definition of a
-      // nested class's member becomes a module entity conflicting with the
-      // global-module declaration inside the class.
-      for (auto *c = cls; c;
-           c = llvm::dyn_cast<clang::CXXRecordDecl>(c->getDeclContext()))
-        if (is_extern_cxx_entity(c->getNameAsString()) ||
-            is_extern_cxx_fqn(c->getQualifiedNameAsString())) {
-          make_extern_cxx(fd);
-          break;
-        }
+      if (in_extern_cxx_class(cls)) make_extern_cxx(fd);
       return true;
     }
     if (fd->getFriendObjectKind() != clang::Decl::FOK_None) return true;
@@ -717,6 +725,42 @@ private:
     return loc.isValid() && sm.isInMainFile(loc);
   }
 
+  // The library header whose macros file this marker belongs in, or empty to
+  // place it here.
+  //
+  // When the macro body lives in ANOTHER library header being rewritten (e.g. a
+  // macro defined in matchers.h but invoked in more-matchers.h), the marker
+  // must be routed into that header's macros file, so the macro body bakes the
+  // export in wherever it expands, rather than exporting the invocation here.
+  //
+  // Only when the macro body is the WHOLE declaration, though. A macro that
+  // supplies nothing but a leading specifier — `#define LIB_CONSTEXPR
+  // constexpr`, a visibility attribute, an `inline` — is where getBeginLoc()
+  // lands too, and routing there takes the marker away from the declaration
+  // that needed it and bakes it into every expansion of a keyword. Where the
+  // declaration ENDS tells the two apart: a macro that declares an entity
+  // spells the end of it as well, while a leading specifier leaves the rest in
+  // this file.
+  //
+  // Variables are exempt either way: a shared DECLARE macro (e.g.
+  // `DECLARE_FLAG_`) expands to a single `extern` variable whose linkage
+  // differs per use (module-local in some modules, `extern "C++"` cross-module
+  // in others), and baking the marker into the shared body would force one
+  // linkage on every expansion.
+  std::string macro_body_route(clang::Decl *d, clang::SourceLocation loc) {
+    if (sm.isInMainFile(loc) || !external_macro_mods || !library_headers ||
+        llvm::isa<clang::VarDecl>(d))
+      return {};
+    auto end = sm.getSpellingLoc(d->getEndLoc());
+    if (!end.isValid() || sm.isInMainFile(end)) return {};
+    auto fn = sm.getFilename(loc);
+    if (fn.empty()) return {};
+    auto canon =
+        std::filesystem::weakly_canonical(std::filesystem::path(fn.str()))
+            .string();
+    return library_headers->count(canon) ? canon : std::string();
+  }
+
   // `shared`: this declares an entity another module defines, so the marker is
   // the one whose expansion depends on whether the purview is wrapped.
   void addExport(clang::Decl *d, bool need_extern_cxx = false,
@@ -750,39 +794,7 @@ private:
     auto loc = begin.isMacroID() ? sm.getSpellingLoc(begin)
                                  : sm.getExpansionLoc(begin);
     if (!loc.isValid()) return;
-    // When the macro body lives in ANOTHER library header being rewritten
-    // (e.g. a macro defined in matchers.h but invoked in
-    // more-matchers.h), the marker must be routed into that header's
-    // macros file (so the macro body bakes the export in wherever it expands),
-    // not exported at the invocation in this file. Variables are exempt: a
-    // shared DECLARE macro (e.g. `DECLARE_FLAG_`) expands to a
-    // single `extern` variable whose linkage differs per use (module-local in
-    // some modules, `extern "C++"` cross-module in others); baking the marker
-    // into the shared body would force one linkage on every expansion. Such
-    // entities keep the invocation-level export.
-    // Only when the macro body is the whole declaration. A macro that supplies
-    // nothing but a leading specifier — `#define LIB_CONSTEXPR constexpr`, a
-    // visibility attribute, an `inline` — is where getBeginLoc() lands too, and
-    // routing there takes the marker away from the declaration that needed it
-    // and bakes it into every expansion of a keyword. Where the declaration
-    // ENDS tells the two apart: a macro that declares an entity spells the end
-    // of it as well, while a leading specifier leaves the rest in this file.
-    bool ends_in_macro_body = false;
-    {
-      auto end = sm.getSpellingLoc(d->getEndLoc());
-      ends_in_macro_body = end.isValid() && !sm.isInMainFile(end);
-    }
-    std::string route_to;
-    if (!sm.isInMainFile(loc) && ends_in_macro_body && external_macro_mods &&
-        library_headers && !llvm::isa<clang::VarDecl>(d)) {
-      auto fn = sm.getFilename(loc);
-      if (!fn.empty()) {
-        auto canon =
-            std::filesystem::weakly_canonical(std::filesystem::path(fn.str()))
-                .string();
-        if (library_headers->count(canon)) route_to = canon;
-      }
-    }
+    auto route_to = macro_body_route(d, loc);
     if (route_to.empty() && !sm.isInMainFile(loc)) loc = sm.getExpansionLoc(begin);
     if (!loc.isValid()) return;
     unsigned off = sm.getFileOffset(loc);

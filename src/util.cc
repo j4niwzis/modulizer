@@ -192,7 +192,21 @@ export struct ParseOptions {
       : delayed_template_parsing(dtp), virtual_sources(vs) {}
   bool delayed_template_parsing = false;
   const std::map<std::string, std::string> *virtual_sources = nullptr;
+  // Flags for one path only, on top of the shared ones. A header written to be
+  // included from one particular point does not parse anywhere else, and what
+  // it is missing differs per header, so the context it needs (`-include` of
+  // what its usage site had already included) cannot be shared.
+  const std::map<std::string, std::vector<std::string>> *per_path_args = nullptr;
 };
+
+// Append the flags registered for this path, if any.
+void add_per_path_args(std::vector<std::string> &flags, const ParseOptions &opts,
+                       const std::string &path) {
+  if (!opts.per_path_args) return;
+  auto it = opts.per_path_args->find(path);
+  if (it == opts.per_path_args->end()) return;
+  flags.insert(flags.end(), it->second.begin(), it->second.end());
+}
 
 // Register every virtual source in `opts` with a tool that is about to parse.
 //
@@ -235,6 +249,7 @@ void parallel_parse(const std::vector<std::string> &paths,
     std::vector<std::string> sources = {path};
     auto flags = base_compile_flags(opts.delayed_template_parsing);
     flags.insert(flags.end(), extra_args.begin(), extra_args.end());
+    add_per_path_args(flags, opts, path);
     clang::tooling::FixedCompilationDatabase db(".", flags);
     clang::tooling::ClangTool tool(db, sources);
     apply_virtual_sources(tool, opts);
@@ -253,6 +268,7 @@ void parallel_parse(const std::vector<std::string> &paths,
     std::vector<std::string> sources = {path};
     auto flags = base_compile_flags(opts.delayed_template_parsing);
     flags.insert(flags.end(), extra_args.begin(), extra_args.end());
+    add_per_path_args(flags, opts, path);
     clang::tooling::FixedCompilationDatabase db(".", flags);
     clang::tooling::ClangTool tool(db, sources);
     apply_virtual_sources(tool, opts);
