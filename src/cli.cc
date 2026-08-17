@@ -886,6 +886,21 @@ export inline int run_full_rewrite(int argc, const char **argv) {
       for (auto &f : tpl_refs.fwd_declared)
         if (not_exported(f)) fwd_declared_fqns.push_back(f);
     }
+    // The same across HEADERS. One module per header means a class declared in
+    // one and having its members defined in another is split over two modules,
+    // and a member can only be defined in the module its class is attached to:
+    //
+    //   error: declaration of 'message' in module lib.thing_impl follows
+    //          declaration in module lib.thing
+    //
+    // Attaching the class to the global module is what puts them back
+    // together, which both sides say with `extern "C++"`.
+    {
+      auto member_classes =
+          out_of_line_member_class_fqns(header_paths, all_extra);
+      fwd_declared_fqns.insert(fwd_declared_fqns.end(), member_classes.begin(),
+                               member_classes.end());
+    }
     // Classes whose members are defined out-of-line in implementation files:
     // those impl units live in different modules, so the class must be
     // `extern "C++"` for the member definition to be valid across modules.

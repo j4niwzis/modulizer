@@ -307,6 +307,18 @@ public:
     return false;
   }
 
+  // The same question asked about an entity that already knows its full name.
+  // An out-of-line member definition is often written qualified at file scope
+  // (`void lib::detail::Thing::f() {}`), where the visitor's namespace path is
+  // empty and a name-based lookup finds nothing.
+  bool is_extern_cxx_fqn(const std::string &fqn) {
+    for (auto &d : fwd_declared_fqns)
+      if (matches_reachable(fqn, d, /*symmetric=*/true)) return true;
+    for (auto &f : friend_extern_fqns)
+      if (matches_reachable(fqn, f, /*symmetric=*/true)) return true;
+    return false;
+  }
+
   // True when this entity must be `extern "C++"`: either it is declared in a
   // module that does not define it, or it is friend-declared inside an
   // extern "C++" class (which attaches the declaration to the global module).
@@ -445,7 +457,8 @@ public:
       // global-module declaration inside the class.
       for (auto *c = cls; c;
            c = llvm::dyn_cast<clang::CXXRecordDecl>(c->getDeclContext()))
-        if (is_extern_cxx_entity(c->getNameAsString())) {
+        if (is_extern_cxx_entity(c->getNameAsString()) ||
+            is_extern_cxx_fqn(c->getQualifiedNameAsString())) {
           make_extern_cxx(fd);
           break;
         }
@@ -747,9 +760,21 @@ private:
     // some modules, `extern "C++"` cross-module in others); baking the marker
     // into the shared body would force one linkage on every expansion. Such
     // entities keep the invocation-level export.
+    // Only when the macro body is the whole declaration. A macro that supplies
+    // nothing but a leading specifier — `#define LIB_CONSTEXPR constexpr`, a
+    // visibility attribute, an `inline` — is where getBeginLoc() lands too, and
+    // routing there takes the marker away from the declaration that needed it
+    // and bakes it into every expansion of a keyword. Where the declaration
+    // ENDS tells the two apart: a macro that declares an entity spells the end
+    // of it as well, while a leading specifier leaves the rest in this file.
+    bool ends_in_macro_body = false;
+    {
+      auto end = sm.getSpellingLoc(d->getEndLoc());
+      ends_in_macro_body = end.isValid() && !sm.isInMainFile(end);
+    }
     std::string route_to;
-    if (!sm.isInMainFile(loc) && external_macro_mods && library_headers &&
-        !llvm::isa<clang::VarDecl>(d)) {
+    if (!sm.isInMainFile(loc) && ends_in_macro_body && external_macro_mods &&
+        library_headers && !llvm::isa<clang::VarDecl>(d)) {
       auto fn = sm.getFilename(loc);
       if (!fn.empty()) {
         auto canon =
