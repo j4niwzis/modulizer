@@ -39,7 +39,7 @@ TEST(HeaderRewrite, ExportsEnumWithReachableEnumeratorValueCcOnly) {
   // Same as ExportsEnumWithReachableEnumeratorValue but in cc-only mode where
   // the header body is inlined into the interface unit. The export must
   // survive in the `.cc` purview body.
-  auto r = rewrite_header(data_path("enumreach.h"), "enumreach_lib", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"test_lib::internal::kD"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+  auto r = rewrite_header(data_path("enumreach.h"), "enumreach_lib", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"test_lib::internal::kD"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(r.cc_content.find("ENUMREACH_LIB_EXPORT enum Flag"),
             std::string::npos)
       << "cc-only interface units must also export enums owning a reachable "
@@ -51,7 +51,7 @@ TEST(HeaderRewrite, ExportsConditionalInternalEntityWithReachableFqn) {
   // get the export marker in the ACTIVE branch when their full FQN (including
   // the intermediate namespace) is listed as reachable.
   auto r = rewrite_header(data_path("condinternal.h"), "cond_lib", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"test_lib::internal::posix::Foo",
-       "test_lib::internal::posix::Bar"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+       "test_lib::internal::posix::Bar"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(r.cc_content.find(
                 "COND_LIB_EXPORT struct Foo {"),
             std::string::npos)
@@ -139,10 +139,10 @@ TEST(HeaderRewrite, ModuleReplacesStdlibHeaderKeepsTransitiveUsed) {
   // must still be added to the GMF. When import std is active, the C++
   // stdlib headers are guarded by <LIB>_IMPORT_STD and import std by
   // <LIB>_USE_IMPORT_STD instead of being removed.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"std.compat", {"iostream"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "std.compat", .headers = {"iostream"}}
   };
-  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_NE(r.cc_content.find("#ifdef STDMOD_USE_IMPORT_STD\nimport std.compat;"),
             std::string::npos)
       << "import std.compat must be emitted behind the USE_IMPORT_STD guard";
@@ -161,10 +161,10 @@ TEST(HeaderRewrite, ModuleReplacesHeaderKeepsTransitiveUsedIncludes) {
     {"third_party.h", "tpmod.third_party"},
     {"a.h", "tpmod.a"}
   };
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"tpmod.third_party", {"third_party.h"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "tpmod.third_party", .headers = {"third_party.h"}}
   };
-  auto r = rewrite_header(data_path("tpmod/a.h"), "tpmod.a", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("tpmod/a.h"), "tpmod.a", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_NE(r.cc_content.find("import tpmod.third_party;"), std::string::npos)
       << "third_party.h must be replaced by its module import";
   EXPECT_NE(r.cc_content.find("#include <variant>"), std::string::npos)
@@ -178,7 +178,7 @@ TEST(HeaderRewrite, ModuleReplacesAutoGeneratedCrossLibrary) {
   // explicit --module-replaces the tool must auto-derive the module
   // `dep_lib.dep` from the include path and emit an import instead of keeping
   // the raw include.
-  auto r = rewrite_header(data_path("autoreplace/mylib/use.h"), "mylib.use", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir, "-I", gDataDir + "/autoreplace"}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}});
+  auto r = rewrite_header(data_path("autoreplace/mylib/use.h"), "mylib.use", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir, "-I", gDataDir + "/autoreplace"}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}});
   EXPECT_NE(r.cc_content.find("export import dep_lib.dep;"),
             std::string::npos)
       << "a cross-library include must auto-derive its module import";
@@ -192,7 +192,7 @@ TEST(HeaderRewrite, ModuleReplacesAutoGeneratedTransitive) {
   // includes dep_lib/dep.h (public) and dep_lib/internal/helper.h (internal).
   // Auto-generation must import the public umbrella/dep modules with export
   // import, plain-import the internal module, and drop all raw includes.
-  auto r = rewrite_header(data_path("autoreplace/mylib/use_umbrella.h"), "mylib.use_umbrella", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir, "-I", gDataDir + "/autoreplace"}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}});
+  auto r = rewrite_header(data_path("autoreplace/mylib/use_umbrella.h"), "mylib.use_umbrella", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir, "-I", gDataDir + "/autoreplace"}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}});
   EXPECT_NE(r.cc_content.find("export import dep_lib.umbrella;"),
             std::string::npos)
       << "the transitively-included public umbrella must be re-exported";
@@ -218,11 +218,11 @@ TEST(HeaderRewrite, ModuleReplacesUsesInternalnessForImport) {
   // lives in an internal dir → its module is plain-`import`ed. std/std.compat
   // are the exception, but any other replacing module follows the internalness
   // rule.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"other_lib", {"other.h"}},
-    {"other_lib.internal.helper", {"internal/helper.h"}},
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "other_lib", .headers = {"other.h"}},
+    ModuleReplacement{.module = "other_lib.internal.helper", .headers = {"internal/helper.h"}},
   };
-  auto r = rewrite_header(data_path("replacelib/consumer.h"), "replacelib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("replacelib/consumer.h"), "replacelib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_NE(r.cc_content.find("export import other_lib;"), std::string::npos)
       << "a public replaced header's module must be re-exported";
   EXPECT_NE(r.cc_content.find("import other_lib.internal.helper;"),
@@ -238,11 +238,11 @@ TEST(HeaderRewrite, ModuleReplacesUsesInternalnessForImport) {
 TEST(HeaderRewrite, ModuleReplacesPrefersMostSpecific) {
   // Both `ab` and `b` replace b.h, but `b` replaces fewer headers, so b.h must
   // import `b`, not `ab`. a.h is only in `ab` so it imports `ab`.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"ab", {"a.h", "b.h"}},
-    {"b", {"b.h"}},
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "ab", .headers = {"a.h", "b.h"}},
+    ModuleReplacement{.module = "b", .headers = {"b.h"}},
   };
-  auto r = rewrite_header(data_path("minreplace/c.h"), "minreplace.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("minreplace/c.h"), "minreplace.c", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_NE(r.cc_content.find("export import ab;"), std::string::npos)
       << "a.h is only replaced by ab";
   EXPECT_NE(r.cc_content.find("export import b;"), std::string::npos)
@@ -255,10 +255,10 @@ TEST(HeaderRewrite, ModuleReplacesTransitiveConsumerGetsImport) {
   // w.h includes only a.h, which includes b.h. b.h is replaced by module
   // `tranlib.b`, and w.h itself uses B. The consumer must get the import even
   // though it reaches b.h only transitively.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"tranlib.b", {"b.h"}},
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "tranlib.b", .headers = {"b.h"}},
   };
-  auto r = rewrite_header(data_path("tranreplace/w.h"), "tranreplace.w", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("tranreplace/w.h"), "tranreplace.w", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_NE(r.cc_content.find("export import tranlib.b;"), std::string::npos)
       << "a transitively-reached replaced header must still be imported";
   EXPECT_EQ(r.cc_content.find("#include \"b.h\""), std::string::npos)
@@ -269,10 +269,10 @@ TEST(HeaderRewrite, ModuleReplacesCrossLibraryAddsImport) {
   // widget.h includes "other.h" which belongs to a DIFFERENT library. The
   // crosslib module replaces other.h, so rewriting widget.h must emit
   // `import other_lib;` in the purview and drop the raw #include.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"other_lib", {"other.h"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "other_lib", .headers = {"other.h"}}
   };
-  auto r = rewrite_header(data_path("crosslib/widget.h"), "crosslib.widget", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("crosslib/widget.h"), "crosslib.widget", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_NE(r.cc_content.find("import other_lib;"), std::string::npos)
       << "a cross-library replaced header must become a module import";
   EXPECT_EQ(r.cc_content.find("#include \"other.h\""), std::string::npos)
@@ -726,7 +726,7 @@ TEST(HeaderRewrite, TextualMacroExtractionCapturesNestedConditional) {
   // headers' bodies. In cc-only mode
   // those bodies are inlined and need the macro, so it must be extracted even
   // though it is nested in an active conditional.
-  auto r = rewrite_header(data_path("macronest/dep.h"), "macronest.dep", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}});
+  auto r = rewrite_header(data_path("macronest/dep.h"), "macronest.dep", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}});
   EXPECT_NE(r.macros_content.find("NESTED_HELPER"), std::string::npos)
       << "a macro inside an active #if defined() block must be extracted";
 }
@@ -736,7 +736,7 @@ TEST(HeaderRewrite, TextualMacroExtractionPreservesConditionalGuards) {
   // must keep its guard structure in the macros file, so the correct branch
   // expands on the actual platform.
   // Extracting only one branch (without the #if) would force the wrong body.
-  auto r = rewrite_header(data_path("macronest/cond.h"), "macronest.cond", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}});
+  auto r = rewrite_header(data_path("macronest/cond.h"), "macronest.cond", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}});
   EXPECT_NE(r.macros_content.find("#if defined(__clang__)"),
             std::string::npos)
       << "the conditional guard around a nested macro must be preserved";
@@ -751,7 +751,7 @@ TEST(HeaderRewrite, TextualMacroExtractionSkipsCodeInConditional) {
   // declaration) must NOT be emitted verbatim into the macros file — only pure
   // macro blocks (only preprocessor directives) may be. Emitting code would
   // declare entities (e.g. `class Bar;`) in the global module fragment.
-  auto r = rewrite_header(data_path("macronest/codeblock.h"), "macronest.codeblock", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}});
+  auto r = rewrite_header(data_path("macronest/codeblock.h"), "macronest.codeblock", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}});
   EXPECT_EQ(r.macros_content.find("class Bar;"), std::string::npos)
       << "declarations inside a conditional must not leak into the macros "
          "file";
@@ -784,7 +784,7 @@ TEST(HeaderRewrite, InjectsFwdDeclForReferencedOpaqueType) {
   std::map<std::string, std::string> include_map = {
     {"fwdopaque/dep.h", "fwdopaque.dep"},
   };
-  auto r = rewrite_header(data_path("fwdopaque/consumer.h"), "fwdopaque.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwdopaque::Foo"}, .fwd_declared_fqns = {"fwdopaque::Foo"}});
+  auto r = rewrite_header(data_path("fwdopaque/consumer.h"), "fwdopaque.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {"fwdopaque::Foo"}, .fwd_declared_fqns = {"fwdopaque::Foo"}});
   // The forward declaration must be emitted somewhere in the interface unit so
   // `void operator<<(const Foo&, int)` is well-formed.
   EXPECT_NE(r.cc_content.find("class Foo;"), std::string::npos)
@@ -976,7 +976,7 @@ TEST(HeaderRewrite, FwdDeclKeepsReferencedSystemHeaderInGmf) {
   std::map<std::string, std::string> include_map = {
     {"fwdstr_lib/dep.h", "fwdstr_lib.internal.dep"},
   };
-  auto r = rewrite_header(data_path("fwdstr_lib/consumer.h"), "fwdstr_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwdstr_lib::foo"}, .fwd_declared_fqns = {"fwdstr_lib::foo"}});
+  auto r = rewrite_header(data_path("fwdstr_lib/consumer.h"), "fwdstr_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {"fwdstr_lib::foo"}, .fwd_declared_fqns = {"fwdstr_lib::foo"}});
   EXPECT_NE(r.cc_content.find("foo"), std::string::npos)
       << "the module-local forward declaration must be injected";
   EXPECT_NE(r.cc_content.find("#include <string>"), std::string::npos)
@@ -1006,7 +1006,7 @@ TEST(HeaderRewrite, CreditsStdlibPrivateHeaderUseToItsPublicHeader) {
   std::map<std::string, std::string> include_map = {
     {"fwdstr_lib/dep.h", "fwdstr_lib.internal.dep"},
   };
-  auto r = rewrite_header(data_path("fwdstr_lib/consumer.h"), "fwdstr_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwdstr_lib::foo"}, .fwd_declared_fqns = {"fwdstr_lib::foo"}});
+  auto r = rewrite_header(data_path("fwdstr_lib/consumer.h"), "fwdstr_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {"fwdstr_lib::foo"}, .fwd_declared_fqns = {"fwdstr_lib::foo"}});
   EXPECT_NE(r.cc_content.find("#include <string>"), std::string::npos)
       << "the public header owning the used declaration must be kept";
   EXPECT_EQ(r.cc_content.find("#include <bits/"), std::string::npos)
@@ -1111,7 +1111,7 @@ TEST(HeaderRewrite, PrimaryTemplateForwardDeclOfReachableSpecializationExported)
   // private — but consumers name `Foo<Signature>` via public macros, so
   // the primary template declaration must be exported from the module that owns
   // the specialization.
-  auto r = rewrite_header(data_path("tplreach_lib/api.h"), "tplreach_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"tplreach_lib::internal::Foo"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"tplreach_lib::internal::Foo"}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+  auto r = rewrite_header(data_path("tplreach_lib/api.h"), "tplreach_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {"tplreach_lib::internal::Foo"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {"tplreach_lib::internal::Foo"}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(r.cc_content.find("TPLREACH_LIB_EXPORT template <typename T>"),
             std::string::npos)
       << "the primary template forward declaration must be exported so "
@@ -1135,7 +1135,7 @@ TEST(HeaderRewrite, PrimaryTemplatePartialSpecNoClashingInjectedFwdDecl) {
   std::map<std::string, std::string> include_map = {
     {"fwdpart_lib/producer.h", "fwdpart_lib.producer"},
   };
-  auto r = rewrite_header(data_path("fwdpart_lib/consumer.h"), "fwdpart_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {"fwdpart_lib::internal::Box"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"fwdpart_lib::Box"}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+  auto r = rewrite_header(data_path("fwdpart_lib/consumer.h"), "fwdpart_lib.consumer", RewriteOptions{.combined_macros = false, .include_to_module = include_map, .reachable_fqns = {"fwdpart_lib::internal::Box"}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {"fwdpart_lib::Box"}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(r.cc_content.find("import fwdpart_lib.producer;"),
             std::string::npos)
       << "the producer header must become a module import";
@@ -1152,13 +1152,13 @@ TEST(HeaderRewrite, CrossModuleAliasTemplateExportedNotInjected) {
   // Instead the defining module must EXPORT the alias (it is added to the
   // reachable set), so the using module sees it through its import.
   auto use = rewrite_header(data_path("adlreach_lib/use.h"), "adlreach_lib.use", RewriteOptions{.combined_macros = false, .include_to_module = {{"adlreach_lib/prod.h", "adlreach_lib.prod"}}, .reachable_fqns = /*reachable_fqns=*/{"adlreach_lib::internal::Foo",
-                          "adlreach_lib::internal::Box"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+                          "adlreach_lib::internal::Box"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_EQ(use.cc_content.find("using Foo"),
             std::string::npos)
       << "the using module must NOT inject a copy of the alias template — it "
          "sees the exported definition via the import";
   auto prod = rewrite_header(data_path("adlreach_lib/prod.h"), "adlreach_lib.prod", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = /*reachable_fqns=*/{"adlreach_lib::internal::Foo",
-                          "adlreach_lib::internal::Box"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+                          "adlreach_lib::internal::Box"}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(prod.cc_content.find(
                 "ADLREACH_LIB_EXPORT template <typename T>\n"
                 "using Foo = Box<Kind::kB, T>;"),
@@ -1171,7 +1171,7 @@ TEST(HeaderRewrite, MemberAliasTemplateNotExported) {
   // An alias template declared inside a class must never get an export marker
   // prepended — that would inject `LIB_EXPORT template <...> using ...` inside
   // the class body and break with "expected member name".
-  auto r = rewrite_header(data_path("memalias_lib/api.h"), "memalias_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+  auto r = rewrite_header(data_path("memalias_lib/api.h"), "memalias_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   auto widget_pos = r.cc_content.find("class Foo");
   auto member_pos = r.cc_content.find("using Bar");
   EXPECT_NE(widget_pos, std::string::npos);
@@ -1192,7 +1192,7 @@ TEST(HeaderRewrite, CrossModuleFunctionTemplateGetsExternCxxInjection) {
   // in defs.h) and `Bar` (its helper). The using module must inject
   // module-local `extern "C++"` declarations so the template body's lookup at
   // its point of definition succeeds, without exporting them to consumers.
-  auto use = rewrite_header(data_path("tplbase_lib/use.h"), "tplbase_lib.use", RewriteOptions{.combined_macros = false, .include_to_module = {{"tplbase_lib/defs.h", "tplbase_lib.defs"}}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {"tplbase_lib::internal::Foo",
+  auto use = rewrite_header(data_path("tplbase_lib/use.h"), "tplbase_lib.use", RewriteOptions{.combined_macros = false, .include_to_module = {{"tplbase_lib/defs.h", "tplbase_lib.defs"}}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {"tplbase_lib::internal::Foo",
        "tplbase_lib::internal::Bar"}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(use.cc_content.find("extern \"C++\" template <typename F, typename Tuple>"),
             std::string::npos)
@@ -1210,7 +1210,7 @@ TEST(HeaderRewrite, CrossModuleFunctionTemplateGetsExternCxxInjection) {
   EXPECT_LT(impl_pos, apply_pos)
       << "the transitive dependency must be injected before its dependent";
   // The defining module marks both `extern "C++"`.
-  auto prod = rewrite_header(data_path("tplbase_lib/defs.h"), "tplbase_lib.defs", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {"tplbase_lib::internal::Foo",
+  auto prod = rewrite_header(data_path("tplbase_lib/defs.h"), "tplbase_lib.defs", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {"tplbase_lib::internal::Foo",
        "tplbase_lib::internal::Bar"}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(prod.cc_content.find(
                 "extern \"C++\" template <typename F, typename Tuple>\n"
@@ -1226,7 +1226,7 @@ TEST(HeaderRewrite, CrossModuleClassTemplateInjectedAsForwardDecl) {
   // declaration `template <typename P> struct Baz;` — NOT the full
   // definition with its base-class list, which would be malformed (the body
   // `{}` is stripped but `: integral_constant<...>` would remain).
-  auto use = rewrite_header(data_path("tplbase_lib/use.h"), "tplbase_lib.use", RewriteOptions{.combined_macros = false, .include_to_module = {{"tplbase_lib/defs.h", "tplbase_lib.defs"}}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {"tplbase_lib::internal::Baz",
+  auto use = rewrite_header(data_path("tplbase_lib/use.h"), "tplbase_lib.use", RewriteOptions{.combined_macros = false, .include_to_module = {{"tplbase_lib/defs.h", "tplbase_lib.defs"}}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {"tplbase_lib::internal::Baz",
        "tplbase_lib::internal::Box"}, .cc_only = /*cc_only=*/true});
   EXPECT_NE(use.cc_content.find(
                 "extern \"C++\" template <typename P>\n"
@@ -1261,7 +1261,7 @@ TEST(HeaderRewrite, MacroOnlyBlockStripsLibraryHeaderIncludes) {
   // includes), and keeping them textually would re-define libc++ declarations
   // that the modules already carry in their GMF (a macro-only block → 
   // `#include <iostream>`).
-  auto r = rewrite_header(data_path("macronly_inc.h"), "macronly.inc", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+  auto r = rewrite_header(data_path("macronly_inc.h"), "macronly.inc", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_EQ(r.macros_content.find("#include \"macronly_lib/dep.h\""),
             std::string::npos)
       << "the verbatim macro block must not keep a library-header include";
@@ -1279,7 +1279,7 @@ TEST(HeaderRewrite, CcOnlyInlinesHeaderIntoInterface) {
   // cc-only mode folds the whole header into the interface unit: no
   // `#include "api.h"`, no raw library includes (they become imports), and the
   // entities appear directly in the .cc purview.
-  auto r = rewrite_header(data_path("cconly_lib/api.h"), "cconly_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
+  auto r = rewrite_header(data_path("cconly_lib/api.h"), "cconly_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}, .cc_only = /*cc_only=*/true});
   EXPECT_EQ(r.cc_content.find("#include \"api.h\""), std::string::npos)
       << "cc-only mode must not include the header from the interface unit";
   EXPECT_EQ(r.cc_content.find("#include \"cconly_lib/dep.h\""),
@@ -1295,7 +1295,7 @@ TEST(HeaderRewrite, ExportPrecedesAttributeMacro) {
   // A cross-module declaration with a leading attribute macro
   // (`[[gnu::visibility]]`) must get the export + extern "C++" prefix BEFORE the
   // macro, not after it (which would put the attribute list before `export`).
-  auto r = rewrite_header(data_path("attr_lib/api.h"), "attr_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {"attr_lib::foo"}});
+  auto r = rewrite_header(data_path("attr_lib/api.h"), "attr_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {"attr_lib::foo"}});
   EXPECT_NE(r.h_content.find(
                 "ATTR_LIB_EXPORT extern \"C++\" ATTR_LIB_API_ bool foo"),
             std::string::npos)
@@ -1305,7 +1305,7 @@ TEST(HeaderRewrite, ExportPrecedesAttributeMacro) {
 TEST(HeaderRewrite, ExternCxxBlockWrapsHeaderInclude) {
   // With extern "C++" the header include must sit inside the extern "C++"
   // block: no premature close before it (which produced an extraneous `}`).
-  auto r = rewrite_header(data_path("cconly_lib/api.h"), "cconly_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
+  auto r = rewrite_header(data_path("cconly_lib/api.h"), "cconly_lib.api", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {}, .fwd_declared_fqns = {}});
   auto open = r.cc_content.find("extern \"C++\" {");
   auto inc = r.cc_content.find("#include \"cconly_lib/api.h\"");
   auto first_close = r.cc_content.find("}  // extern \"C++\"", open);
@@ -1353,10 +1353,10 @@ TEST(HeaderRewrite, ImportStdReplacesCppHeadersKeepsCHeaders) {
   // stdlib headers must be dropped/replaced by import std.compat, while the C
   // headers and the macro-carrying `cstdio`/`cerrno`/`cassert` wrappers stay
   // (they carry stderr/errno/assert macros a module cannot provide).
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"std.compat", {"iostream"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "std.compat", .headers = {"iostream"}}
   };
-  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   EXPECT_EQ(r.cc_content.find("#include <cstdint>"), std::string::npos)
       << "a C++ wrapper header provided by import std.compat must not be "
          "included outright";
@@ -1385,10 +1385,10 @@ TEST(HeaderRewrite, ImportStdReplacesCppHeadersKeepsCHeaders) {
 TEST(HeaderRewrite, GmfMergesDuplicateIncludes) {
   // a.h reaches <string> through many headers; the GMF must not repeat the
   // identical include line for each parent that pulled it in.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"std.compat", {"iostream"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "std.compat", .headers = {"iostream"}}
   };
-  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   auto count_of = [&](const std::string &line) {
     std::size_t n = 0, pos = 0;
     while ((pos = r.cc_content.find(line, pos)) != std::string::npos) {
@@ -1408,10 +1408,10 @@ TEST(HeaderRewrite, GmfSkipsEmptyGuardBlocks) {
   // guard-context block is deduplicated, the GMF must NOT emit the (now
   // empty) `#ifndef ... #endif` guards — that would bloat every interface and
   // implementation unit with thousands of redundant directives.
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"std.compat", {"iostream"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "std.compat", .headers = {"iostream"}}
   };
-  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   std::size_t pos = 0;
   int empty_blocks = 0;
   while ((pos = r.cc_content.find("#ifndef", pos)) != std::string::npos) {
@@ -1433,10 +1433,10 @@ TEST(HeaderRewrite, GmfSkipsLibcppInternalHeaders) {
   // are implementation details reached only through the public C++ headers;
   // the GMF must never emit them (they are covered by import std.compat or
   // pulled in by the kept public headers themselves).
-  std::map<std::string, std::set<std::string>> replaces = {
-    {"std.compat", {"iostream"}}
+  ModuleReplacements replaces = {
+    ModuleReplacement{.module = "std.compat", .headers = {"iostream"}}
   };
-  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = replaces});
+  auto r = rewrite_header(data_path("stdmod/a.h"), "stdmod.a", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = true, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = true, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = replaces});
   std::size_t pos = 0;
   int libcpp_includes = 0;
   while ((pos = r.cc_content.find("#include <", pos)) != std::string::npos) {
@@ -2146,7 +2146,7 @@ TEST(HeaderRewrite, DoesNotExternCxxFriendTemplateInsideClass) {
   // template <typename T> friend class Bar;` inside a class is ill-formed.
   // Here Foo is itself extern "C++" (forward-declared by another module) and
   // it friend-declares the class template Bar.
-  auto r = rewrite_header(data_path("friendtmpl_lib/base.h"), "friendtmpl_lib.base", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replaces = {}, .defined_fqns = {"friendtmpl_lib::Foo", "friendtmpl_lib::Bar"}, .fwd_declared_fqns = {"friendtmpl_lib::Foo", "friendtmpl_lib::Bar"}});
+  auto r = rewrite_header(data_path("friendtmpl_lib/base.h"), "friendtmpl_lib.base", RewriteOptions{.combined_macros = false, .include_to_module = {}, .reachable_fqns = {}, .extern_cxx = /*extern_cxx=*/false, .extra_args = {"-I", gDataDir}, .no_internal_filter = false, .import_std = false, .public_modules = {}, .internal_mode = InternalMode::kBoth, .module_replacements = {}, .defined_fqns = {"friendtmpl_lib::Foo", "friendtmpl_lib::Bar"}, .fwd_declared_fqns = {"friendtmpl_lib::Foo", "friendtmpl_lib::Bar"}});
   EXPECT_NE(r.h_content.find("template <typename T>\n  friend class Bar;"),
             std::string::npos)
       << "the friend template declaration must remain";
@@ -2349,4 +2349,224 @@ TEST(HeaderRewrite, ReadsDirectivesWrittenWithSpaceAfterTheHash) {
   EXPECT_NE(m.find("#   define SPACEDIR_API_KIND 2"), std::string::npos)
       << "both branches travel with the block; hoisting only the taken one "
          "hands every platform whatever the conversion host happened to be";
+}
+
+TEST(HeaderRewrite, DemotesInlineOnAnOutOfLineVirtualDefinition) {
+  // An out-of-line virtual definition is the key function of its class: it is
+  // where the vtable and typeinfo get emitted. Left `inline` inside a module
+  // interface unit it emits nothing at all — an inline function in a module
+  // unit is emitted only where it is odr-used, and it is not reachable for
+  // inlining from a module that merely imports the class. A second module
+  // deriving from that class then links against nothing:
+  //
+  //   undefined reference to `test_lib::Category::fallback(int) const'
+  //   undefined reference to `typeinfo for test_lib::Category'
+  //
+  // The interface unit compiles once, so it can drop the keyword; every
+  // textual includer still needs it. Hence the macro rather than a deletion.
+  auto r = rewrite_header(data_path("keyfn.h"), "keyfn_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.h_content.find("KEYFN_LIB_INLINE Cond Category::fallback"),
+            std::string::npos)
+      << "the out-of-line virtual must give up its literal `inline`; got:\n"
+      << r.h_content;
+  EXPECT_EQ(r.h_content.find("inline Cond Category::fallback"),
+            std::string::npos)
+      << "and the keyword must be gone, not merely joined by the macro";
+}
+
+TEST(HeaderRewrite, DefinesTheInlineMacroBothWaysInTheExportHeader) {
+  // The macro is what makes the demotion safe to ship: empty inside the
+  // module unit that owns the definition, `inline` for everyone including the
+  // header textually.
+  auto r = rewrite_header(data_path("keyfn.h"), "keyfn_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto &e = r.export_h_content;
+  EXPECT_NE(e.find("#ifdef KEYFN_LIB_USE_MODULES"), std::string::npos);
+  EXPECT_NE(e.find("#define KEYFN_LIB_INLINE\n"), std::string::npos)
+      << "empty in the owning interface unit; got:\n"
+      << e;
+  EXPECT_NE(e.find("#define KEYFN_LIB_INLINE inline"), std::string::npos)
+      << "and `inline` for every textual includer";
+}
+
+TEST(HeaderRewrite, LeavesInlineAloneOnNonVirtualDefinitions) {
+  // Only a key function is worth demoting. A plain out-of-line member or a
+  // free function keeps its `inline`: nothing about vtable emission hangs on
+  // it, and dropping the keyword would give the classic build one strong
+  // definition per includer.
+  auto r = rewrite_header(data_path("keyfn.h"), "keyfn_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.h_content.find("inline int Plain::twice"), std::string::npos)
+      << "a non-virtual member is not a key function";
+  EXPECT_NE(r.h_content.find("inline int triple"), std::string::npos)
+      << "nor is a free function";
+  EXPECT_EQ(r.h_content.find("KEYFN_LIB_INLINE int"), std::string::npos)
+      << "neither should have been demoted";
+}
+
+TEST(HeaderRewrite, DemotesInlineAheadOfTheLinkageMarkerAtTheSameOffset) {
+  // Both edits land on the definition's first token: `inline` starts it, and
+  // that is exactly where `extern "C++"` is inserted for a class another
+  // module forward-declares. apply_mods keeps push order at a shared offset,
+  // so the replacement has to be queued first — queued second it consumes the
+  // marker's own text and the header stops parsing:
+  //
+  //   KEYFN_LIB_INLINELIB_EXTERN_CXX_DECL inline Cond Category::fallback(...)
+  //   error: expected unqualified-id
+  auto r = rewrite_header(
+      data_path("keyfn.h"), "keyfn_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .fwd_declared_fqns = {"test_lib::Category"}});
+  EXPECT_NE(r.h_content.find("KEYFN_LIB_EXTERN_CXX_DECL KEYFN_LIB_INLINE Cond "
+                             "Category::fallback"),
+            std::string::npos)
+      << "linkage first, then the demoted keyword; got:\n"
+      << r.h_content;
+  EXPECT_EQ(r.h_content.find("inline Cond Category::fallback"),
+            std::string::npos)
+      << "the replacement must land on `inline`, not on the marker's own text";
+}
+
+TEST(HeaderRewrite, ClearsAUserSuppliedMacroInsideTheMacrosFile) {
+  // A configuration header that opens by rejecting its own macros —
+  //
+  //   #if defined(LIB_WINDOWS_API) || defined(LIB_POSIX_API)
+  //   #error ... must not be defined by users
+  //   #endif
+  //
+  // — reads them before it defines them, and the macros file has already
+  // supplied them by the time that check runs. The name is therefore dropped.
+  //
+  // It has to be dropped INSIDE the macros file, ahead of the definitions,
+  // where the file's own guard runs it exactly once. Dropped in the header
+  // instead, the `#undef` is sound only while the macros file has not been
+  // included yet — and once any other header has chained it in, the include
+  // that follows is a no-op and the name is left undefined for good:
+  //
+  //   error: BOOST_POSIX_API or BOOST_WINDOWS_API must be defined
+  auto r = rewrite_header(data_path("presencerr.h"), "presencerr_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto undef = r.macros_content.find("#undef PRESENCERR_POSIX_API");
+  auto define = r.macros_content.find("#  define PRESENCERR_POSIX_API");
+  ASSERT_NE(undef, std::string::npos)
+      << "the name guarding the #error is cleared in the macros file; got:\n"
+      << r.macros_content;
+  ASSERT_NE(define, std::string::npos);
+  EXPECT_LT(undef, define)
+      << "cleared before the definition it makes room for, not after";
+  EXPECT_EQ(r.h_content.find("#undef PRESENCERR_POSIX_API"), std::string::npos)
+      << "and NOT in the header, where it would fire against an already "
+         "included macros file and undefine the name permanently; got:\n"
+      << r.h_content;
+}
+
+TEST(HeaderRewrite, KeepsTheClearedMacroWhenAnotherHeaderChainedItInFirst) {
+  // The case the header-side #undef could not survive: a header whose own
+  // macros file pulls in the configuration header's macros, so those macros
+  // are already defined — and their include guard already set — before the
+  // configuration header itself is reached.
+  auto r = rewrite_header(data_path("presencerr_use.h"), "presencerr_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_EQ(r.h_content.find("#undef PRESENCERR_POSIX_API"), std::string::npos)
+      << "nothing in the rewritten header may undefine what the chained "
+         "macros file already supplied; got:\n"
+      << r.h_content;
+}
+
+TEST(HeaderRewrite, KeepsTheMacroTheClearedNameStandsFor) {
+  // The other half: having cleared the name, the macros file must still be
+  // what defines it, or the header is left with neither.
+  auto r = rewrite_header(data_path("presencerr.h"), "presencerr_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.macros_content.find("#  define PRESENCERR_POSIX_API"),
+            std::string::npos)
+      << "the macros file carries the definition; got:\n"
+      << r.macros_content;
+}
+
+// A module that provides headers replaces an include of one with an import of
+// it. `std` providing <vector> and a converted library providing its own
+// headers are the same arrangement, and these exercise it as one mechanism.
+
+TEST(HeaderRewrite, GuardedReplacementKeepsBothHalvesOfTheChoice) {
+  // An include belongs in the global module fragment and an import in the
+  // purview, so a replacement that can be switched off cannot simply swap one
+  // for the other: it emits the import under the guard and leaves the include
+  // in place under the negation. The guard is the PROVIDER's, so each provider
+  // is switched on by itself rather than by one project-wide flag.
+  auto r = rewrite_header(
+      data_path("replaces_lib/use.hpp"), "replaces_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES"}}});
+  EXPECT_NE(r.cc_content.find("#if defined(PROVIDER_IMPORT_MODULES)"),
+            std::string::npos)
+      << "the import is emitted under the provider's own guard; got:\n"
+      << r.cc_content;
+  EXPECT_NE(r.cc_content.find("import provider.thing;"), std::string::npos)
+      << "the module name is derived from the include path";
+  EXPECT_NE(r.cc_content.find("#if !defined(PROVIDER_IMPORT_MODULES)"),
+            std::string::npos)
+      << "and the include survives under the negation, for a build that has "
+         "not switched the provider on";
+}
+
+TEST(HeaderRewrite, ReplacementCarriesTheProvidersMacrosFile) {
+  // A module carries declarations but not macros, so a consumer that took a
+  // macro from the header it no longer includes is left without it:
+  //
+  //   error: use of undeclared identifier 'BOOST_CURRENT_LOCATION'
+  //
+  // The provider's macros file therefore travels with the import. Whether it
+  // wrote one is not knowable from this run — only the provider's own tree
+  // says — so the include asks.
+  auto r = rewrite_header(
+      data_path("replaces_lib/use.hpp"), "replaces_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES",
+                         .carries_macros_file = true}}});
+  EXPECT_NE(r.cc_content.find("__has_include(\"provider/thing_macros.h\")"),
+            std::string::npos)
+      << "the macros file is probed for, not assumed; got:\n"
+      << r.cc_content;
+  EXPECT_NE(r.cc_content.find("#include \"provider/thing_macros.h\""),
+            std::string::npos);
+}
+
+TEST(HeaderRewrite, UnguardedReplacementDropsTheIncludeOutright) {
+  // With no guard there is no second build to keep the include for, so the
+  // replacement is unconditional — what a plain --module-replaces entry has
+  // always done.
+  auto r = rewrite_header(
+      data_path("replaces_lib/use.hpp"), "replaces_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"}}}});
+  EXPECT_NE(r.cc_content.find("import provider.thing;"), std::string::npos);
+  EXPECT_EQ(r.cc_content.find("#include <provider/thing.hpp>"),
+            std::string::npos)
+      << "an unguarded replacement leaves no include behind; got:\n"
+      << r.cc_content;
+}
+
+TEST(HeaderRewrite, ImportsTheModuleTheReplacementNames) {
+  // One entry per converted module, so the module an include becomes is the
+  // one that entry names.
+  auto r = rewrite_header(
+      data_path("replaces_lib/use.hpp"), "replaces_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES"}}});
+  EXPECT_NE(r.cc_content.find("import provider.thing;"), std::string::npos)
+      << "provider/thing.hpp -> provider.thing; got:\n"
+      << r.cc_content;
 }

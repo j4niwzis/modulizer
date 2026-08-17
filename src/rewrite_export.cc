@@ -21,6 +21,7 @@ public:
                         std::string_view shared_export_macro,
                         std::string_view linkage_macro,
                         std::string_view extern_decl_macro,
+                        std::string_view inline_macro,
                         const std::vector<std::string> &reachable_fqns,
                         std::vector<std::string> &internal_fqns,
                         bool no_internal_filter = false,
@@ -36,7 +37,7 @@ public:
       : ctx(ctx), mods(mods), re(re), export_macro(export_macro),
         shared_export_macro(shared_export_macro),
         linkage_macro(linkage_macro),
-        extern_decl_macro(extern_decl_macro),
+        extern_decl_macro(extern_decl_macro), inline_macro(inline_macro),
         reachable_fqns(reachable_fqns), internal_fqns(internal_fqns),
         no_internal_filter(no_internal_filter), used_headers(used_headers),
         defined_fqns(defined_fqns), fwd_decls(fwd_decls),
@@ -57,6 +58,7 @@ public:
     }
     HeaderVisitor visitor(ctx.getSourceManager(), mods, re, export_macro,
                           shared_export_macro, linkage_macro, extern_decl_macro,
+                          inline_macro,
                           reachable_fqns, internal_fqns, no_internal_filter,
                           defined_fqns, extern_cxx, fwd_declared_fqns,
                           friend_extern_fqns, same_module_free_fqns,
@@ -507,6 +509,7 @@ private:
   std::string shared_export_macro;
   std::string linkage_macro;
   std::string extern_decl_macro;
+  std::string inline_macro;
   bool extern_cxx = false;
   std::string extern_cxx_macro;
   const std::vector<std::string> &fwd_declared_fqns;

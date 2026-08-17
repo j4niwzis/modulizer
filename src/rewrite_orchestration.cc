@@ -301,7 +301,9 @@ export struct RewriteBatchConfig {
   std::string module_name;
   std::string library_name;
   std::set<std::string> public_modules;
-  std::map<std::string, std::set<std::string>> module_replaces;
+  // The modules that provide headers these libraries include: `std` and any
+  // library already converted. See ModuleReplacement.
+  ModuleReplacements module_replacements;
   std::vector<std::string> defined_fqns;
   std::vector<std::string> fwd_declared_fqns;
   std::set<std::string> same_module_free_fqns;
@@ -371,7 +373,7 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
       it != cfg.extra_imports.end())
     o.extra_imports = it->second;
   o.internal_mode = cfg.internal_mode;
-  o.module_replaces = cfg.module_replaces;
+  o.module_replacements = cfg.module_replacements;
   o.defined_fqns = cfg.defined_fqns;
   o.fwd_declared_fqns = cfg.fwd_declared_fqns;
   o.cc_only = cfg.cc_only;

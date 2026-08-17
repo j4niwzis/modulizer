@@ -460,3 +460,156 @@ TEST(ConsumerRewrite, ReAddedSystemIncludesComeBeforeTheImports) {
   EXPECT_LT(inc, imp)
       << "a re-added C header must precede the standard library import";
 }
+
+TEST(ConsumerRewrite, TracesOutsideHeadersTheImportCannotSupply) {
+  // The consumer includes only the library header and takes `outside::Gadget`
+  // and OUTSIDE_TAG through it. Converting the library does not convert the
+  // outside header: the library's module units include it in their global
+  // module fragment, where its declarations attach to the global module and
+  // are invisible to anyone importing the module. The macro does not cross a
+  // module boundary at all.
+  //
+  // So the include the consumer never wrote has to be written for it:
+  //
+  //   error: missing '#include "boost/assert/source_location.hpp"';
+  //          'source_location' must be declared before it is used
+  //   error: use of undeclared identifier 'BOOST_CURRENT_LOCATION'
+  auto use = data_path("outsidelib/use.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end())
+      << "a consumer naming entities from an unconverted header needs it";
+  EXPECT_NE(it->second.count("outside/gadget.h"), 0u)
+      << "spelled as the include path, not as a bare file name — a bare "
+         "`gadget.h` resolves to nothing";
+}
+
+TEST(ConsumerRewrite, DoesNotAskForTheLibraryHeadersItImports) {
+  // The other half: what the module DOES provide must not come back as an
+  // include. Re-adding a library header alongside the import of the same
+  // module declares everything in it twice, once in the global module and
+  // once attached to the module.
+  auto use = data_path("outsidelib/use.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end());
+  for (const auto &inc : it->second)
+    EXPECT_EQ(inc.find("outsidelib/"), std::string::npos)
+        << "the library's own header must not be re-added: " << inc;
+}
+
+TEST(ConsumerRewrite, TracesTheOutsideHeadersTheLibraryInterfaceLeansOn) {
+  // A module's global module fragment is pruned to what is decl-reachable from
+  // its exported declarations. An outside TYPE named in the interface survives;
+  // an outside operator found only by ADL, when some template using it is
+  // instantiated in the consumer's translation unit, does not:
+  //
+  //   error: invalid operands to binary expression
+  //          ('const variant2::variant<...>' and the same)
+  //   note: candidate function not viable: operator==(monostate, monostate)
+  //
+  // — variant.hpp plainly visible, and the one operator that matters gone. So
+  // the outside headers the library's own headers pull in have to reach the
+  // consumer, which is exactly what it used to get transitively before the
+  // include became an import.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/holder.h"), data_path("outsidelib/api.h")},
+      {"-I", gDataDir});
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "the header carrying the ADL-only operator must reach the consumer";
+}
+
+TEST(ConsumerRewrite, StillReportsAHeaderSomeModuleProvides) {
+  // Whether a module actually provides one of these is decided at BUILD time,
+  // by the provider's own guard. Dropping it from the trace answers that
+  // question at conversion time and gets it wrong for every build with the
+  // guard off: nothing imports the module, the library's units include the
+  // header in their global module fragment, and pruning takes the ADL-only
+  // operators away again.
+  //
+  // So it is reported, and the caller emits both answers — the import under
+  // the guard, the include under its negation.
+  ModuleReplacements provided = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES"}};
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/holder.h")}, {"-I", gDataDir}, provided,
+      "OUTSIDELIB_USE_MODULES");
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "a header a module MIGHT provide is still one the consumer may need";
+}
+
+TEST(ConsumerRewrite, EmitsImportAndIncludeForAProvidedHeader) {
+  // The pair the guard chooses between, so one generated tree serves a build
+  // with the converted dependency and a build without it.
+  ConsumerRewriteOptions cfg;
+  cfg.include_to_module = {{"outsidelib/holder.h", {"outsidelib.holder", ""}}};
+  cfg.required_module_includes = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES",
+                        .carries_macros_file = true}};
+  auto out = rewrite_consumer_source(
+      "#include \"outsidelib/holder.h\"\nint main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("#if defined(OUTSIDE_IMPORT_MODULES)"), std::string::npos)
+      << "got:\n" << out;
+  EXPECT_NE(out.find("import outside.gadget;"), std::string::npos);
+  EXPECT_NE(out.find("#include <outside/gadget.h>"), std::string::npos)
+      << "and the include for the build that has not switched it on";
+  EXPECT_NE(out.find("outside/gadget_macros.h"), std::string::npos)
+      << "with the provider's macros file, which the module cannot carry";
+}
+
+TEST(ConsumerRewrite, LeavesOutAnIncludeTheLibraryOnlyMakesConditionally) {
+  // A header the library reaches for only on another platform is not the
+  // consumer's to include. Handed over unconditionally it is handed to every
+  // platform, and the ones it was never meant for stop compiling:
+  //
+  //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not available"
+  //
+  // The conversion's own `<PREFIX>_USE_MODULES` guard does not count: every
+  // generated header wraps its includes in it, and it says nothing about
+  // whether the include was conditional to begin with.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/holder.h")}, {"-I", gDataDir},
+      /*provided=*/{}, "OUTSIDELIB_USE_MODULES");
+  EXPECT_EQ(needed.count("outside/winonly.h"), 0u)
+      << "a conditional include must not be handed on unconditionally";
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "while one guarded only by the conversion's own macro still must be";
+}
+
+TEST(ConsumerRewrite, ReadsPastAHeadersOwnIncludeGuard) {
+  // An include guard wraps the whole file and is true exactly once; it says
+  // nothing about the includes inside it. Counted as a condition it makes
+  // every include in every guarded header look conditional — which is every
+  // header there is — and the trace reports nothing at all.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/guarded.h")}, {"-I", gDataDir}, /*provided=*/{},
+      "OUTSIDELIB_USE_MODULES");
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "an include guard must not hide what the header includes";
+}
+
+TEST(ConsumerRewrite, OnlyAsksForIncludesThatResolveOnTheSearchPath) {
+  // The re-added includes are emitted `#include <...>`, so a spelling that
+  // only works relative to the file that wrote it is worse than nothing.
+  // Clang will happily suggest one — it is the shortest way to name the file
+  // from the consumer — and the result does not compile:
+  //
+  //   test/production.cc:35:10: fatal error: production.h: No such file
+  //     35 | #include <production.h>
+  auto use = data_path("outsidelib/nested/use_sidecar.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  if (it == needed.end()) return;  // nothing traced at all is fine here
+  EXPECT_EQ(it->second.count("sidecar.h"), 0u)
+      << "a bare name resolves against no search directory";
+  for (const auto &inc : it->second)
+    EXPECT_NE(inc.find('/'), std::string::npos)
+        << "every re-added include must be search-path relative: " << inc;
+}
