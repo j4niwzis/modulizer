@@ -30,6 +30,15 @@ const std::vector<std::string> kStdIncludes = {
 
 } // namespace
 
+// Where a header's macros file sits when the include map does not say. The
+// conversion writes one whenever a header defines macros, so a lookup that
+// came back empty is worth asking the compiler about rather than treating as
+// an answer: a path that resolves differently at rewrite time than at build
+// time otherwise costs the consumer every macro it used to get textually.
+std::string conventional_macros_header(const std::string &include_path) {
+  return replacement_macros_header(include_path, /*hyphen_macros=*/false);
+}
+
 export struct ConsumerHeaderInfo {
   std::string module;
   std::string macro_header;  // empty when the header has no generated macro file
@@ -142,6 +151,9 @@ export std::string rewrite_consumer_source(
   // not lose them.
   std::vector<std::string> pending_imports;
   std::vector<std::string> pending_macros;
+  // Those among them that are a guess at the conventional name rather than a
+  // file the include map pointed at; they are asked for, not assumed.
+  std::set<std::string> probed_macros;
   // The library includes this rewrite takes out, kept for dual mode's `#else`.
   std::vector<std::string> replaced_includes;
   std::vector<std::string> out;
@@ -215,10 +227,14 @@ export std::string rewrite_consumer_source(
         auto it = options.include_to_module.find(inc->path);
         if (it != options.include_to_module.end()) {
           auto &mod = it->second.module;
-          auto &mh = it->second.macro_header;
+          // The name the include map gave, or the conventional one to ask
+          // about when it gave none.
+          const bool probed = it->second.macro_header.empty();
+          std::string mh = probed ? conventional_macros_header(inc->path)
+                                  : it->second.macro_header;
           bool have_import = existing_imports.count(mod) ||
                              std::ranges::contains(pending_imports, mod);
-          bool have_macro = mh.empty() || existing_quoted_includes.count(mh) ||
+          bool have_macro = existing_quoted_includes.count(mh) ||
                             std::ranges::contains(pending_macros, mh);
           if (cond_depth > 0 || it->second.reincludable) {
             // Guarded, or re-includable: replace it where it stands, so the
@@ -228,7 +244,12 @@ export std::string rewrite_consumer_source(
             if (!options.dual_macro.empty())
               out.push_back(std::format("#if defined({})\n", options.dual_macro));
             if (!have_import) out.push_back(std::format("import {};\n", mod));
-            if (!have_macro) out.push_back(std::format("#include \"{}\"\n", mh));
+            if (!have_macro)
+              out.push_back(probed
+                                ? std::format("#if __has_include(\"{0}\")\n"
+                                              "#include \"{0}\"\n#endif\n",
+                                              mh)
+                                : std::format("#include \"{}\"\n", mh));
             if (!options.dual_macro.empty()) {
               out.push_back("#else\n");
               out.push_back(std::string(line));
@@ -242,7 +263,10 @@ export std::string rewrite_consumer_source(
           }
           if (!insert_at) insert_at = out.size();
           if (!have_import) pending_imports.push_back(mod);
-          if (!have_macro) pending_macros.push_back(mh);
+          if (!have_macro) {
+            pending_macros.push_back(mh);
+            if (probed) probed_macros.insert(mh);
+          }
           replaced_includes.push_back(std::string(line));
           pos = nl + 1;
           ++src_line;
@@ -378,7 +402,10 @@ export std::string rewrite_consumer_source(
         !std::ranges::contains(pending_imports, m))
       modular += std::format("import {};\n", m);
   for (auto &mh : pending_macros)
-    modular += std::format("#include \"{}\"\n", mh);
+    modular += probed_macros.count(mh)
+                   ? std::format("#if __has_include(\"{0}\")\n"
+                                 "#include \"{0}\"\n#endif\n", mh)
+                   : std::format("#include \"{}\"\n", mh);
 
   // Dual mode: only the imports are conditional. What the file included
   // besides the library — `<boost/config/workaround.hpp>`, the C headers the

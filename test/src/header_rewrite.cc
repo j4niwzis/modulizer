@@ -2570,3 +2570,20 @@ TEST(HeaderRewrite, ImportsTheModuleTheReplacementNames) {
       << "provider/thing.hpp -> provider.thing; got:\n"
       << r.cc_content;
 }
+
+TEST(HeaderRewrite, MacroOnlyHeaderStillWritesItsMacrosFile) {
+  // A header whose whole content is a macro has nothing to export, but the
+  // macro is exactly what a consumer came for. If the conversion records no
+  // macros file, whoever maps the include to a module has nothing to offer in
+  // its place and the macro is simply gone:
+  //
+  //   production.h:44:3: error: 'FRIEND_TEST' has not been declared
+  auto r = rewrite_header(data_path("macroonly/friend_macro.h"),
+                          "macroonly.friend_macro",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_FALSE(r.macros_name.empty())
+      << "a macro-only header must still name a macros file";
+  EXPECT_NE(r.macros_content.find("MACROONLY_BEFRIEND"), std::string::npos)
+      << "carrying the macro; got:\n"
+      << r.macros_content;
+}

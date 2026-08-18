@@ -1157,6 +1157,20 @@ private:
       return true;
     }
 
+    // A header that cannot be read here cannot say what a consumer needs.
+    //
+    // Every library header is parsed on its own, which reaches headers no
+    // build on this platform ever includes. Their own includes are
+    // unconditional — the condition is on whoever includes THEM — so nothing
+    // inside the file says "not here", and taking them hands a header for
+    // another platform to every consumer:
+    //
+    //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not
+    //   available"
+    void EndSourceFileAction() override {
+      if (getCompilerInstance().getDiagnostics().hasErrorOccurred()) out.clear();
+    }
+
   private:
     std::set<std::string> &out;
     const std::set<std::string> &library_files;

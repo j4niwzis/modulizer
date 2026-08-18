@@ -613,3 +613,82 @@ TEST(ConsumerRewrite, OnlyAsksForIncludesThatResolveOnTheSearchPath) {
     EXPECT_NE(inc.find('/'), std::string::npos)
         << "every re-added include must be search-path relative: " << inc;
 }
+
+TEST(ConsumerRewrite, KeepsAMacroOnlyHeaderReachableFromAConsumerHeader) {
+  // A header that defines nothing but a macro has no declarations to export,
+  // so nothing about it crosses a module boundary. A consumer that used the
+  // macro must still be able to: either the include stays, or the macros file
+  // that carries it arrives instead.
+  //
+  //   production.h:44:3: error: 'FRIEND_TEST' has not been declared
+  //   production.h:44:3: error: ISO C++ forbids declaration of 'FRIEND_TEST'
+  //                             with no type
+  ConsumerRewriteOptions cfg;
+  cfg.is_header = true;
+  cfg.include_to_module = {
+      {"macroonly/friend_macro.h",
+       {"macroonly.friend_macro", "macroonly/friend_macro_macros.h"}}};
+  auto out = rewrite_consumer_source(
+      read_file(data_path("macroonly/user.h")), cfg);
+  bool has_macros_header =
+      out.find("macroonly/friend_macro_macros.h") != std::string::npos;
+  bool kept_include =
+      out.find("#include \"macroonly/friend_macro.h\"") != std::string::npos;
+  EXPECT_TRUE(has_macros_header || kept_include)
+      << "the macro has to reach the consumer somehow; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, ProbesForAMacrosFileItCouldNotResolve) {
+  // The macros file is found by asking the include path for it, and a path
+  // that answers differently at rewrite time than at build time leaves the
+  // consumer with an import and nothing else — every macro it used to get
+  // from that header is gone:
+  //
+  //   production.h:44:3: error: 'FRIEND_TEST' has not been declared
+  //
+  // The conversion writes a macros file whenever a header defines macros, so
+  // "not found" is worth a second question rather than a conclusion. Asked
+  // with __has_include, a file that is there is used and one that is not
+  // costs nothing.
+  ConsumerRewriteOptions cfg;
+  cfg.is_header = true;
+  cfg.include_to_module = {
+      {"macroonly/friend_macro.h", {"macroonly.friend_macro", ""}}};
+  auto out = rewrite_consumer_source(
+      read_file(data_path("macroonly/user.h")), cfg);
+  EXPECT_NE(out.find("import macroonly.friend_macro;"), std::string::npos);
+  EXPECT_NE(out.find("__has_include(\"macroonly/friend_macro_macros.h\")"),
+            std::string::npos)
+      << "ask for the macros file rather than assume it is not there; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, IgnoresALibraryHeaderThatCannotBeReadHere) {
+  // Every library header is parsed on its own to see what it includes, which
+  // reaches headers no build on this platform ever includes. Their includes
+  // are unconditional WITHIN them — the condition is on whoever includes them
+  // — so nothing inside the file says "not here", and handing those on gives
+  // every consumer a header for another platform:
+  //
+  //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not available"
+  //
+  // A header that cannot be read here cannot say what a consumer needs.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/other_platform.h")}, {"-I", gDataDir},
+      /*provided=*/{}, "OUTSIDELIB_USE_MODULES");
+  EXPECT_EQ(needed.count("outside/platform_only.h"), 0u)
+      << "a header that fails to parse contributes nothing";
+  EXPECT_TRUE(needed.empty()) << "nothing at all, in fact";
+}
+
+TEST(ConsumerRewrite, StillReadsTheHeadersThatDoParse) {
+  // And the ones that do parse are unaffected by a sibling that does not.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/other_platform.h"),
+       data_path("outsidelib/holder.h")},
+      {"-I", gDataDir}, /*provided=*/{}, "OUTSIDELIB_USE_MODULES");
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "one unreadable header must not silence the rest";
+  EXPECT_EQ(needed.count("outside/platform_only.h"), 0u);
+}
