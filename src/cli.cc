@@ -654,6 +654,9 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
 
   ConsumerRewriteOptions cfg;
   cfg.import_std = ImportStdOpt.getValue();
+  // The same separator the headers were generated with, so a macros file is
+  // asked for by the name it was actually written under.
+  cfg.hyphen_macros = HyphenMacrosOpt.getValue();
   cfg.include_to_module = std::move(include_map);
 
   // The consumer references internal entities (e.g. entities the library's

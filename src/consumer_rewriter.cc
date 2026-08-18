@@ -35,8 +35,9 @@ const std::vector<std::string> kStdIncludes = {
 // came back empty is worth asking the compiler about rather than treating as
 // an answer: a path that resolves differently at rewrite time than at build
 // time otherwise costs the consumer every macro it used to get textually.
-std::string conventional_macros_header(const std::string &include_path) {
-  return replacement_macros_header(include_path, /*hyphen_macros=*/false);
+std::string conventional_macros_header(const std::string &include_path,
+                                       bool hyphen_macros) {
+  return replacement_macros_header(include_path, hyphen_macros);
 }
 
 export struct ConsumerHeaderInfo {
@@ -57,6 +58,10 @@ export struct ConsumerRewriteOptions {
   // imported by the time it reaches them, and the declarations collide —
   //   error: redefinition of 'void* memchr(void*, int, size_t)'
   bool is_header = false;
+  // How this library names its files. A hyphenated library gets hyphenated
+  // macros files, and asking for the underscored name asks for a file nobody
+  // wrote — taking with it every macro the consumer came for.
+  bool hyphen_macros = false;
   std::map<std::string, ConsumerHeaderInfo> include_to_module;
   // System C/POSIX headers the consumer uses macros/symbols from (traced from
   // its source via trace_consumer_system_includes). `import std.compat` cannot
@@ -210,7 +215,7 @@ export std::string rewrite_consumer_source(
           out.push_back(std::format("#if defined({})\n", rep->guard));
           out.push_back(std::format("import {};\n", mod));
           if (rep->carries_macros_file) {
-            auto mh = replacement_macros_header(inc->path, /*hyphen_macros=*/false);
+            auto mh = replacement_macros_header(inc->path, options.hyphen_macros);
             out.push_back(std::format("#if __has_include(\"{}\")\n", mh));
             out.push_back(std::format("#include \"{}\"\n", mh));
             out.push_back("#endif\n");
@@ -230,7 +235,8 @@ export std::string rewrite_consumer_source(
           // The name the include map gave, or the conventional one to ask
           // about when it gave none.
           const bool probed = it->second.macro_header.empty();
-          std::string mh = probed ? conventional_macros_header(inc->path)
+          std::string mh = probed ? conventional_macros_header(inc->path,
+                                                               options.hyphen_macros)
                                   : it->second.macro_header;
           bool have_import = existing_imports.count(mod) ||
                              std::ranges::contains(pending_imports, mod);
@@ -368,7 +374,7 @@ export std::string rewrite_consumer_source(
       block += std::format("#if defined({})\n", r.guard);
       block += std::format("import {};\n", r.module);
       if (r.carries_macros_file) {
-        auto mh = replacement_macros_header(inc, /*hyphen_macros=*/false);
+        auto mh = replacement_macros_header(inc, options.hyphen_macros);
         block += std::format("#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n",
                              mh, mh);
       }

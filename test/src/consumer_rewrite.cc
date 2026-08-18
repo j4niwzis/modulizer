@@ -692,3 +692,81 @@ TEST(ConsumerRewrite, StillReadsTheHeadersThatDoParse) {
       << "one unreadable header must not silence the rest";
   EXPECT_EQ(needed.count("outside/platform_only.h"), 0u);
 }
+
+// The line a compiler reports for `needle` in `text`, counting the way one
+// does: each line advances the counter, and `#line N` sets the next line to N.
+static std::size_t reported_line_of(const std::string &text,
+                                    std::string_view needle) {
+  std::size_t line = 1;
+  for (std::size_t pos = 0; pos < text.size();) {
+    auto nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    auto content = std::string_view(text).substr(pos, nl - pos);
+    if (content.contains(needle)) return line;
+    auto trimmed = content.substr(std::min(content.find_first_not_of(" \t"),
+                                           content.size()));
+    if (trimmed.starts_with("#line ")) {
+      line = std::strtoul(std::string(trimmed.substr(6)).c_str(), nullptr, 10);
+    } else {
+      ++line;
+    }
+    pos = nl + 1;
+  }
+  return 0;
+}
+
+TEST(ConsumerRewrite, KeepsEveryLineWhereItWas) {
+  // The rewrite adds imports and moves includes, so it restores the numbering
+  // with `#line`. Off by one there is invisible until something reports a
+  // source location, and then every one of them is wrong:
+  //
+  //   ec_location_test.cpp(36): test 'ec.location().line() == 27'
+  //                             ('26' == '27') failed
+  auto src = read_file(data_path("lineno/use.cc"));
+  ASSERT_EQ(reported_line_of(src, "LINENO_MARKER"), 10u)
+      << "the fixture itself must have the marker on line 10";
+
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.include_to_module = {{"lineno/lib.h", {"lineno.lib", ""}}};
+  auto out = rewrite_consumer_source(src, cfg);
+  EXPECT_EQ(reported_line_of(out, "LINENO_MARKER"), 10u)
+      << "the marker has to still report line 10; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, SpellsAMacrosFileTheWayTheLibraryNamesItsFiles) {
+  // A library whose headers are hyphenated gets hyphenated macros files, and a
+  // consumer asked to include the underscored name asks for a file nobody
+  // wrote. The macro it came for is then simply missing:
+  //
+  //   production.h:41:3: error: a type specifier is required for all
+  //                             declarations
+  //     41 |   FRIEND_TEST(PrivateCodeTest, CanAccessPrivateMembers);
+  ConsumerRewriteOptions cfg;
+  cfg.hyphen_macros = true;
+  cfg.include_to_module = {{"lib/thing-here.h", {"lib.thing_here", ""}}};
+  auto out = rewrite_consumer_source(
+      "#include \"lib/thing-here.h\"\nint main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("lib/thing-here-macros.h"), std::string::npos)
+      << "the separator the library uses, not the default; got:\n"
+      << out;
+  EXPECT_EQ(out.find("thing-here_macros.h"), std::string::npos);
+}
+
+TEST(ConsumerRewrite, SpellsAProvidersMacrosFileTheSameWay) {
+  // The same for a module that provides headers: its macros file is named the
+  // way that library names files, not the way this one does.
+  ConsumerRewriteOptions cfg;
+  cfg.hyphen_macros = true;
+  cfg.module_replacements = {
+      ModuleReplacement{.module = "dep.thing_here",
+                        .headers = {"dep/thing-here.h"},
+                        .guard = "DEP_IMPORT_MODULES",
+                        .carries_macros_file = true}};
+  auto out = rewrite_consumer_source(
+      "#include \"dep/thing-here.h\"\nint main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("dep/thing-here-macros.h"), std::string::npos)
+      << "got:\n"
+      << out;
+}
