@@ -365,8 +365,25 @@ export std::string rewrite_consumer_source(
   // Seen first, the textual declarations are already in place when the module
   // arrives and the two agree. The whole block is emitted at one insertion
   // point, so this is only about the order within it.
+  // A header some module provides is left to the loop below, which writes the
+  // import and the include as the two branches of one condition. Written here
+  // as well it would arrive first and unconditionally, and the textual
+  // declarations it brings are the global module's while the ones the import
+  // brings are the provider's. Nothing diagnoses the two standing side by
+  // side; the consumer names one and the library was built against the other,
+  // and only the linker ever says so:
+  //
+  //   undefined reference to `boost::detail::throw_location@
+  //   boost.throw_exception::throw_location(boost::source_location const&)'
+  //
+  // — where the library defines that constructor taking the provider's
+  // `source_location@boost.assert.source_location`, and the two names differ
+  // by the module each type is attached to.
+  std::set<std::string> provided_by_module;
+  for (auto &r : options.required_module_includes)
+    provided_by_module.insert(r.headers.begin(), r.headers.end());
   for (auto &inc : options.required_system_includes)
-    if (!already_above_block(inc))
+    if (!already_above_block(inc) && !provided_by_module.count(inc))
       block += std::format("#include <{}>\n", inc);
   for (auto &r : options.required_module_includes) {
     for (auto &inc : r.headers) {
