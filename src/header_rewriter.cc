@@ -198,9 +198,30 @@ GmfAndImports classify_includes(
           // so the include asks:
           //
           //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+          //
+          // It goes in the GMF and not beside the import, though the import is
+          // what it belongs to. A macros file is text, and text read after
+          // `export module` is read into the module: a macros file carrying the
+          // standard header one of its bodies names would attach that header's
+          // declarations to this module, and they are the global module's —
+          //
+          //   error: declaration of 'source_location' in module
+          //          boost.exception.exception follows declaration in the
+          //          global module
+          //
+          // Reading it earlier costs nothing, macros being no respecters of the
+          // purview: what is defined before `export module` is still defined
+          // after it. The unit's own macros file is read there for the same
+          // reason.
           auto mh = replacement_macros_header(inc.path, options.hyphen_macros);
-          line += std::format(
-              "\n#if __has_include(\"{}\")\n#include \"{}\"\n#endif", mh, mh);
+          IncludeDirective minc = inc;
+          minc.path = mh;
+          minc.is_quoted = true;
+          minc.line = std::format(
+              "#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n", mh, mh);
+          minc.guard_stack.push_back(
+              std::format("#if defined({})\n", rep->guard));
+          out.gmf_incs.push_back(std::move(minc));
         }
         out.purview_imports.push_back(guarded_import(
             inc, std::format("#if defined({})\n{}\n#endif", rep->guard, line)));
