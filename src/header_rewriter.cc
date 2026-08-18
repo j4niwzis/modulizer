@@ -1243,7 +1243,8 @@ export HeaderRewriteResult rewrite_header(
   // In cc-only mode the header body is inlined into the interface unit where
   // USE_MODULES is always defined, so these includes are dropped entirely.
   hdr = wrap_includes_with_guard(std::move(hdr), includes, use_modules_macro,
-                                 /*remove=*/options.cc_only);
+                                 /*remove=*/options.cc_only,
+                                 options.module_replacements);
 
   auto prelude = std::format(
       "#pragma once\n"

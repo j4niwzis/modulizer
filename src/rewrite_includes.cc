@@ -362,7 +362,8 @@ export void emit_gmf_blocks(std::string &cc,
 // Skip includes that are inside #ifdef blocks (they keep original guards).
 export std::string wrap_includes_with_guard(
     std::string hdr, const std::vector<IncludeDirective> &includes,
-    const std::string &use_modules_macro, bool remove = false) {
+    const std::string &use_modules_macro, bool remove = false,
+    const ModuleReplacements &module_replacements = {}) {
   auto find_inc = [](const std::vector<IncludeDirective> &incs,
                      const std::string &path) -> const IncludeDirective * {
     for (auto &i : incs) if (i.path == path) return &i;
@@ -406,7 +407,26 @@ export std::string wrap_includes_with_guard(
         // library headers are imported and system headers live in the GMF).
       } else {
         wrapped_hdr += std::format("#ifndef {}\n", use_modules_macro);
+        // A header some module provides, under the negation of that module's
+        // own guard. This file is read by consumers, and a consumer may have
+        // imported the provider already — its own pair said to. Including the
+        // provider textually then declares a second time what the import gave
+        // it, and the two are not one entity:
+        //
+        //   error: declaration of 'source_location' in the global module
+        //          follows declaration in module boost.assert.source_location
+        //
+        // The guard above does not answer this. It says whether this file is
+        // being read as its own module's unit, which is a different question
+        // from whether the PROVIDER is a module here — and only the second one
+        // decides whether the include is a duplicate. The import half is left
+        // to the consumer's own pair; a header is not the place to write one.
+        auto *rep = find_replacement(inc_path, module_replacements);
+        bool guarded = rep && !rep->guard.empty();
+        if (guarded)
+          wrapped_hdr += std::format("#if !defined({})\n", rep->guard);
         wrapped_hdr += line;
+        if (guarded) wrapped_hdr += "#endif\n";
         // Named, so the merge below can tell this `#endif` from one the source
         // already had. Merging on a bare `#endif` deletes the wrong one.
         wrapped_hdr += std::format("#endif  // {}\n", use_modules_macro);

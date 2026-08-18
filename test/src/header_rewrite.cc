@@ -2717,3 +2717,43 @@ TEST(HeaderRewrite, DoesNotCarryTheStandardHeaderWhereStdIsImported) {
       << "must not be carried beside import std; got:\n"
       << r.macros_content;
 }
+
+TEST(HeaderRewrite, GeneratedHeaderSkipsAReplacedIncludeWhereItIsAModule) {
+  // The generated header is read by consumers, and a consumer may already have
+  // imported the provider — the pair at the top of its own file said to. This
+  // header then including the provider textually declares a second time what
+  // the import gave it, and the two are not one entity:
+  //
+  //   assert/source_location.hpp:37: error: declaration of 'source_location'
+  //     in the global module follows declaration in module
+  //     boost.assert.source_location
+  //   assert/source_location.hpp:149: error: declaration of 'operator<<' in
+  //     the global module follows declaration in module
+  //     boost.assert.source_location
+  //
+  // So the include is left to the builds where the provider is not a module.
+  // Only the negation: the import belongs to the consumer's own pair, which
+  // put those declarations there to begin with, and a header — which may be
+  // read anywhere in a translation unit — is no place to write one.
+  //
+  // The library's own USE_MODULES guard does not answer this. It says whether
+  // this file is being read as its module's unit, which is a different
+  // question from whether the PROVIDER is a module here, and only the second
+  // decides whether the include duplicates an import.
+  auto r = rewrite_header(
+      data_path("replaces_lib/use.hpp"), "replaces_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES"}}});
+  auto inc = r.h_content.find("#include <provider/thing.hpp>");
+  if (inc == std::string::npos) return;  // not included at all is also correct
+  auto guard = r.h_content.rfind("#if !defined(PROVIDER_IMPORT_MODULES)", inc);
+  EXPECT_NE(guard, std::string::npos)
+      << "the include must stand down where the provider is a module; got:\n"
+      << r.h_content;
+  EXPECT_LT(r.h_content.rfind("#ifndef REPLACES_LIB_USE_MODULES", inc), guard)
+      << "and stay inside the library's own guard; got:\n"
+      << r.h_content;
+}
