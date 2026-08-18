@@ -219,12 +219,33 @@ GmfAndImports classify_includes(
           minc.is_quoted = true;
           minc.line = std::format(
               "#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n", mh, mh);
-          minc.guard_stack.push_back(
-              std::format("#if defined({})\n", rep->guard));
+          // Outermost, as the include below is given the negation of the
+          // same guard. The condition the include sat under may call a macro
+          // the provider itself defines —
+          //
+          //   #if (BOOST_MP11_WORKAROUND( BOOST_MP11_GCC, >= 140000 ) && ...)
+          //
+          // and asking it first is asking the provider's macros for
+          // permission to read the provider's macros:
+          //
+          //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not
+          //          defined
+          //
+          // Under the provider's own guard the whole block is skipped where
+          // there is no import, and where there is one the macros have
+          // arrived with it by the time the condition is read.
+          minc.guard_stack.insert(minc.guard_stack.begin(),
+                                  std::format("#if defined({})\n", rep->guard));
           out.gmf_incs.push_back(std::move(minc));
         }
-        out.purview_imports.push_back(guarded_import(
-            inc, std::format("#if defined({})\n{}\n#endif", rep->guard, line)));
+        // The provider's guard outside the condition here too, and for the
+        // reason the macros file above is given the same order: the condition
+        // an include of the provider sat under is written in the provider's
+        // terms, and reading it first asks a question only the import can
+        // answer.
+        out.purview_imports.push_back(
+            std::format("#if defined({})\n{}\n#endif", rep->guard,
+                        guarded_import(inc, line)));
         inc.guard_stack.insert(inc.guard_stack.begin(),
                                std::format("#if !defined({})\n", rep->guard));
         out.gmf_incs.push_back(inc);

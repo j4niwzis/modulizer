@@ -2621,3 +2621,75 @@ TEST(HeaderRewrite, MacrosFileCarriesAConditionalStandardHeaderUnderItsGuard) {
       << "carried without its guard:\n"
       << r.macros_content;
 }
+
+TEST(HeaderRewrite, ProviderGuardSitsOutsideTheConditionTheIncludeSatUnder) {
+  // The macros file that comes with an import is read under the provider's
+  // guard, and under the condition the include it replaces sat beneath. The
+  // provider's guard has to be the outer of the two.
+  //
+  // Inside it, the condition is read first — and a condition on an include of
+  // the provider is written in the provider's terms:
+  //
+  //   #if (BOOST_MP11_WORKAROUND( BOOST_MP11_GCC, >= 140000 ) && ...)
+  //
+  // which asks the provider's macros for permission to read the provider's
+  // macros. Where nothing imports the provider, nothing has defined them and
+  // the question cannot be asked at all:
+  //
+  //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+  //
+  // Outside, the block is skipped whole where there is no import, and where
+  // there is one the macros arrived with it.
+  auto r = rewrite_header(
+      data_path("replaces_lib/cond_use.hpp"), "replaces_lib.cond",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES",
+                         .carries_macros_file = true}}});
+  auto at = r.cc_content.find("#include \"provider/thing_macros.h\"");
+  ASSERT_NE(at, std::string::npos) << "macros file not read:\n" << r.cc_content;
+  auto above = r.cc_content.substr(0, at);
+  auto guard = above.rfind("#if defined(PROVIDER_IMPORT_MODULES)");
+  auto cond = above.rfind("#if PROVIDER_WORKAROUND");
+  ASSERT_NE(guard, std::string::npos) << "no provider guard:\n" << r.cc_content;
+  ASSERT_NE(cond, std::string::npos) << "no condition:\n" << r.cc_content;
+  EXPECT_LT(guard, cond) << "the provider's guard must be the outer of the two;"
+                            " got:\n"
+                         << r.cc_content;
+}
+
+TEST(HeaderRewrite, ProviderGuardSitsOutsideThatConditionForTheImportToo) {
+  // The same nesting, for the import itself rather than the macros file that
+  // travels with it. The import is written under the provider's guard and
+  // under the condition the include it replaces sat beneath, and again the
+  // provider's guard has to be the outer of the two — for the same reason,
+  // the condition being written in the provider's terms:
+  //
+  //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+  //
+  // The window starts at `export module`, so what is measured is the import
+  // in the purview and not the macros file above it, which has its own copy
+  // of the same two lines.
+  auto r = rewrite_header(
+      data_path("replaces_lib/cond_use.hpp"), "replaces_lib.cond",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES",
+                         .carries_macros_file = true}}});
+  auto purview = r.cc_content.find("export module");
+  ASSERT_NE(purview, std::string::npos) << r.cc_content;
+  auto at = r.cc_content.find("import provider.thing;", purview);
+  ASSERT_NE(at, std::string::npos) << "no import:\n" << r.cc_content;
+  auto above = r.cc_content.substr(purview, at - purview);
+  auto guard = above.rfind("#if defined(PROVIDER_IMPORT_MODULES)");
+  auto cond = above.rfind("#if PROVIDER_WORKAROUND");
+  ASSERT_NE(guard, std::string::npos) << "no provider guard:\n" << r.cc_content;
+  ASSERT_NE(cond, std::string::npos) << "no condition:\n" << r.cc_content;
+  EXPECT_LT(guard, cond) << "the provider's guard must be the outer of the two;"
+                            " got:\n"
+                         << r.cc_content;
+}
