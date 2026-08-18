@@ -809,6 +809,68 @@ std::vector<std::string> macros_file_support_includes(
     }
     return false;
   };
+  // A macro whose BODY names a standard-library TYPE --
+  // `#define BOOST_CURRENT_LOCATION ::boost::source_location(::std::source_location::current())`.
+  // Same reason as above and the same remedy: the body is expanded where the
+  // macros file is included, in translation units that never read the header
+  // it came from, so the standard header declaring the type travels with it.
+  //
+  //   error: missing '#include'; 'source_location' must be declared before
+  //          it is used
+  //   note: expanded from macro 'BOOST_CURRENT_LOCATION'
+  //   note: declaration here is not visible
+  //
+  // Only a name the header itself included a header FOR counts, matched on
+  // that header's own stem -- `<source_location>` for `std::source_location`.
+  // It does not know that `<cstdio>` declares `printf`, and deliberately so:
+  // guessing wider carries standard headers nothing asked for, which is what
+  // the exclusion below exists to prevent.
+  auto include_stem = [](const std::string &path) {
+    auto stem = path;
+    if (auto dot = stem.find_last_of('.'); dot != std::string::npos)
+      stem.resize(dot);
+    return stem;
+  };
+  auto body_names = [&](std::string_view body, const std::string &stem) {
+    for (auto pos = body.find(stem); pos != std::string_view::npos;
+         pos = body.find(stem, pos + 1)) {
+      // `std::` in front is what marks it as the library's, rather than a word
+      // of the macro's own that happens to spell a header.
+      if (pos < 5 || body.substr(pos - 5, 5) != "std::") continue;
+      auto after = pos + stem.size();
+      if (after >= body.size() || !is_ident_char(body[after])) return true;
+    }
+    return false;
+  };
+  // Which of the header's own standard includes a macro body names. Unlike the
+  // includes gathered below this one may be conditional, and is carried under
+  // the condition it was written under rather than skipped: the header that
+  // declares the type is guarded by the very feature-test macro the macro
+  // definition is guarded by, so the two branches stand or fall together.
+  std::vector<const IncludeDirective *> std_entity_includes;
+  for (auto &inc : includes) {
+    if (inc.transitive || inc.is_quoted) continue;
+    auto stem = include_stem(inc.path);
+    if (stem.empty() || stem.find('/') != std::string::npos) continue;
+    // Both shapes of record: a plain `#define`, whose body is the one line,
+    // and a conditional block, whose body is the whole `#if`/`#elif` chain and
+    // whose name is empty. A macro that needs a standard header is more often
+    // the second -- it is defined one way where the header exists and another
+    // way where it does not.
+    bool named = false;
+    for (auto &m : export_macros)
+      if (body_names(m.body, stem)) {
+        named = true;
+        break;
+      }
+    if (!named) continue;
+    auto resolved =
+        resolve_include(inc.path, header_path.str(), options.extra_args);
+    // A standard header only: one of our own arrives as an import already.
+    if (resolved.empty() || !resolved_in_system_dir(resolved)) continue;
+    std_entity_includes.push_back(&inc);
+  }
+
   bool needs_system = false;
   if (!options.import_std)
     for (auto &m : export_macros)
@@ -877,6 +939,18 @@ std::vector<std::string> macros_file_support_includes(
           inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
                         : std::format("#include <{}>\n", inc.path));
     }
+  }
+  for (auto *inc : std_entity_includes) {
+    auto line = std::format("#include <{}>\n", inc->path);
+    if (std::ranges::find(block_support_includes, line) !=
+        block_support_includes.end())
+      continue;
+    auto guards = valid_guards(inc->guard_stack);
+    std::string out;
+    for (auto &g : guards) out += g;
+    out += line;
+    for (std::size_t i = 0; i < guards.size(); ++i) out += "#endif\n";
+    block_support_includes.push_back(std::move(out));
   }
   return block_support_includes;
 }

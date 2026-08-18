@@ -2587,3 +2587,37 @@ TEST(HeaderRewrite, MacroOnlyHeaderStillWritesItsMacrosFile) {
       << "carrying the macro; got:\n"
       << r.macros_content;
 }
+
+TEST(HeaderRewrite, MacrosFileCarriesTheStandardHeaderItsBodyNames) {
+  // A macros file travels on its own: it is included beside the import that
+  // replaced its header, in translation units that never included that header.
+  // A macro body naming a standard-library type therefore has to bring the
+  // header declaring it, or every use of the macro is a use of a type nobody
+  // declared:
+  //
+  //   throw_exception.hpp:229: error: missing '#include';
+  //                           'source_location' must be declared before it is used
+  //   note: expanded from macro 'BOOST_CURRENT_LOCATION'
+  //   note: declaration here is not visible
+  auto r = rewrite_header(data_path("macrostd/loc.h"), "macrostd.loc",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.macros_content.find("#include <source_location>"),
+            std::string::npos)
+      << "the macros file must carry it; got:\n"
+      << r.macros_content;
+}
+
+TEST(HeaderRewrite, MacrosFileCarriesAConditionalStandardHeaderUnderItsGuard) {
+  // The include is guarded by the very feature test the macro definition is
+  // guarded by. Dropping it for being conditional leaves the branch that uses
+  // the type without the header declaring it; copying it unconditionally asks
+  // for a header the other branch never wanted. It travels with its guard.
+  auto r = rewrite_header(data_path("macrostd/condloc.h"), "macrostd.condloc",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto at = r.macros_content.find("#include <source_location>");
+  ASSERT_NE(at, std::string::npos) << "not carried:\n" << r.macros_content;
+  EXPECT_NE(r.macros_content.rfind("#if defined(__cpp_lib_source_location)", at),
+            std::string::npos)
+      << "carried without its guard:\n"
+      << r.macros_content;
+}
