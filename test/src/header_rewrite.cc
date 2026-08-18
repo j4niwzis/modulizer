@@ -2693,3 +2693,27 @@ TEST(HeaderRewrite, ProviderGuardSitsOutsideThatConditionForTheImportToo) {
                             " got:\n"
                          << r.cc_content;
 }
+
+TEST(HeaderRewrite, DoesNotCarryTheStandardHeaderWhereStdIsImported) {
+  // The other side of MacrosFileCarriesTheStandardHeaderItsBodyNames. Where
+  // the consumer imports std, a textual standard header beside that import
+  // declares a second time what the import already carries, and the two are
+  // not one entity:
+  //
+  //   bits/stringfwd.h:79: error: reference to 'basic_string' is ambiguous
+  //   note: candidates are: 'template<...> class std::__cxx11::basic_string'
+  //   note:                 'template<...> class std::__cxx11::basic_string'
+  //
+  //   __new/allocate.h:39: error: call to 'operator new' is ambiguous
+  //
+  // So the header is not carried there. The macro keeps whatever the import
+  // gives it, and where that is not enough the answer is the import's to fix
+  // — carrying the header trades one broken build for another.
+  auto r = rewrite_header(
+      data_path("macrostd/loc.h"), "macrostd.loc",
+      RewriteOptions{.extra_args = {"-I", gDataDir}, .import_std = true});
+  EXPECT_EQ(r.macros_content.find("#include <source_location>"),
+            std::string::npos)
+      << "must not be carried beside import std; got:\n"
+      << r.macros_content;
+}

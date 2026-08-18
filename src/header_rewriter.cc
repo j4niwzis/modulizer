@@ -889,8 +889,20 @@ std::vector<std::string> macros_file_support_includes(
   // the condition it was written under rather than skipped: the header that
   // declares the type is guarded by the very feature-test macro the macro
   // definition is guarded by, so the two branches stand or fall together.
+  //
+  // Not where std is imported. The import already carries these declarations,
+  // and a textual header beside it declares them a second time without making
+  // them one entity:
+  //
+  //   bits/stringfwd.h: error: reference to 'basic_string' is ambiguous
+  //   __new/allocate.h: error: call to 'operator new' is ambiguous
+  //
+  // The macro keeps what the import gives it. Carrying the header there would
+  // trade one broken build for another, which is the same bargain the
+  // foreign-macro case above refuses.
   std::vector<const IncludeDirective *> std_entity_includes;
   for (auto &inc : includes) {
+    if (options.import_std) break;
     if (inc.transitive || inc.is_quoted) continue;
     auto stem = include_stem(inc.path);
     if (stem.empty() || stem.find('/') != std::string::npos) continue;
