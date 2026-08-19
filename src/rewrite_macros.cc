@@ -537,6 +537,39 @@ export bool header_guards_itself(const std::string &src) {
   return false;
 }
 
+
+// The preprocessor lines of a conditional, and nothing else. A chain that
+// chooses between arms and also declares something cannot be emitted whole --
+// the declarations would land in the global module fragment -- but its macros
+// are meaningless without the arms that select them, and a module unit that
+// imports the header rather than reading it has only this file to learn them
+// from. What defines a macro is a directive, so dropping every other line
+// keeps the machine and leaves the declarations behind.
+std::string directives_only(std::string_view block) {
+  std::string out;
+  bool cont = false;
+  std::size_t pos = 0;
+  while (pos < block.size()) {
+    auto nl = block.find('\n', pos);
+    if (nl == std::string_view::npos) nl = block.size();
+    auto line = block.substr(pos, nl - pos);
+    bool keep = cont;
+    if (!keep) {
+      auto d = parse_directive(line, /*skip_hash_ws=*/true,
+                              /*keyword_ends_crlf=*/true);
+      // An include would bring the declarations back by another door.
+      keep = d && d->keyword != "include";
+    }
+    if (keep) {
+      out += line;
+      out += '\n';
+      cont = !line.empty() && line.back() == '\\';
+    }
+    pos = nl + 1;
+  }
+  return out;
+}
+
 export std::string build_macros_file(
     const std::vector<MacroRec> &export_macros,
     // Macro header -> the conditional context it must be chained in under.
@@ -621,6 +654,7 @@ export std::string build_macros_file(
     return out;
   };
   bool has_marked_macros = false;
+  std::set<unsigned> emitted_arm_chains;
   for (auto &m : export_macros) {
     // Skip bare active definitions covered by an emitted conditional block:
     // one that covers every platform makes any definition of the name dead,
@@ -636,9 +670,20 @@ export std::string build_macros_file(
       // And a definition inside an arm-bearing chain that is NOT emitted: no
       // block carries its condition, so written here it is written for every
       // compiler, saying what only the converting one had any right to say.
+      // A definition inside an arm-bearing chain that is not emitted whole.
+      // Written bare it speaks for every compiler; left out altogether it is
+      // gone from the one file a module unit importing this header can learn
+      // it from. So the chain arrives here as its directives alone, once, in
+      // the place its first definition would have taken.
       bool in_arm = false;
       for (auto &[start, end] : unemitted_arm_ranges)
-        if (m.start_off >= start && m.end_off <= end) { in_arm = true; break; }
+        if (m.start_off >= start && m.end_off <= end) {
+          if (emitted_arm_chains.insert(start).second)
+            mout += directives_only(
+                std::string_view(original).substr(start, end - start));
+          in_arm = true;
+          break;
+        }
       if (in_arm) continue;
     }
     // Move the doc-comment block that precedes the macro into the macros file

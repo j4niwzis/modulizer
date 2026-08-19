@@ -2780,30 +2780,32 @@ TEST(HeaderRewrite, KeepsTheArmAMacroWasDefinedUnder) {
   //         in a constant expression
   auto r = rewrite_header(data_path("branchmac/flavor.h"), "branchmac",
                           RewriteOptions{.extra_args = {"-I", gDataDir}});
-  // What the file leaves the macro AT, read here, on a compiler that is not
-  // the one the arm is about. Asking whether the arm's definition appears at
-  // all says nothing when it does not — the question is whether reading this
-  // file would take the width away, and the answer has to be no whether the
-  // arm was carried with its condition or left behind altogether.
-  auto last = r.macros_content.rfind("BRANCHMAC_WIDTH");
-  ASSERT_NE(last, std::string::npos)
-      << "no macros file to speak of; got:\n"
-      << r.macros_content;
-  auto eol = r.macros_content.find('\n', last);
-  auto line = r.macros_content.substr(
-      last, eol == std::string::npos ? std::string::npos : eol - last);
-  EXPECT_NE(line.find("64"), std::string::npos)
-      << "the arm's redefinition is the one left standing, so every compiler "
-         "reads the width the arm's own compiler wanted; got:\n"
-      << r.macros_content;
-  // And the arm's own name never arrives without the condition that selects
-  // it, whichever way the arm was handled.
-  auto at = r.macros_content.find("BRANCHMAC_WIDTH 32");
-  if (at != std::string::npos)
-    EXPECT_NE(r.macros_content.substr(0, at).find("_MSC_VER"),
-              std::string::npos)
-        << "carried out of its arm; got:\n"
-        << r.macros_content;
+  auto &m = r.macros_content;
+  // The chain arrives with the arms that choose between its definitions, so
+  // each compiler reads its own.
+  ASSERT_NE(m.find("#if defined(__clang__)"), std::string::npos)
+      << "the chain is not here at all; got:\n"
+      << m;
+  EXPECT_NE(m.find("#elif defined(_MSC_VER)"), std::string::npos)
+      << "an arm went missing, and with it the condition that excludes what "
+         "it defines; got:\n"
+      << m;
+  // Every definition the chain makes is inside it. The one that matters is
+  // the arm's own: written outside, it would be read by every compiler.
+  auto at = m.find("BRANCHMAC_WIDTH 32");
+  ASSERT_NE(at, std::string::npos) << "the arm's definition is gone, so a "
+                                      "module unit importing this header can "
+                                      "no longer learn it; got:\n"
+                                   << m;
+  EXPECT_NE(m.substr(0, at).find("_MSC_VER"), std::string::npos)
+      << "carried out of its arm, so every compiler reads it; got:\n"
+      << m;
+  // And nothing the chain declares comes with it: a declaration here would
+  // land in the global module fragment of everyone who reads the file.
+  EXPECT_EQ(m.find("branchmac_gets"), std::string::npos)
+      << "a declaration inside the chain must not travel with its macros; "
+         "got:\n"
+      << m;
 }
 
 TEST(HeaderRewrite, DoesNotHoistAnArmsOwnDefinitionOutOfItsArm) {
