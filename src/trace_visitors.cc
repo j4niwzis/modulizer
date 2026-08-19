@@ -2,6 +2,9 @@ module;
 
 export module modulizer.trace_visitors;
 import modulizer.astutil;
+// For header_guards_itself: whether a file is a header at all, or a fragment
+// its includer reads between definitions of the terms it names.
+import modulizer.rewrite_macros;
 import modulizer.rewrite_util;
 import modulizer.util;
 import libtooling;
@@ -778,6 +781,34 @@ std::string outside_include_name_for(
     clang::FileID main_fid, const clang::HeaderSearch *hs,
     const std::set<std::string> &library_files) {
   auto fid = sm.getFileID(loc);
+  if (!fid.isValid() || fid == main_fid) return {};
+  // Out through anything that is not a header. A file with no include guard
+  // and no `#pragma once` is not one: it is a fragment its includer reads
+  // between definitions of the terms it names, sometimes more than once, and
+  // inside whatever namespace the includer opened. Named to a consumer it is
+  // read alone, at file scope, with none of that around it --
+  //
+  //   bind/detail/bind_cc.hpp:16: error: unknown type name 'BOOST_BIND_ST'
+  //   bind/detail/bind_cc.hpp:16: error: use of undeclared identifier '_bi';
+  //                              did you mean 'boost::_bi'?
+  //
+  // -- the second because the namespace went with it. The header that reads
+  // the fragment is the one a consumer can include, so the walk goes there.
+  //
+  // Asked of the file rather than of its name: the system-header walk beside
+  // this one knows `__`-prefixed files and `bits/` directories, which is every
+  // fragment a C library ships and none of the ones a C++ library does.
+  while (fid.isValid() && fid != main_fid) {
+    auto self = sm.getFileEntryRefForID(fid);
+    if (!self) break;
+    bool ok = true;
+    if (auto buf = sm.getBufferData(fid); !buf.empty())
+      ok = header_guards_itself(std::string(buf));
+    if (ok) break;
+    auto inc = sm.getIncludeLoc(fid);
+    if (!inc.isValid()) break;
+    fid = sm.getFileID(inc);
+  }
   if (!fid.isValid() || fid == main_fid) return {};
   auto fe = sm.getFileEntryRefForID(fid);
   if (!fe) return {};

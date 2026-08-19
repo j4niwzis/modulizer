@@ -907,3 +907,27 @@ TEST(ConsumerRewrite, LeavesAThirdPartyIncludeBelowTheImportItFollowed) {
          "followed it; got:\n"
       << out;
 }
+
+TEST(ConsumerRewrite, CreditsAFragmentsDeclarationToTheHeaderThatOwnsIt) {
+  // A declaration is credited to the file it is written in, and some files are
+  // not headers: an x-macro fragment carries no include guard and names terms
+  // its includer defines around it. Handed to a consumer as an include, it is
+  // read once, alone, with none of them —
+  //
+  //   bind/detail/bind_cc.hpp:16: error: unknown type name 'BOOST_BIND_ST'
+  //   bind/detail/bind_cc.hpp:16: error: use of undeclared identifier '_bi'
+  //
+  // and the second of those because the fragment is read outside the namespace
+  // its includer opened. The header that owns it is the one to name.
+  auto use = data_path("outsidelib/xmac/use_xmac.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end())
+      << "the consumer reaches an outside declaration, so something is owed";
+  EXPECT_EQ(it->second.count("outsidelib/xmac/body.hpp"), 0u)
+      << "a fragment with no guard of its own cannot be included alone";
+  EXPECT_NE(it->second.count("outsidelib/xmac/wrapper.hpp"), 0u)
+      << "the header that defines its terms and reads it is what a consumer "
+         "includes";
+}
