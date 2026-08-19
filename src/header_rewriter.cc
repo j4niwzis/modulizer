@@ -493,6 +493,10 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     std::vector<ModPoint> &mods, const std::vector<MacroRec> &export_macros,
     const std::set<std::string> &block_defined_names,
     const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
+    // Chains that choose between arms and are not emitted whole. Their
+    // definitions stay in the header, where the arm still selects them; the
+    // macros file gets the chain's directives instead.
+    const std::vector<std::pair<unsigned, unsigned>> &unemitted_arm_ranges,
     const std::string &original,
     // A header that is re-read at every inclusion computes its macros from the
     // state at that point, and a second copy of that machine left in the body
@@ -503,7 +507,9 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
   if (reincludable) {
     for (auto &m : export_macros) {
       if (m.end_off <= m.start_off) continue;
-      if (!m.name.empty() && inside_block(block_ranges, m)) continue;
+      if (!m.name.empty() &&
+          (inside_block(block_ranges, m) || inside_block(unemitted_arm_ranges, m)))
+        continue;
       ranges.push_back({m.start_off, m.end_off});
       mods.push_back({m.start_off, m.end_off - m.start_off, ""});
     }
@@ -519,6 +525,7 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     // to retract and no definition after it, so the macro ends up undefined
     // for everyone who includes the header.
     if (inside_block(block_ranges, m)) continue;
+    if (inside_block(unemitted_arm_ranges, m)) continue;
     ranges.push_back({m.start_off, m.end_off});
     auto guard = override_guard_with_code(original, m.start_off, m.name);
     if (guard.active) {
@@ -1220,8 +1227,8 @@ export HeaderRewriteResult rewrite_header(
   // the macros file (applied by build_macros_file), never to the header body,
   // where the macro definition is stripped out entirely.
   auto stripped_macro_ranges = collect_stripped_ranges(
-      mods, export_macros, block_defined_names, unemitted_arm_ranges, original,
-      !header_guards_itself(original));
+      mods, export_macros, block_defined_names, block_ranges,
+      unemitted_arm_ranges, original, !header_guards_itself(original));
 
   // The header body keeps the raw macro invocation; the export markers the
   // visitor placed INSIDE a macro definition (spelling locations) belong to the
