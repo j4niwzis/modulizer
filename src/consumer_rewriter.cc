@@ -388,7 +388,25 @@ export std::string rewrite_consumer_source(
   std::set<std::string> provided_by_module;
   for (auto &r : options.required_module_includes)
     provided_by_module.insert(r.headers.begin(), r.headers.end());
+  // The C headers the std module also declares go first, ahead of everything
+  // else the block hands over. The block carries other consumers' headers too,
+  // and a consumer header of this same conversion imports std itself — so one
+  // of these written after it is read after an import, and the declarations
+  // they share are then made twice:
+  //
+  //   bits/types/struct_tm.h:7: error: redefinition of 'struct tm'
+  //   string.h:105: error: redefinition of 'void* memchr(void*, int, size_t)'
+  //
+  // Reading them first is the whole of what they are here for.
   for (auto &inc : options.required_system_includes) {
+    if (already_above_block(inc) || provided_by_module.count(inc)) continue;
+    if (replaced_in_source.count(inc)) continue;
+    if (!kStdProvidedCHeaders.count(inc)) continue;
+    if (find_replacement(inc, options.module_replacements)) continue;
+    block += std::format("#include <{}>\n", inc);
+  }
+  for (auto &inc : options.required_system_includes) {
+    if (kStdProvidedCHeaders.count(inc)) continue;  // already above
     if (already_above_block(inc) || provided_by_module.count(inc)) continue;
     // Replaced where the source includes it: the pair is already in place and
     // a plain copy here would arrive above it, textually, and win.

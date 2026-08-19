@@ -849,3 +849,32 @@ TEST(ConsumerRewrite, ReadsStringHAheadOfEverythingElseTheBlockBrings) {
                           "in it may import std; got:\n"
                        << out;
 }
+
+TEST(ConsumerRewrite, LiftsAStdProvidedCHeaderAboveTheBlocksOwnHeaders) {
+  // <time.h> and its kind declare what the std module also declares, so a
+  // translation unit that reads one after importing std defines those twice:
+  //
+  //   bits/types/struct_tm.h:7: error: redefinition of 'struct tm'
+  //   note: previous definition, of module std.compat, imported at
+  //         gmock-matchers_test.h:40
+  //
+  // The import is not in this file. The block hands over another consumer's
+  // header, that header imports std itself, and a C header written after it
+  // in the block is already too late. They go to the front of the block, as
+  // <string.h> does and for the same reason.
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.is_header = false;
+  // Sorted, so the peer header is handed over first and the C header second —
+  // which is the order that breaks.
+  cfg.required_system_includes = {"peer/other.h", "time.h"};
+  auto out = rewrite_consumer_source("int main() { return 0; }\n", cfg);
+  auto th = out.find("#include <time.h>");
+  auto peer = out.find("#include <peer/other.h>");
+  ASSERT_NE(th, std::string::npos) << "dropped altogether; got:\n" << out;
+  ASSERT_NE(peer, std::string::npos) << "got:\n" << out;
+  EXPECT_LT(th, peer)
+      << "a std-provided C header must lead the block, since anything else in "
+         "it may import std; got:\n"
+      << out;
+}
