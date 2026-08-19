@@ -433,9 +433,18 @@ export std::string rewrite_consumer_source(
   //   internal compiler error: in nonnull_arg_p, at tree.cc
   // Reading the header first is what avoids it. A header must not do this (it
   // would land below the includer's import), which is why this is .cc only.
+  //
+  // First in the block, not last. The block carries other consumers' headers
+  // too, and a consumer header of this same conversion imports std itself, so
+  // anything written after one is written after an import:
+  //
+  //   string.h:105: error: redefinition of
+  //                 'void* memchr(void*, int, size_t)'
+  //   note: previously defined here, of module std.compat, imported at
+  //         googletest-param-test-test.h:35
   if (options.import_std && !options.is_header &&
       !already_above_block("string.h"))
-    block += "#include <string.h>\n";
+    block.insert(0, "#include <string.h>\n");
 
   if (options.import_std) {
     // std.compat (rather than std) also provides the C library's global names

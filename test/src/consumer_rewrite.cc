@@ -823,3 +823,29 @@ TEST(ConsumerRewrite, StillProvidesAReplacedHeaderTheSourceNeverIncluded) {
       << "and the include for the build that has not; got:\n"
       << out;
 }
+
+TEST(ConsumerRewrite, ReadsStringHAheadOfEverythingElseTheBlockBrings) {
+  // <string.h> is read for gcc's sake, and it has to be read before any
+  // import — that is the whole of what it is for. The block it sits in also
+  // carries other consumers' headers, and one of those imports std itself,
+  // so last in the block is still below an import:
+  //
+  //   string.h:105: error: redefinition of 'void* memchr(void*, int, size_t)'
+  //   note: 'void* memchr(void*, int, size_t)' previously defined here
+  //   ... of module std.compat, imported at <a header the block brought in>
+  //
+  // First in the block is the only place that holds.
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.is_header = false;
+  cfg.required_system_includes = {"outside/gadget.h"};
+  auto out = rewrite_consumer_source(
+      "#include \"peer.h\"\nint main() { return 0; }\n", cfg);
+  auto sh = out.find("#include <string.h>");
+  ASSERT_NE(sh, std::string::npos) << "not read at all; got:\n" << out;
+  auto other = out.find("#include <outside/gadget.h>");
+  ASSERT_NE(other, std::string::npos) << "got:\n" << out;
+  EXPECT_LT(sh, other) << "string.h must lead the block, since anything else "
+                          "in it may import std; got:\n"
+                       << out;
+}
