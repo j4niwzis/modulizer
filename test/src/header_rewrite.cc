@@ -317,7 +317,9 @@ TEST(HeaderRewrite, ExportsPublicClass) {
 
 TEST(HeaderRewrite, DoesNotExportDetailMembers) {
   auto r = rewrite_header(data_path("macro_test.h"), "test_lib");
-  if (r.h_content.empty()) { GTEST_SKIP(); return; }
+  ASSERT_FALSE(r.h_content.empty())
+      << "the rewrite produced no header at all, which is the failure this "
+         "test would otherwise step around";
   auto pos = r.h_content.find("\nnamespace detail");
   EXPECT_NE(pos, std::string::npos);
   auto after_start = r.h_content.find('{', pos);

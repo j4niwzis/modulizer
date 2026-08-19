@@ -606,7 +606,9 @@ TEST(ConsumerRewrite, OnlyAsksForIncludesThatResolveOnTheSearchPath) {
   auto lib = data_path("outsidelib/api.h");
   auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
   auto it = needed.find(use);
-  if (it == needed.end()) return;  // nothing traced at all is fine here
+  ASSERT_NE(it, needed.end())
+      << "this consumer does reach an outside header, so a trace that found "
+         "nothing is the thing going wrong, not a case to wave through";
   EXPECT_EQ(it->second.count("sidecar.h"), 0u)
       << "a bare name resolves against no search directory";
   for (const auto &inc : it->second)
