@@ -2778,17 +2778,29 @@ TEST(HeaderRewrite, KeepsTheArmAMacroWasDefinedUnder) {
   //         in a constant expression
   auto r = rewrite_header(data_path("branchmac/flavor.h"), "branchmac",
                           RewriteOptions{.extra_args = {"-I", gDataDir}});
-  // The file was written and holds what the chain does not guard, so an
-  // absence below is an absence and not an empty file.
-  ASSERT_NE(r.macros_content.find("BRANCHMAC_WIDTH 64"), std::string::npos)
+  // What the file leaves the macro AT, read here, on a compiler that is not
+  // the one the arm is about. Asking whether the arm's definition appears at
+  // all says nothing when it does not — the question is whether reading this
+  // file would take the width away, and the answer has to be no whether the
+  // arm was carried with its condition or left behind altogether.
+  auto last = r.macros_content.rfind("BRANCHMAC_WIDTH");
+  ASSERT_NE(last, std::string::npos)
       << "no macros file to speak of; got:\n"
       << r.macros_content;
-  // Spelled without the hash: the file keeps the source's own indenting, so
-  // the definition would arrive as `#  define`.
-  auto at = r.macros_content.find("BRANCHMAC_WIDTH 32");
-  if (at == std::string::npos) return;  // left behind entirely, which is safe
-  auto above = r.macros_content.substr(0, at);
-  EXPECT_NE(above.find("_MSC_VER"), std::string::npos)
-      << "carried out of its arm, so every compiler reads it; got:\n"
+  auto eol = r.macros_content.find('\n', last);
+  auto line = r.macros_content.substr(
+      last, eol == std::string::npos ? std::string::npos : eol - last);
+  EXPECT_NE(line.find("64"), std::string::npos)
+      << "the arm's redefinition is the one left standing, so every compiler "
+         "reads the width the arm's own compiler wanted; got:\n"
       << r.macros_content;
+  // And the arm's own name never arrives without the condition that selects
+  // it, whichever way the arm was handled.
+  auto at = r.macros_content.find("BRANCHMAC_WIDTH 32");
+  if (at != std::string::npos)
+    EXPECT_NE(r.macros_content.substr(0, at).find("_MSC_VER"),
+              std::string::npos)
+        << "carried out of its arm; got:\n"
+        << r.macros_content;
 }
+

@@ -315,7 +315,27 @@ export std::string rewrite_consumer_source(
           // already provided:
           //   error: redefinition of 'ssize_t read(int, void*, size_t)'
           // Only unguarded ones: a platform-guarded include keeps its guard.
-          if (insert_at && cond_depth == 0) {
+          // Only a header of the standard library's. The block stands where
+          // the first replaced include stood, so lifting one into it puts it
+          // above the imports — right for a C header, which must not be read
+          // after an import, and wrong for anyone else's: it moves the header
+          // above the import it used to follow, and a library read in an order
+          // its own headers never arranged for says so from the inside —
+          //
+          //   boost/mpl/aux_/integral_wrapper.hpp:42: error: unknown type
+          //          name 'AUX_WRAPPER_VALUE_TYPE'
+          //
+          // that one being read once per wrapper with the wrapper's macros
+          // defined around it. Where it stands is where it belongs.
+          //
+          // Which headers are the system's is not guessed from the shape of
+          // the name -- <sys/types.h> has a slash and <boost/mpl/at.hpp> has
+          // one too. It is what the trace already found the consumer taking
+          // from the system, plus the standard headers named above.
+          bool std_header = kStdHeaders.count(inc->path) ||
+                            kStdProvidedCHeaders.count(inc->path) ||
+                            options.required_system_includes.count(inc->path);
+          if (insert_at && cond_depth == 0 && std_header) {
             hoisted_system_includes.push_back(line);
             pos = nl + 1;
             ++src_line;
