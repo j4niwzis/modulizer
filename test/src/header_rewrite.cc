@@ -2757,3 +2757,38 @@ TEST(HeaderRewrite, GeneratedHeaderSkipsAReplacedIncludeWhereItIsAModule) {
       << "and stay inside the library's own guard; got:\n"
       << r.h_content;
 }
+
+TEST(HeaderRewrite, KeepsTheArmAMacroWasDefinedUnder) {
+  // A macro defined inside one arm of an #if/#elif chain is defined only for
+  // the compiler that arm is about. Hoisted into the macros file without it,
+  // the body is read by every compiler, and its inner conditions are written
+  // in the absent compiler's terms — undefined names, which the preprocessor
+  // reads as 0 and finds true:
+  //
+  //   #if _MSC_FULL_VER < 190024210   // 0 < 190024210, on clang
+  //   #  undef BOOST_MP11_CONSTEXPR
+  //   #  define BOOST_MP11_CONSTEXPR  // and now it is nothing
+  //
+  // Boost.Mp11 loses every constexpr that way, and the failure lands far from
+  // here, on the users of the macro:
+  //
+  //   error: constexpr variable 'r' must be initialized by a constant
+  //          expression
+  //   note: non-constexpr function 'construct_from_tuple<...>' cannot be used
+  //         in a constant expression
+  auto r = rewrite_header(data_path("branchmac/flavor.h"), "branchmac",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  // The file was written and holds what the chain does not guard, so an
+  // absence below is an absence and not an empty file.
+  ASSERT_NE(r.macros_content.find("BRANCHMAC_WIDTH 64"), std::string::npos)
+      << "no macros file to speak of; got:\n"
+      << r.macros_content;
+  // Spelled without the hash: the file keeps the source's own indenting, so
+  // the definition would arrive as `#  define`.
+  auto at = r.macros_content.find("BRANCHMAC_WIDTH 32");
+  if (at == std::string::npos) return;  // left behind entirely, which is safe
+  auto above = r.macros_content.substr(0, at);
+  EXPECT_NE(above.find("_MSC_VER"), std::string::npos)
+      << "carried out of its arm, so every compiler reads it; got:\n"
+      << r.macros_content;
+}
