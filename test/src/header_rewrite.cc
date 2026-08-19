@@ -2806,3 +2806,26 @@ TEST(HeaderRewrite, KeepsTheArmAMacroWasDefinedUnder) {
         << r.macros_content;
 }
 
+TEST(HeaderRewrite, DoesNotHoistAnArmsOwnDefinitionOutOfItsArm) {
+  // The arm a macro is defined under is what selects it, and that holds for
+  // the arm taken while converting as much as for the others. Captured as it
+  // expands here and written without its condition, the macros file says what
+  // the converting compiler decided and every other compiler reads it:
+  //
+  //   #define BRANCHMAC_CLANG 0     // the chain's own default
+  //   # define BRANCHMAC_CLANG 1    // from #if defined(__clang__), unguarded
+  //
+  // so a build with another compiler is told it is the one the conversion ran
+  // on. The value is right here and wrong everywhere else, which is the whole
+  // of what the arm was for.
+  auto r = rewrite_header(data_path("branchmac/flavor.h"), "branchmac",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto at = r.macros_content.find("BRANCHMAC_CLANG 1");
+  if (at == std::string::npos) {
+    SUCCEED() << "left with its arm, or left behind";
+    return;
+  }
+  EXPECT_NE(r.macros_content.substr(0, at).find("__clang__"), std::string::npos)
+      << "the arm's own condition must stand above what it defines; got:\n"
+      << r.macros_content;
+}

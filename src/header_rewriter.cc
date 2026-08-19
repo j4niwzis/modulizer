@@ -1157,7 +1157,8 @@ export HeaderRewriteResult rewrite_header(
   // Textually extract ALL #define lines from the original header,
   // including those inside inactive #if blocks. These are needed so that
   // guard macros in the GMF resolve correctly on any platform.
-  extract_textual_macros(original, macros);
+  std::vector<std::pair<unsigned, unsigned>> unemitted_arm_ranges;
+  extract_textual_macros(original, macros, &unemitted_arm_ranges);
 
   // A macro whose name is (re)defined inside an emitted conditional block must
   // not also be emitted as a bare unconditional #define from the active set:
@@ -1219,7 +1220,7 @@ export HeaderRewriteResult rewrite_header(
   // the macros file (applied by build_macros_file), never to the header body,
   // where the macro definition is stripped out entirely.
   auto stripped_macro_ranges = collect_stripped_ranges(
-      mods, export_macros, block_defined_names, block_ranges, original,
+      mods, export_macros, block_defined_names, unemitted_arm_ranges, original,
       !header_guards_itself(original));
 
   // The header body keeps the raw macro invocation; the export markers the
@@ -1362,7 +1363,7 @@ export HeaderRewriteResult rewrite_header(
     result.macros_content = build_macros_file(
         export_macros, extra_macro_includes, block_support_includes,
         block_defined_names, block_ranges, original, mods, export_include,
-        header_guards_itself(original));
+        header_guards_itself(original), unemitted_arm_ranges);
     result.macros_name = macros_name;
     // The macro definitions moved out of the header into the macros file, and
     // the body still uses them (`GTEST_INTERNAL_HAS_INCLUDE(<span>)`). The

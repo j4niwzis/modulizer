@@ -155,8 +155,13 @@ std::string strip_block_includes(std::string full) {
   return cleaned;
 }
 
-export void extract_textual_macros(const std::string &original,
-                                   std::vector<MacroRec> &macros) {
+export void extract_textual_macros(
+    const std::string &original, std::vector<MacroRec> &macros,
+    // Conditionals that choose between arms and are NOT emitted verbatim.
+    // What is defined inside one belongs to the arm that selects it, and no
+    // emitted block carries that arm along, so neither the header nor the
+    // macros file may take the definition out on its own.
+    std::vector<std::pair<unsigned, unsigned>> *unemitted_arm_ranges = nullptr) {
   std::string_view src(original);
   std::size_t pos = 0;
   std::set<std::string> seen_macro_names;
@@ -251,9 +256,12 @@ export void extract_textual_macros(const std::string &original,
           // fragment); its macros are still captured individually by
           // PPCallbacks. Whether a nested one is redundant — covered by an
           // enclosing block that gets emitted — is settled after the scan.
-          cands.push_back({b.start, nl + 1,
-                           b.has_define && !b.has_code && !b.is_zero,
-                           b.has_arms, std::move(b.children)});
+          bool worth = b.has_define && !b.has_code && !b.is_zero;
+          if (unemitted_arm_ranges && b.has_arms && !worth)
+            unemitted_arm_ranges->push_back(
+                {(unsigned)b.start, (unsigned)(nl + 1)});
+          cands.push_back({b.start, nl + 1, worth, b.has_arms,
+                           std::move(b.children)});
           auto idx = cands.size() - 1;
           if (!blocks.empty())
             blocks.back().children.push_back(idx);
@@ -546,7 +554,11 @@ export std::string build_macros_file(
     // machine, so the includes inside those branches belong to it as well.
     // (For a header included once, the branch is reproduced here AND kept in
     // the body, and the includes stay with the body.)
-    bool guard_once = true) {
+    bool guard_once = true,
+    // See extract_textual_macros: a definition inside an arm nobody carries
+    // stays where its arm selects it, which is the header.
+    const std::vector<std::pair<unsigned, unsigned>> &unemitted_arm_ranges =
+        {}) {
   const bool sole_copy = !guard_once;
   std::string mout;
   if (guard_once) mout += "#pragma once\n\n";
@@ -621,6 +633,13 @@ export std::string build_macros_file(
       for (auto &[start, end] : block_ranges)
         if (m.start_off >= start && m.end_off <= end) { in_block = true; break; }
       if (in_block) continue;
+      // And a definition inside an arm-bearing chain that is NOT emitted: no
+      // block carries its condition, so written here it is written for every
+      // compiler, saying what only the converting one had any right to say.
+      bool in_arm = false;
+      for (auto &[start, end] : unemitted_arm_ranges)
+        if (m.start_off >= start && m.end_off <= end) { in_arm = true; break; }
+      if (in_arm) continue;
     }
     // Move the doc-comment block that precedes the macro into the macros file
     // next to the macro it documents.
