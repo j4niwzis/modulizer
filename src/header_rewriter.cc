@@ -1226,6 +1226,15 @@ export HeaderRewriteResult rewrite_header(
   // The used-headers filter cannot keep them: the uses that need them are
   // written inside the kept include, not here, and a use outside the main file
   // is not recorded. So they are kept on the strength of what reached them.
+  //
+  // Only the standard ones. A condition found inside another project's header
+  // belongs to that header and is not carried here (see expand_include_closure),
+  // so anything else kept this way would be written unconditionally --
+  //
+  //   utf8_codecvt_facet.cc:30: fatal error: 'cygwin/version.h' file not found
+  //
+  // -- and it is the standard library's declarations that clash with the
+  // global module's copy anyway. The rest stay where the fragment reads them.
   {
     std::set<std::string> body_read;
     for (auto &inc : includes)
@@ -1238,7 +1247,7 @@ export HeaderRewriteResult rewrite_header(
       for (auto &inc : includes) {
         if (!inc.transitive || inc.from_body_read) continue;
         if (!body_read.count(inc.parent_resolved)) continue;
-        inc.from_body_read = true;
+        if (kStdHeaders.count(inc.path)) inc.from_body_read = true;
         if (auto r = resolve_include(inc.path, header_path, options.extra_args);
             !r.empty() && body_read.insert(r).second)
           grew = true;

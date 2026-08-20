@@ -2906,4 +2906,14 @@ TEST(HeaderRewrite, PutsAFragmentsIncludesInTheGlobalModuleFragment) {
   EXPECT_LT(at, purview)
       << "it must be read before the purview opens, not inside it; got:\n"
       << r.cc_content;
+  // Only the standard ones. The condition a fragment reads a platform header
+  // under is the fragment's own and does not travel with the include, so
+  // hoisting one would write it for every platform:
+  //
+  //   utf8_codecvt_facet.cc:30: fatal error: 'cygwin/version.h' file not found
+  EXPECT_EQ(r.cc_content.find("fragstd_platform/only_there.h"),
+            std::string::npos)
+      << "a header the fragment reads under a condition of its own must stay "
+         "where that condition is; got:\n"
+      << r.cc_content;
 }
