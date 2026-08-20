@@ -2852,3 +2852,32 @@ TEST(HeaderRewrite, MacroSelfCheckDoesNotOutliveItsDefinition) {
          "got:\n"
       << r.h_content;
 }
+
+TEST(HeaderRewrite, MacrosFileDoesNotClaimTheHeaderSOwnGuard) {
+  // A header whose guarded body is nothing but directives — it defines the
+  // namespace macros an include fragment is read under, includes it, and
+  // takes them back — has no code to disqualify its include guard from being
+  // emitted whole. Emitted whole, the guard's own `#define` goes with it, and
+  // the header reads that macros file ABOVE its guard:
+  //
+  //   #include "boost/filesystem/detail/utf8_codecvt_facet_macros.h"
+  //   ...
+  //   #ifndef BOOST_FILESYSTEM_UTF8_CODECVT_FACET_HPP   <-- already defined
+  //
+  // so the body never runs, the fragment is never read, and what it declares
+  // is missing from every build:
+  //
+  //   cstdio_test.cpp:86: error: no type named 'utf8_codecvt_facet' in
+  //     namespace 'boost::filesystem::detail'
+  auto r = rewrite_header(
+      data_path("fragguard/facet.h"), "fragguard_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir}});
+  ASSERT_NE(r.macros_content.find("#define FRAGGUARD_BEGIN_NAMESPACE"),
+            std::string::npos)
+      << "the fragment's namespace macros must reach the macros file; got:\n"
+      << r.macros_content;
+  EXPECT_EQ(r.macros_content.find("#define FRAGGUARD_FACET_HPP"),
+            std::string::npos)
+      << "but not the guard the header tests to decide whether to run; got:\n"
+      << r.macros_content;
+}
