@@ -211,6 +211,9 @@ export struct IncludeDirective {
   std::string line;
   std::vector<std::string> guard_stack;
   bool skip_gmf = false;
+  // Reached through an include the body keeps (see skip_gmf): its text is read
+  // in the module purview, so what it includes is read there too.
+  bool from_body_read = false;
   bool transitive = false;
   std::string parent_resolved;  // resolved path of the header that included it
   // Discovered inside a standard-library/system header (`<bits/types.h>` seen

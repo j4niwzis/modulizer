@@ -2881,3 +2881,29 @@ TEST(HeaderRewrite, MacrosFileDoesNotClaimTheHeaderSOwnGuard) {
       << "but not the guard the header tests to decide whether to run; got:\n"
       << r.macros_content;
 }
+
+TEST(HeaderRewrite, PutsAFragmentsIncludesInTheGlobalModuleFragment) {
+  // A header that reads an include fragment reads it in the module unit's
+  // PURVIEW: the fragment is not a module, and the terms it is read between
+  // are defined around it there. Whatever the fragment includes is read there
+  // too, and a standard header read in the purview attaches what it declares
+  // to this module, against the copy the global module already has:
+  //
+  //   bits/move.h:227: error: declaration of 'swap' in module
+  //     boost.filesystem.detail.utf8_codecvt_facet follows declaration in the
+  //     global module
+  //
+  // So it belongs above `export module`, with the rest of what the unit reads
+  // textually.
+  auto r = rewrite_header(data_path("fragstd/facet.hpp"), "fragstd.facet",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto purview = r.cc_content.find("export module");
+  ASSERT_NE(purview, std::string::npos) << r.cc_content;
+  auto at = r.cc_content.find("#include <bitset>");
+  ASSERT_NE(at, std::string::npos)
+      << "the fragment's own include must be somewhere; got:\n"
+      << r.cc_content;
+  EXPECT_LT(at, purview)
+      << "it must be read before the purview opens, not inside it; got:\n"
+      << r.cc_content;
+}

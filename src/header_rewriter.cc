@@ -301,7 +301,8 @@ GmfAndImports classify_includes(
         if (!inc.is_quoted) {
           auto resolved =
               resolve_include(inc.path, header_path.str(), options.extra_args);
-          if (!keep_transitive_system_include(resolved, inc.path,
+          if (!inc.from_body_read &&
+              !keep_transitive_system_include(resolved, inc.path,
                                               used_headers)) {
             // `<version>` defines only preprocessor macros the header body
             // evaluates (e.g. `__cpp_lib_char8_t`); macros are not tracked by
@@ -1211,6 +1212,38 @@ export HeaderRewriteResult rewrite_header(
         if (!inc.transitive && inc.offset > first_private_off &&
             std::filesystem::path(inc.path).has_extension())
           inc.skip_gmf = true;
+  }
+
+  // And what those bring with them. An include the body keeps is read in the
+  // PURVIEW -- that is the point of keeping it -- so everything it includes is
+  // read there too. A standard header read there attaches what it declares to
+  // this module, against the copy the global module already has:
+  //
+  //   bits/move.h:227: error: declaration of 'swap' in module
+  //     boost.filesystem.detail.utf8_codecvt_facet follows declaration in the
+  //     global module
+  //
+  // The used-headers filter cannot keep them: the uses that need them are
+  // written inside the kept include, not here, and a use outside the main file
+  // is not recorded. So they are kept on the strength of what reached them.
+  {
+    std::set<std::string> body_read;
+    for (auto &inc : includes)
+      if (inc.skip_gmf && !inc.transitive)
+        if (auto r = resolve_include(inc.path, header_path, options.extra_args);
+            !r.empty())
+          body_read.insert(r);
+    for (bool grew = !body_read.empty(); grew;) {
+      grew = false;
+      for (auto &inc : includes) {
+        if (!inc.transitive || inc.from_body_read) continue;
+        if (!body_read.count(inc.parent_resolved)) continue;
+        inc.from_body_read = true;
+        if (auto r = resolve_include(inc.path, header_path, options.extra_args);
+            !r.empty() && body_read.insert(r).second)
+          grew = true;
+      }
+    }
   }
 
   // PUBLIC macros (never #undef'd before the end of the header) move to the
