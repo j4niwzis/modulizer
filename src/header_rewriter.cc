@@ -1304,6 +1304,7 @@ export HeaderRewriteResult rewrite_header(
   hdr = wrap_includes_with_guard(std::move(hdr), includes, use_modules_macro,
                                  /*remove=*/options.cc_only,
                                  options.module_replacements);
+  hdr = export_body_read_includes(std::move(hdr), includes, use_modules_macro);
 
   auto prelude = std::format(
       "#pragma once\n"

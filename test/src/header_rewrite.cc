@@ -2916,4 +2916,19 @@ TEST(HeaderRewrite, PutsAFragmentsIncludesInTheGlobalModuleFragment) {
       << "a header the fragment reads under a condition of its own must stay "
          "where that condition is; got:\n"
       << r.cc_content;
+  // And what the fragment declares has to be exported. Nothing in it carries
+  // the marker -- it belongs to another project and is not rewritten -- so
+  // attached to this module and unexported, a consumer that imports cannot
+  // see it:
+  //
+  //   cstdio_test.cpp:86: error: missing '#include
+  //     "boost/detail/utf8_codecvt_facet.hpp"'; 'utf8_codecvt_facet' must be
+  //     declared before it is used
+  auto inc_at = r.h_content.find("#include <outside/fragstd_body.hpp>");
+  ASSERT_NE(inc_at, std::string::npos)
+      << "the fragment must still be read by the header; got:\n"
+      << r.h_content;
+  EXPECT_NE(r.h_content.rfind("export {", inc_at), std::string::npos)
+      << "what it declares must be exported where it is read; got:\n"
+      << r.h_content;
 }
