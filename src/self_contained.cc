@@ -174,6 +174,44 @@ Verdict classify_one(const std::string &path,
 
 }  // namespace
 
+// Whether a consumer could write `#include <name>` and have it compile with
+// nothing else around it. An include guard does not settle this: it says "read
+// me once", not "read me alone", and a fragment can carry one and still name
+// terms only its includer defines --
+//
+//   detail/utf8_codecvt_facet.hpp:99: error: unknown type name
+//     'BOOST_UTF8_BEGIN_NAMESPACE'
+//
+// -- so the question is put to the compiler, in the form the consumer would
+// write it.
+export bool include_stands_alone(const std::string &name,
+                                 const std::vector<std::string> &extra_args) {
+  auto flags = base_compile_flags();
+  flags.insert(flags.end(), extra_args.begin(), extra_args.end());
+  clang::tooling::FixedCompilationDatabase db(".", flags);
+  // The name the tool will open, not the one written here: it makes a relative
+  // argument absolute against the working directory, and a virtual file mapped
+  // under the other spelling is simply not there -- which reads as "this header
+  // does not compile" for every header asked about.
+  const std::string probe = "__mz_stands_alone.cc";
+  auto text = std::format("#include <{}>\n", name);
+  clang::tooling::ClangTool tool(db, {probe});
+  // Both spellings: the tool makes a relative argument absolute against the
+  // working directory, and a virtual file mapped under only one of them is
+  // simply not there -- which reads as "this header does not compile", for
+  // every header asked about.
+  tool.mapVirtualFile(probe, text);
+  std::error_code ec;
+  auto abs = std::filesystem::absolute(probe, ec);
+  if (!ec && abs.string() != probe) tool.mapVirtualFile(abs.string(), text);
+  ErrorCounter counter;
+  tool.setDiagnosticConsumer(&counter);
+  auto factory =
+      clang::tooling::newFrontendActionFactory<clang::SyntaxOnlyAction>();
+  tool.run(factory.get());
+  return counter.errors == 0;
+}
+
 // What the sweep found. `contexts` maps a header that needs one to the library
 // headers that have to be included ahead of it. `fragments` are headers no
 // context would fix: text meant to be pasted where it lands, the way an
