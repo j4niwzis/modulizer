@@ -1165,7 +1165,9 @@ export HeaderRewriteResult rewrite_header(
   // including those inside inactive #if blocks. These are needed so that
   // guard macros in the GMF resolve correctly on any platform.
   std::vector<std::pair<unsigned, unsigned>> unemitted_arm_ranges;
-  extract_textual_macros(original, macros, &unemitted_arm_ranges);
+  std::vector<std::pair<unsigned, unsigned>> rejection_ranges;
+  extract_textual_macros(original, macros, &unemitted_arm_ranges,
+                         &rejection_ranges);
 
   // A macro whose name is (re)defined inside an emitted conditional block must
   // not also be emitted as a bare unconditional #define from the active set:
@@ -1229,6 +1231,13 @@ export HeaderRewriteResult rewrite_header(
   auto stripped_macro_ranges = collect_stripped_ranges(
       mods, export_macros, block_defined_names, block_ranges,
       unemitted_arm_ranges, original, !header_guards_itself(original));
+
+  // A block that rejects one of this header's own macros as user input goes
+  // out whole. The header reads its generated macros file above that block, so
+  // what the rejection finds there is the library's own definition, and the
+  // header errors out on the first read of it.
+  for (auto [rs, re] : rejection_ranges)
+    mods.push_back({rs, re - rs, ""});
 
   // The header body keeps the raw macro invocation; the export markers the
   // visitor placed INSIDE a macro definition (spelling locations) belong to the
@@ -1487,10 +1496,14 @@ export HeaderRewriteResult rewrite_header(
       std::set<std::string> errored;
       std::size_t pos = 0;
       std::string pending_cond;
-      while (pos < hdr.size()) {
-        auto nl = hdr.find('\n', pos);
-        if (nl == std::string::npos) nl = hdr.size();
-        auto line = std::string_view(hdr).substr(pos, nl - pos);
+      // The source, not the rewritten header: the check itself is cut out of
+      // the header (it judges a macro this file defines, and the macros file
+      // supplies that definition above it), and the names it named have to
+      // outlive it.
+      while (pos < original.size()) {
+        auto nl = original.find('\n', pos);
+        if (nl == std::string::npos) nl = original.size();
+        auto line = std::string_view(original).substr(pos, nl - pos);
         auto d = parse_directive(line);
         if (d && (d->keyword == "if" || d->keyword == "elif"))
           pending_cond = d->after;

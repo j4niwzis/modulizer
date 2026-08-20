@@ -2831,3 +2831,24 @@ TEST(HeaderRewrite, DoesNotHoistAnArmsOwnDefinitionOutOfItsArm) {
       << "the arm's own condition must stand above what it defines; got:\n"
       << r.macros_content;
 }
+
+TEST(HeaderRewrite, MacroSelfCheckDoesNotOutliveItsDefinition) {
+  // A header that rejects a macro as user input and then derives it itself
+  // reads its own generated macros file at the top, above that rejection. Once
+  // the deriving chain moves to the macros file, the rejection is left below
+  // it, sees the library's own definition, and fires on the first read of the
+  // header:
+  //
+  //   config.hpp:76: error: BOOST_FILESYSTEM_WINDOWS_API and
+  //     BOOST_FILESYSTEM_POSIX_API must not be defined by users
+  //
+  // The rejection belongs to the chain that moved. It cannot stay behind.
+  auto r = rewrite_header(data_path("selfcheck.h"), "selfcheck_lib");
+  ASSERT_NE(r.macros_content.find("#define SELFCHECK_API"), std::string::npos)
+      << "the deriving chain must reach the macros file; got:\n"
+      << r.macros_content;
+  EXPECT_EQ(r.h_content.find("must not be defined by users"), std::string::npos)
+      << "the rejection must not be left below the definition it rejects; "
+         "got:\n"
+      << r.h_content;
+}

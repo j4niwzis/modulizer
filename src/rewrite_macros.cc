@@ -161,18 +161,26 @@ export void extract_textual_macros(
     // What is defined inside one belongs to the arm that selects it, and no
     // emitted block carries that arm along, so neither the header nor the
     // macros file may take the definition out on its own.
-    std::vector<std::pair<unsigned, unsigned>> *unemitted_arm_ranges = nullptr) {
+    std::vector<std::pair<unsigned, unsigned>> *unemitted_arm_ranges = nullptr,
+    // Blocks that raise a diagnostic about a macro this file itself defines.
+    // They are cut out of the header body; see the loop that fills them.
+    std::vector<std::pair<unsigned, unsigned>> *rejection_ranges = nullptr) {
   std::string_view src(original);
   std::size_t pos = 0;
   std::set<std::string> seen_macro_names;
   for (auto &m : macros)
     seen_macro_names.insert(m.name);
+  // Every non-guard name this file defines, wherever it sits, and the blocks
+  // that raise a diagnostic without defining anything.
+  std::set<std::string, std::less<>> defined_names;
+  std::vector<std::pair<std::size_t, std::size_t>> rejections;
 
   struct CondBlock {
     std::size_t start;  // offset of the `#if` line
     bool is_zero;       // `#if 0` (dead on every platform)
     bool has_define;    // contains a non-guard #define (in any nested branch)
     bool has_code;      // contains a non-preprocessor (declaration) line
+    bool has_error;     // contains `#error`/`#warning` and nothing else
     // Has `#elif`/`#else` arms, so what is inside it belongs to one arm and
     // not to the block as a whole.
     bool has_arms = false;
@@ -245,7 +253,7 @@ export void extract_textual_macros(
           auto ns = rest.find_first_not_of(" \t");
           is_zero = ns != std::string_view::npos && rest[ns] == '0';
         }
-        blocks.push_back({pos, is_zero, false, false, false, {}});
+        blocks.push_back({pos, is_zero, false, false, false, false, {}});
       } else if (dir == "endif") {
         if (!blocks.empty()) {
           auto b = std::move(blocks.back());
@@ -260,6 +268,9 @@ export void extract_textual_macros(
           if (unemitted_arm_ranges && b.has_arms && !worth)
             unemitted_arm_ranges->push_back(
                 {(unsigned)b.start, (unsigned)(nl + 1)});
+          if (rejection_ranges && b.has_error && !b.has_define &&
+              !b.has_code && !b.has_arms && !b.is_zero)
+            rejections.push_back({b.start, nl + 1});
           cands.push_back({b.start, nl + 1, worth, b.has_arms,
                            std::move(b.children)});
           auto idx = cands.size() - 1;
@@ -268,12 +279,27 @@ export void extract_textual_macros(
           else
             roots.push_back(idx);
         }
+      } else if (dir == "error" || dir == "warning") {
+        // A diagnostic the library raises about its own configuration. Which
+        // macros it is judging is settled after the scan: the ones it rejects
+        // are usually defined below it.
+        if (!blocks.empty()) blocks.back().has_error = true;
       } else if (dir == "else" || dir == "elif") {
         // keep blocks unchanged, but remember that this one chooses between
         // arms: what is nested inside belongs to the arm it sits in, which is
         // not something recorded here.
         if (!blocks.empty()) blocks.back().has_arms = true;
       } else if (dir == "define" && !d->after.empty()) {
+        {
+          auto after = d->after;
+          auto ns = after.find_first_not_of(" \t");
+          if (ns != std::string_view::npos) {
+            auto ne = after.find_first_of("( \t", ns);
+            auto mname = after.substr(
+                ns, ne == std::string_view::npos ? ne : ne - ns);
+            if (!is_guard_name(mname)) defined_names.emplace(mname);
+          }
+        }
         if (blocks.empty()) {
           capture_macro(line, d->hash_pos, nl);
         } else {
@@ -364,6 +390,38 @@ export void extract_textual_macros(
     for (auto child : c.children) self(self, child);
   };
   for (auto idx : roots) emit(emit, idx);
+
+  // A header that rejects one of its own macros as user input reads its
+  // generated macros file above that rejection, so what the rejection finds is
+  // the library's own definition and it fires on the first read:
+  //
+  //   config.hpp:76: error: BOOST_FILESYSTEM_WINDOWS_API and
+  //     BOOST_FILESYSTEM_POSIX_API must not be defined by users
+  //
+  // Once the macros are the library's to replay, the header can no longer tell
+  // a user's definition from its own, and the question the rejection asks has
+  // no answer left. Only the ones judging a macro this file defines go: a
+  // diagnostic about anything else is still about something the header can see.
+  for (auto [start, end] : rejections) {
+    auto nl = src.find('\n', start);
+    auto cond = src.substr(start, nl == std::string_view::npos ? nl
+                                                               : nl - start);
+    for (std::size_t i = 0; i < cond.size();) {
+      if (!(std::isalpha((unsigned char)cond[i]) || cond[i] == '_')) {
+        ++i;
+        continue;
+      }
+      auto j = i;
+      while (j < cond.size() &&
+             (std::isalnum((unsigned char)cond[j]) || cond[j] == '_'))
+        ++j;
+      if (defined_names.count(cond.substr(i, j - i))) {
+        rejection_ranges->push_back({(unsigned)start, (unsigned)end});
+        break;
+      }
+      i = j;
+    }
+  }
 }
 
 // Result of override-guard analysis for a macro define.
