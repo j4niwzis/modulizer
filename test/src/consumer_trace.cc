@@ -360,12 +360,16 @@ TEST(ConsumerTrace, TracesSystemIncludesOfConvertedConsumer) {
   std::map<std::string, std::string> virtual_sources = {
       {consumer,
        demodularize_consumer_source(read_file(consumer), include_to_module)}};
-  // No assertion on the contents (this consumer uses no C library macros) —
-  // the point is that tracing runs on the reconstruction instead of dying on
-  // the unresolvable import.
+  // What is being checked is that tracing RAN — on the reconstruction rather
+  // than dying on the unresolvable import. This consumer uses no C library
+  // macros, so it needs no includes; the parse of the file as it stands finds
+  // nothing either, which is why the two are compared instead.
   auto traced = trace_consumer_system_includes({consumer}, extra_args,
                                                &virtual_sources);
-  EXPECT_TRUE(traced.empty() || traced.count(consumer) == 1);
+  auto unreconstructed = trace_consumer_system_includes({consumer}, extra_args);
+  EXPECT_EQ(traced, unreconstructed)
+      << "a reconstruction must not change what a consumer needs from the "
+         "system";
 }
 
 TEST(ConsumerTrace, VirtualSourceAppliesToRelativeConsumerPaths) {
@@ -373,9 +377,19 @@ TEST(ConsumerTrace, VirtualSourceAppliesToRelativeConsumerPaths) {
   // relative to the tree being converted, while ClangTool parses them by
   // absolute path. A virtual source keyed by the path as given would then
   // never be found and the pass would silently parse the file on disk — the
-  // very file that does not parse. The test binary runs from the project
-  // root, so this exercises the relative form end to end.
-  std::string consumer = "test/data/reconv_lib/consumer_converted.cc";
+  // very file that does not parse.
+  //
+  // Relative to wherever the binary is being run from, rather than assuming
+  // that is the project root: the point is the relative FORM, and a test that
+  // also demands a particular working directory fails for a reason that has
+  // nothing to do with what it checks.
+  std::error_code rel_ec;
+  auto consumer = std::filesystem::relative(
+      data_path("reconv_lib/consumer_converted.cc"),
+      std::filesystem::current_path(), rel_ec).string();
+  ASSERT_FALSE(rel_ec || consumer.empty()) << "cannot express the data path "
+                                              "relative to the current "
+                                              "directory";
   std::string producer = data_path("reconv_lib/producer.h");
   std::vector<std::string> extra_args = {"-I", gDataDir};
   std::map<std::string, ConsumerHeaderInfo> include_to_module = {

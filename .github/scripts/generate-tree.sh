@@ -55,8 +55,8 @@ cmake -S /src/standalone -B /build-modulizer -G Ninja \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_CXX_FLAGS=-fno-rtti \
   \$LLVM_CMAKE_ARGS
-# CMake 4.4 synthesizes a second `std` target for the executable, so main.cc is
-# handed a different `std` BMI than the library's module units were built
+# CMake 4.4 synthesizes a second \`std\` target for the executable, so main.cc is
+# handed a different \`std\` BMI than the library's module units were built
 # against. Clang segfaults in ASTReader rather than diagnosing it:
 #
 #   main.cc:6:8: current parser token 'vector'
@@ -135,8 +135,14 @@ install_lib() { # \$1 = googletest|googlemock, \$2 = gtest|gmock
   for f in "\$st"/*.h; do
     [ -e "\$f" ] || continue
     b=\$(basename "\$f")
-    case " \$pub " in *" \$b "*) cp "\$f" "\$dir/include/\$lib/"; continue ;; esac
-    case " \$src " in *" \$b "*) cp "\$f" "\$dir/src/"; continue ;; esac
+    # A macros file belongs beside the header it was written for: consumers ask
+    # for it under that header's own name, so gtest-internal-inl-macros.h has
+    # to land where gtest-internal-inl.h lives or the ask never resolves and
+    # the macros quietly go missing:
+    #   error: use of undeclared identifier 'EXPECT_FATAL_FAILURE'
+    owner=\$(printf '%s' "\$b" | sed 's/-macros\\.h\$/.h/')
+    case " \$pub " in *" \$b "*|*" \$owner "*) cp "\$f" "\$dir/include/\$lib/"; continue ;; esac
+    case " \$src " in *" \$b "*|*" \$owner "*) cp "\$f" "\$dir/src/"; continue ;; esac
     cp "\$f" "\$dir/include/"
   done
   for f in "\$st"/internal/*.h; do

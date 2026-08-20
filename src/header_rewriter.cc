@@ -58,7 +58,10 @@ export struct RewriteOptions {
   bool import_std = false;
   std::set<std::string> public_modules;
   InternalMode internal_mode = InternalMode::kBoth;
-  std::map<std::string, std::set<std::string>> module_replaces;
+  // The modules that provide headers this library includes: `std` for
+  // <vector>, another converted library for its own headers. One mechanism for
+  // both — see ModuleReplacement.
+  ModuleReplacements module_replacements;
   std::vector<std::string> defined_fqns;
   std::vector<std::string> fwd_declared_fqns;
   bool cc_only = false;
@@ -100,6 +103,37 @@ struct GmfAndImports {
 // `classify_replacement` uses to drop headers provided by an imported module.
 // `includes` is moved-from: entries that become GMF includes are moved into
 // the result.
+// Whether a preprocessor condition asks only WHETHER macros are defined —
+// `defined(A) || defined(B)` — rather than what they are. A condition that
+// reads a value (`defined(V) && V != 3`) wants the macro defined, and taking
+// it away turns a paste of it into nonsense:
+//
+//   error: no member named 'append_vLIB_VERSION'
+bool only_presence_tests(std::string_view cond) {
+  for (std::size_t i = 0; i < cond.size(); ++i) {
+    if (is_ident_char(cond[i])) {
+      auto j = i;
+      while (j < cond.size() && is_ident_char(cond[j])) ++j;
+      auto id = cond.substr(i, j - i);
+      if (id != "defined") {
+        // An identifier that is not the operator itself must be its argument.
+        auto before = cond.substr(0, i);
+        while (!before.empty() && (before.back() == ' ' || before.back() == '\t' ||
+                                   before.back() == '('))
+          before.remove_suffix(1);
+        if (!before.ends_with("defined")) return false;
+      }
+      i = j - 1;
+      continue;
+    }
+    if (cond[i] == '!' || cond[i] == '&' || cond[i] == '|' || cond[i] == '(' ||
+        cond[i] == ')' || cond[i] == ' ' || cond[i] == '\t' || cond[i] == '\r')
+      continue;
+    return false;
+  }
+  return true;
+}
+
 // An import derived from a conditional include has to keep the condition. A
 // dispatch header picks one of several implementations of the same entities —
 //
@@ -137,21 +171,86 @@ GmfAndImports classify_includes(
   GmfAndImports out;
   for (auto &inc : includes) {
     if (is_xmacro_include(inc.path)) continue;
-    // A header explicitly provided by a module (`--module-replaces`): import
-    // that module instead of keeping the include. Non-std modules replace the
-    // include outright; std/std.compat only mark it for guarded removal because
-    // `import std;` is emitted separately by the `--import-std` flag. When
-    // several modules replace the same header, prefer the most specific one
-    // (the module replacing the fewest headers, e.g. `std.variant` over
-    // `std` for `<variant>`).
-    std::string replaced_mod =
-        find_replacing_module(inc.path, options.module_replaces);
-    if (!replaced_mod.empty() && replaced_mod != "std" &&
-        replaced_mod != "std.compat") {
-      out.purview_imports.push_back(format_import(
-          inc.path, replaced_mod, options.public_modules, options.internal_mode));
-      imported_modules.insert(replaced_mod);
-      continue;
+    // A header some module provides: the include becomes an import of it.
+    // What the build can do with that choice decides the shape.
+    //
+    // std/std.compat are the exception: `import std;` is emitted separately by
+    // the `--import-std` flag, so here the include is only marked for guarded
+    // removal and falls through.
+    if (auto *rep = find_replacement(inc.path, options.module_replacements)) {
+      const auto &mod = rep->module;
+      if (mod != "std" && mod != "std.compat") {
+        auto line = format_import(inc.path, mod, options.public_modules,
+                                  options.internal_mode);
+        if (rep->guard.empty()) {
+          // Nothing to keep the include for: the replacement is unconditional.
+          out.purview_imports.push_back(line);
+          imported_modules.insert(mod);
+          continue;
+        }
+        // The two halves cannot sit together — an include belongs in the
+        // global module fragment and an import in the purview — so the import
+        // goes under the guard and the include stays under its negation.
+        if (rep->carries_macros_file) {
+          // A module carries no macros, so the provider's macros file comes
+          // with the import. Whether it wrote one is not knowable from here —
+          // the provider is converted by its own run, and only its tree says —
+          // so the include asks:
+          //
+          //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+          //
+          // It goes in the GMF and not beside the import, though the import is
+          // what it belongs to. A macros file is text, and text read after
+          // `export module` is read into the module: a macros file carrying the
+          // standard header one of its bodies names would attach that header's
+          // declarations to this module, and they are the global module's —
+          //
+          //   error: declaration of 'source_location' in module
+          //          boost.exception.exception follows declaration in the
+          //          global module
+          //
+          // Reading it earlier costs nothing, macros being no respecters of the
+          // purview: what is defined before `export module` is still defined
+          // after it. The unit's own macros file is read there for the same
+          // reason.
+          auto mh = replacement_macros_header(inc.path, options.hyphen_macros);
+          IncludeDirective minc = inc;
+          minc.path = mh;
+          minc.is_quoted = true;
+          minc.line = std::format(
+              "#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n", mh, mh);
+          // Outermost, as the include below is given the negation of the
+          // same guard. The condition the include sat under may call a macro
+          // the provider itself defines —
+          //
+          //   #if (BOOST_MP11_WORKAROUND( BOOST_MP11_GCC, >= 140000 ) && ...)
+          //
+          // and asking it first is asking the provider's macros for
+          // permission to read the provider's macros:
+          //
+          //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not
+          //          defined
+          //
+          // Under the provider's own guard the whole block is skipped where
+          // there is no import, and where there is one the macros have
+          // arrived with it by the time the condition is read.
+          minc.guard_stack.insert(minc.guard_stack.begin(),
+                                  std::format("#if defined({})\n", rep->guard));
+          out.gmf_incs.push_back(std::move(minc));
+        }
+        // The provider's guard outside the condition here too, and for the
+        // reason the macros file above is given the same order: the condition
+        // an include of the provider sat under is written in the provider's
+        // terms, and reading it first asks a question only the import can
+        // answer.
+        out.purview_imports.push_back(
+            std::format("#if defined({})\n{}\n#endif", rep->guard,
+                        guarded_import(inc, line)));
+        inc.guard_stack.insert(inc.guard_stack.begin(),
+                               std::format("#if !defined({})\n", rep->guard));
+        out.gmf_incs.push_back(inc);
+        continue;
+      }
     }
     auto it = options.include_to_module.find(inc.path);
     auto ait = auto_imports.find(inc.path);
@@ -202,7 +301,8 @@ GmfAndImports classify_includes(
         if (!inc.is_quoted) {
           auto resolved =
               resolve_include(inc.path, header_path.str(), options.extra_args);
-          if (!keep_transitive_system_include(resolved, inc.path,
+          if (!inc.from_body_read &&
+              !keep_transitive_system_include(resolved, inc.path,
                                               used_headers)) {
             // `<version>` defines only preprocessor macros the header body
             // evaluates (e.g. `__cpp_lib_char8_t`); macros are not tracked by
@@ -214,7 +314,7 @@ GmfAndImports classify_includes(
           if (!resolved.empty()) {
             auto rc = classify_replacement(inc, header_path, options.extra_args,
                                            imported_modules,
-                                           options.module_replaces);
+                                           options.module_replacements);
             if (rc.other_replaced) continue;
             if (rc.std_replaced)
               inc.guard_stack.insert(inc.guard_stack.begin(),
@@ -254,7 +354,7 @@ GmfAndImports classify_includes(
       }
       // Headers provided by an imported module: see classify_replacement.
       auto rc = classify_replacement(inc, header_path, options.extra_args,
-                                     imported_modules, options.module_replaces);
+                                     imported_modules, options.module_replacements);
       if (rc.other_replaced) continue;
       if (rc.std_replaced) {
         inc.guard_stack.insert(inc.guard_stack.begin(),
@@ -394,8 +494,28 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     std::vector<ModPoint> &mods, const std::vector<MacroRec> &export_macros,
     const std::set<std::string> &block_defined_names,
     const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
-    const std::string &original) {
+    // Chains that choose between arms and are not emitted whole. Their
+    // definitions stay in the header, where the arm still selects them; the
+    // macros file gets the chain's directives instead.
+    const std::vector<std::pair<unsigned, unsigned>> &unemitted_arm_ranges,
+    const std::string &original,
+    // A header that is re-read at every inclusion computes its macros from the
+    // state at that point, and a second copy of that machine left in the body
+    // runs against whatever the first copy already established. The macros
+    // file is the single copy; nothing of it stays here.
+    bool reincludable = false) {
   std::vector<std::pair<unsigned, unsigned>> ranges;
+  if (reincludable) {
+    for (auto &m : export_macros) {
+      if (m.end_off <= m.start_off) continue;
+      if (!m.name.empty() &&
+          (inside_block(block_ranges, m) || inside_block(unemitted_arm_ranges, m)))
+        continue;
+      ranges.push_back({m.start_off, m.end_off});
+      mods.push_back({m.start_off, m.end_off - m.start_off, ""});
+    }
+    return ranges;
+  }
   for (auto &m : export_macros) {
     if (m.name.empty()) continue;  // macro-only conditional block
     if (m.start_off == 0 && m.end_off == 0) continue;  // no source offsets
@@ -406,6 +526,7 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     // to retract and no definition after it, so the macro ends up undefined
     // for everyone who includes the header.
     if (inside_block(block_ranges, m)) continue;
+    if (inside_block(unemitted_arm_ranges, m)) continue;
     ranges.push_back({m.start_off, m.end_off});
     auto guard = override_guard_with_code(original, m.start_off, m.name);
     if (guard.active) {
@@ -526,7 +647,7 @@ std::string assemble_interface_cc(
   cc += std::format("\nexport module {};\n", module_name.str());
   if (options.import_std) {
     cc += std::format("#ifdef {}\nimport {};\n#endif\n", std_use_guard,
-                      std_module_name(options.module_replaces));
+                      std_module_name(options.module_replacements));
   }
 
   std::set<std::string> seen_imports;
@@ -738,6 +859,80 @@ std::vector<std::string> macros_file_support_includes(
     }
     return false;
   };
+  // A macro whose BODY names a standard-library TYPE --
+  // `#define BOOST_CURRENT_LOCATION ::boost::source_location(::std::source_location::current())`.
+  // Same reason as above and the same remedy: the body is expanded where the
+  // macros file is included, in translation units that never read the header
+  // it came from, so the standard header declaring the type travels with it.
+  //
+  //   error: missing '#include'; 'source_location' must be declared before
+  //          it is used
+  //   note: expanded from macro 'BOOST_CURRENT_LOCATION'
+  //   note: declaration here is not visible
+  //
+  // Only a name the header itself included a header FOR counts, matched on
+  // that header's own stem -- `<source_location>` for `std::source_location`.
+  // It does not know that `<cstdio>` declares `printf`, and deliberately so:
+  // guessing wider carries standard headers nothing asked for, which is what
+  // the exclusion below exists to prevent.
+  auto include_stem = [](const std::string &path) {
+    auto stem = path;
+    if (auto dot = stem.find_last_of('.'); dot != std::string::npos)
+      stem.resize(dot);
+    return stem;
+  };
+  auto body_names = [&](std::string_view body, const std::string &stem) {
+    for (auto pos = body.find(stem); pos != std::string_view::npos;
+         pos = body.find(stem, pos + 1)) {
+      // `std::` in front is what marks it as the library's, rather than a word
+      // of the macro's own that happens to spell a header.
+      if (pos < 5 || body.substr(pos - 5, 5) != "std::") continue;
+      auto after = pos + stem.size();
+      if (after >= body.size() || !is_ident_char(body[after])) return true;
+    }
+    return false;
+  };
+  // Which of the header's own standard includes a macro body names. Unlike the
+  // includes gathered below this one may be conditional, and is carried under
+  // the condition it was written under rather than skipped: the header that
+  // declares the type is guarded by the very feature-test macro the macro
+  // definition is guarded by, so the two branches stand or fall together.
+  //
+  // Not where std is imported. The import already carries these declarations,
+  // and a textual header beside it declares them a second time without making
+  // them one entity:
+  //
+  //   bits/stringfwd.h: error: reference to 'basic_string' is ambiguous
+  //   __new/allocate.h: error: call to 'operator new' is ambiguous
+  //
+  // The macro keeps what the import gives it. Carrying the header there would
+  // trade one broken build for another, which is the same bargain the
+  // foreign-macro case above refuses.
+  std::vector<const IncludeDirective *> std_entity_includes;
+  for (auto &inc : includes) {
+    if (options.import_std) break;
+    if (inc.transitive || inc.is_quoted) continue;
+    auto stem = include_stem(inc.path);
+    if (stem.empty() || stem.find('/') != std::string::npos) continue;
+    // Both shapes of record: a plain `#define`, whose body is the one line,
+    // and a conditional block, whose body is the whole `#if`/`#elif` chain and
+    // whose name is empty. A macro that needs a standard header is more often
+    // the second -- it is defined one way where the header exists and another
+    // way where it does not.
+    bool named = false;
+    for (auto &m : export_macros)
+      if (body_names(m.body, stem)) {
+        named = true;
+        break;
+      }
+    if (!named) continue;
+    auto resolved =
+        resolve_include(inc.path, header_path.str(), options.extra_args);
+    // A standard header only: one of our own arrives as an import already.
+    if (resolved.empty() || !resolved_in_system_dir(resolved)) continue;
+    std_entity_includes.push_back(&inc);
+  }
+
   bool needs_system = false;
   if (!options.import_std)
     for (auto &m : export_macros)
@@ -778,6 +973,16 @@ std::vector<std::string> macros_file_support_includes(
       if (conditional_depth_at(original, inc.offset) > 0) continue;
       if (auto_imports.count(inc.path)) continue;
       if (is_generated_macro_header(inc.path)) continue;
+      // Never another converted library's header. That one is a module, and a
+      // textual copy of it here is a second set of the same declarations,
+      // pulled in wherever this macros file is included:
+      //
+      //   error: declaration 'mp_bool' attached to named module
+      //          'boost.mp11.integral' cannot be attached to other modules
+      //
+      // Its macros arrive from its own macros file, chained in beside the
+      // import that replaced it.
+      if (find_replacement(inc.path, options.module_replacements)) continue;
       // Never a standard-library header. Nothing in `<string>` defines the
       // kind of function-like configuration macro a condition calls, and a
       // consumer of this macros file imports std — a textual copy of the
@@ -796,6 +1001,18 @@ std::vector<std::string> macros_file_support_includes(
           inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
                         : std::format("#include <{}>\n", inc.path));
     }
+  }
+  for (auto *inc : std_entity_includes) {
+    auto line = std::format("#include <{}>\n", inc->path);
+    if (std::ranges::find(block_support_includes, line) !=
+        block_support_includes.end())
+      continue;
+    auto guards = valid_guards(inc->guard_stack);
+    std::string out;
+    for (auto &g : guards) out += g;
+    out += line;
+    for (std::size_t i = 0; i < guards.size(); ++i) out += "#endif\n";
+    block_support_includes.push_back(std::move(out));
   }
   return block_support_includes;
 }
@@ -931,7 +1148,7 @@ export HeaderRewriteResult rewrite_header(
         return std::make_unique<HeaderRewriteConsumer>(
             ci.getASTContext(), mods, internal_re, export_macro,
             shared_marker, shared_linkage_macro, extern_decl_macro,
-            options.reachable_fqns, result.internal_fqns, options.no_internal_filter,
+            prefix + "_INLINE", options.reachable_fqns, result.internal_fqns, options.no_internal_filter,
             &used_headers, options.defined_fqns, &fwd_decls, options.extern_cxx,
             options.extern_cxx_macro, options.fwd_declared_fqns, options.same_module_free_fqns,
             options.library_headers.empty() ? nullptr : &options.library_headers,
@@ -948,7 +1165,10 @@ export HeaderRewriteResult rewrite_header(
   // Textually extract ALL #define lines from the original header,
   // including those inside inactive #if blocks. These are needed so that
   // guard macros in the GMF resolve correctly on any platform.
-  extract_textual_macros(original, macros);
+  std::vector<std::pair<unsigned, unsigned>> unemitted_arm_ranges;
+  std::vector<std::pair<unsigned, unsigned>> rejection_ranges;
+  extract_textual_macros(original, macros, &unemitted_arm_ranges,
+                         &rejection_ranges);
 
   // A macro whose name is (re)defined inside an emitted conditional block must
   // not also be emitted as a bare unconditional #define from the active set:
@@ -994,6 +1214,47 @@ export HeaderRewriteResult rewrite_header(
           inc.skip_gmf = true;
   }
 
+  // And what those bring with them. An include the body keeps is read in the
+  // PURVIEW -- that is the point of keeping it -- so everything it includes is
+  // read there too. A standard header read there attaches what it declares to
+  // this module, against the copy the global module already has:
+  //
+  //   bits/move.h:227: error: declaration of 'swap' in module
+  //     boost.filesystem.detail.utf8_codecvt_facet follows declaration in the
+  //     global module
+  //
+  // The used-headers filter cannot keep them: the uses that need them are
+  // written inside the kept include, not here, and a use outside the main file
+  // is not recorded. So they are kept on the strength of what reached them.
+  //
+  // Only the standard ones. A condition found inside another project's header
+  // belongs to that header and is not carried here (see expand_include_closure),
+  // so anything else kept this way would be written unconditionally --
+  //
+  //   utf8_codecvt_facet.cc:30: fatal error: 'cygwin/version.h' file not found
+  //
+  // -- and it is the standard library's declarations that clash with the
+  // global module's copy anyway. The rest stay where the fragment reads them.
+  {
+    std::set<std::string> body_read;
+    for (auto &inc : includes)
+      if (inc.skip_gmf && !inc.transitive)
+        if (auto r = resolve_include(inc.path, header_path, options.extra_args);
+            !r.empty())
+          body_read.insert(r);
+    for (bool grew = !body_read.empty(); grew;) {
+      grew = false;
+      for (auto &inc : includes) {
+        if (!inc.transitive || inc.from_body_read) continue;
+        if (!body_read.count(inc.parent_resolved)) continue;
+        if (kStdHeaders.count(inc.path)) inc.from_body_read = true;
+        if (auto r = resolve_include(inc.path, header_path, options.extra_args);
+            !r.empty() && body_read.insert(r).second)
+          grew = true;
+      }
+    }
+  }
+
   // PUBLIC macros (never #undef'd before the end of the header) move to the
   // generated macros file and are stripped from the header body; PRIVATE macros
   // (undef'd before the end) stay in the body, exactly as in the original. A
@@ -1010,7 +1271,15 @@ export HeaderRewriteResult rewrite_header(
   // the macros file (applied by build_macros_file), never to the header body,
   // where the macro definition is stripped out entirely.
   auto stripped_macro_ranges = collect_stripped_ranges(
-      mods, export_macros, block_defined_names, block_ranges, original);
+      mods, export_macros, block_defined_names, block_ranges,
+      unemitted_arm_ranges, original, !header_guards_itself(original));
+
+  // A block that rejects one of this header's own macros as user input goes
+  // out whole. The header reads its generated macros file above that block, so
+  // what the rejection finds there is the library's own definition, and the
+  // header errors out on the first read of it.
+  for (auto [rs, re] : rejection_ranges)
+    mods.push_back({rs, re - rs, ""});
 
   // The header body keeps the raw macro invocation; the export markers the
   // visitor placed INSIDE a macro definition (spelling locations) belong to the
@@ -1033,7 +1302,9 @@ export HeaderRewriteResult rewrite_header(
   // In cc-only mode the header body is inlined into the interface unit where
   // USE_MODULES is always defined, so these includes are dropped entirely.
   hdr = wrap_includes_with_guard(std::move(hdr), includes, use_modules_macro,
-                                 /*remove=*/options.cc_only);
+                                 /*remove=*/options.cc_only,
+                                 options.module_replacements);
+  hdr = export_body_read_includes(std::move(hdr), includes, use_modules_macro);
 
   auto prelude = std::format(
       "#pragma once\n"
@@ -1041,8 +1312,23 @@ export HeaderRewriteResult rewrite_header(
       "#define {1} export\n"
       "#else\n"
       "#define {1}\n"
+      "#endif\n"
+      // A definition in a module interface unit is compiled exactly once, so
+      // `inline` is not needed there — and it is harmful. An inline definition
+      // emits no strong symbol, so a virtual member defined out of line is
+      // never its class's key function, and the vtable of anything deriving
+      // from that class has nothing to point at:
+      //
+      //   undefined reference to `lib::category::default_condition(int) const'
+      //   undefined reference to `typeinfo for lib::category'
+      //
+      // Every other includer is a textual one and still needs the keyword.
+      "#ifdef {0}\n"
+      "#define {2}\n"
+      "#else\n"
+      "#define {2} inline\n"
       "#endif\n",
-      use_modules_macro, export_macro);
+      use_modules_macro, export_macro, prefix + "_INLINE");
   // The wrapping gives every entity in the purview C++ language linkage in the
   // global module. Where it is absent, a declaration of an entity another
   // module defines has to ask for that linkage itself.
@@ -1063,11 +1349,23 @@ export HeaderRewriteResult rewrite_header(
   // the library's include root (`mylib/mylib-export.h`) when the library uses
   // an include subdirectory, otherwise at the top level (`test_lib_export.h`).
   // Named with the same hyphen/underscore style as the macro headers.
+  //
+  // After the MACRO prefix, not the library root. Where the root is a vendor
+  // shared by many libraries — every Boost library has `boost/` — naming it
+  // after the root gives them all the same path with different contents, and
+  // a build that sees two of them gets whichever comes first:
+  //
+  //   error: unknown type name 'BOOST_DESCRIBEX_EXPORT'
+  //
+  // The prefix is what already distinguishes the macros inside it.
   auto inc_prefix = include_prefix(header_path, library_name);
   auto export_sep = options.hyphen_macros ? "-" : "_";
   auto exp_dir = inc_prefix.empty() ? "" : std::format("{}/", library_name.str());
+  auto export_stem = prefix;
+  std::ranges::transform(export_stem, export_stem.begin(),
+                         [](unsigned char c) { return std::tolower(c); });
   auto export_h_name = exp_dir + std::format("{}{}export",
-      library_name.str(), export_sep);
+      export_stem, export_sep);
   auto export_include = std::format("#include \"{}.h\"\n", export_h_name);
 
   std::size_t insert_pos = 0;
@@ -1093,7 +1391,7 @@ export HeaderRewriteResult rewrite_header(
 
   // Compute auto-imports before generating macros content so we can
   // chain-include dependency macros files.
-  std::set<std::string> extra_macro_includes;
+  std::map<std::string, std::vector<std::string>> extra_macro_includes;
   auto auto_imports = compute_auto_imports(
       includes, library_name, module_name, header_path, options.extra_args,
       result.imported_modules, extra_macro_includes,
@@ -1107,7 +1405,7 @@ export HeaderRewriteResult rewrite_header(
                      (options.hyphen_macros ? "-" : "_") + "macros";
 
   // Modules this module imports; used to drop includes that an imported
-  // module provides (options.module_replaces).
+  // module provides (options.module_replacements).
   std::set<std::string> imported_modules;
   for (auto &[p, m] : options.include_to_module) imported_modules.insert(m);
   for (auto &[p, m] : auto_imports) imported_modules.insert(m);
@@ -1123,7 +1421,8 @@ export HeaderRewriteResult rewrite_header(
   if (!export_macros.empty() || !extra_macro_includes.empty()) {
     result.macros_content = build_macros_file(
         export_macros, extra_macro_includes, block_support_includes,
-        block_defined_names, block_ranges, original, mods, export_include);
+        block_defined_names, block_ranges, original, mods, export_include,
+        header_guards_itself(original), unemitted_arm_ranges);
     result.macros_name = macros_name;
     // The macro definitions moved out of the header into the macros file, and
     // the body still uses them (`GTEST_INTERNAL_HAS_INCLUDE(<span>)`). The
@@ -1177,6 +1476,19 @@ export HeaderRewriteResult rewrite_header(
     // The macros file carries the live one, so it is the default that
     // redefines it, and an undef placed only at the live definition arrives
     // after the warning has already been issued.
+    // The leading `#undef`s moved into the macros file with the definitions
+    // they precede; left here they would undo the include above.
+    std::vector<std::pair<std::size_t, std::size_t>> undef_cuts;
+    for (auto &[off, name] :
+         leading_undefs(hdr, export_macros, block_defined_names, {})) {
+      auto line_end = hdr.find('\n', off);
+      undef_cuts.emplace_back(off, line_end == std::string::npos
+                                       ? hdr.size() - off
+                                       : line_end + 1 - off);
+    }
+    std::ranges::sort(undef_cuts, [](auto &a, auto &b) { return a.first > b.first; });
+    for (auto &[off, len] : undef_cuts) hdr.erase(off, len);
+
     std::vector<std::pair<std::size_t, std::string>> sites;
     for (auto &m : export_macros) {
       if (m.name.empty()) continue;
@@ -1209,9 +1521,92 @@ export HeaderRewriteResult rewrite_header(
     //
     // which is silent: the header still has a `#define`, and the name it
     // defines is simply the wrong one.
-    sites.emplace_back(post_guard_pos,
-                       std::format("#ifndef {}\n#include \"{}.h\"\n#endif\n",
-                                   use_modules_macro, macros_name));
+    // A header that REFUSES to be handed one of its own macros — the
+    // "must not be defined by users" check a configuration header opens with —
+    // reads it before it defines it, and the macros file has already supplied
+    // it by then:
+    //
+    //   #if defined(LIB_WINDOWS_API) || defined(LIB_POSIX_API)
+    //   #error LIB_WINDOWS_API and LIB_POSIX_API must not be defined by users
+    //   #endif
+    //
+    // The `#undef` before each definition comes far too late for that, so those
+    // names are dropped up front instead. Only the ones guarding an `#error`:
+    // every other early read is meant to see what the macros file carries (see
+    // above), and taking those away would silently pick a different branch.
+    std::string upfront;
+    {
+      std::set<std::string> errored;
+      std::size_t pos = 0;
+      std::string pending_cond;
+      // The source, not the rewritten header: the check itself is cut out of
+      // the header (it judges a macro this file defines, and the macros file
+      // supplies that definition above it), and the names it named have to
+      // outlive it.
+      while (pos < original.size()) {
+        auto nl = original.find('\n', pos);
+        if (nl == std::string::npos) nl = original.size();
+        auto line = std::string_view(original).substr(pos, nl - pos);
+        auto d = parse_directive(line);
+        if (d && (d->keyword == "if" || d->keyword == "elif"))
+          pending_cond = d->after;
+        else if (d && d->keyword == "error" && !pending_cond.empty() &&
+                 only_presence_tests(pending_cond)) {
+          for (auto &m : export_macros)
+            if (!m.name.empty() && pending_cond.contains(m.name))
+              errored.insert(m.name);
+        } else if (d && (d->keyword == "endif" || d->keyword == "else")) {
+          pending_cond.clear();
+        }
+        pos = nl + 1;
+      }
+      for (auto &name : errored) upfront += std::format("#undef {}\n", name);
+    }
+    // They go INSIDE the macros file, ahead of the definitions they make room
+    // for, where that file's own guard runs them exactly once.
+    //
+    // Not in the header. A header-side `#undef` is sound only while the macros
+    // file has not been included yet, and any other header whose macros file
+    // chains this one in gets there first — after which the include meant to
+    // restore the value is a no-op against the guard, the `#undef` stands, and
+    // the name is gone for the rest of the translation unit:
+    //
+    //   error: BOOST_POSIX_API or BOOST_WINDOWS_API must be defined
+    if (!upfront.empty() && !result.macros_content.empty()) {
+      auto &m = result.macros_content;
+      std::size_t at = 0;
+      auto after_line = [&](std::size_t pos) {
+        auto nl = m.find('\n', pos);
+        return nl == std::string::npos ? m.size() : nl + 1;
+      };
+      if (auto p = m.find("#pragma once"); p != std::string::npos) {
+        at = after_line(p);
+      } else {
+        // No `#pragma once`, so the file leans on the include guard it copied
+        // from the header. Above that guard the undefs would run on every
+        // inclusion, undoing the definitions each time the guard skipped.
+        std::size_t pos = 0;
+        std::string pending;
+        while (pos < m.size()) {
+          auto nl = m.find('\n', pos);
+          if (nl == std::string::npos) nl = m.size();
+          auto d = parse_directive(std::string_view(m).substr(pos, nl - pos));
+          if (d && pending.empty() && d->keyword == "ifndef") {
+            auto e = d->after.find_first_of(" \t\r");
+            pending = e == std::string::npos ? d->after : d->after.substr(0, e);
+          } else if (d && !pending.empty() && d->keyword == "define") {
+            at = nl == m.size() ? m.size() : nl + 1;
+            break;
+          }
+          pos = nl + 1;
+        }
+      }
+      m.insert(at, upfront);
+    }
+    sites.emplace_back(
+        post_guard_pos,
+        std::format("#ifndef {}\n#include \"{}.h\"\n#endif\n",
+                    use_modules_macro, macros_name));
     // Back to front, so the offsets of the sites still to come do not shift.
     std::ranges::sort(sites, [](auto &a, auto &b) { return a.first > b.first; });
     for (auto &[pos, text] : sites) hdr.insert(pos, text);
@@ -1321,7 +1716,7 @@ export SourceRewriteResult rewrite_source(
     const std::vector<std::string> &extra_args = {},
     bool import_std = false,
     bool extern_cxx = false,
-    const std::map<std::string, std::set<std::string>> &module_replaces = {},
+    const ModuleReplacements &module_replacements = {},
     const std::set<std::string> &macro_files = {},
     const std::set<std::string> &interface_modules = {},
     const std::vector<std::string> &fwd_declared_fqns = {},
@@ -1398,7 +1793,7 @@ export SourceRewriteResult rewrite_source(
   // Quoted `{library}/...` includes auto-derive their module name, mirroring
   // rewrite_header's auto-import behavior.
   std::vector<std::pair<std::string, std::string>> imported;
-  std::set<std::string> extra_macro_includes;
+  std::map<std::string, std::vector<std::string>> extra_macro_includes;
   auto auto_imports = compute_auto_imports(
       includes, library_name, module_name, source_path, extra_args, imported,
       extra_macro_includes, hyphen_macros,
@@ -1509,7 +1904,7 @@ export SourceRewriteResult rewrite_source(
           // libc++/libstdc++ internal __-prefixed headers) are stripped: they
           // must not be included in the GMF next to `import std;`.
           auto rc = classify_replacement(inc, source_path, extra_args,
-                                         imported_mods, module_replaces);
+                                         imported_mods, module_replacements);
           if (rc.other_replaced || rc.std_replaced) continue;
           if (inc.skip_gmf) {
             // The include sits in an `#elif` branch (e.g. `<regex.h>` behind
@@ -1544,19 +1939,18 @@ export SourceRewriteResult rewrite_source(
       continue;
     }
 
-    // A header explicitly provided by a module (`--module-replaces`): import
-    // that module instead of keeping the include (same as rewrite_header).
-    // Prefer the most specific replacing module (fewest headers).
-    std::string replaced_mod =
-        find_replacing_module(inc.path, module_replaces);
-    if (!replaced_mod.empty() && replaced_mod != "std" &&
-        replaced_mod != "std.compat") {
-      if (!imported_mods.count(replaced_mod)) {
-        imports.push_back(replaced_mod);
-        imported_mods.insert(replaced_mod);
+    // A header some module provides: import it instead of keeping the include
+    // (same as rewrite_header).
+    if (auto *rep = find_replacement(inc.path, module_replacements)) {
+      const auto &replaced_mod = rep->module;
+      if (replaced_mod != "std" && replaced_mod != "std.compat") {
+        if (!imported_mods.count(replaced_mod)) {
+          imports.push_back(replaced_mod);
+          imported_mods.insert(replaced_mod);
+        }
+        drop_include(inc);
+        continue;
       }
-      drop_include(inc);
-      continue;
     }
 
     // Resolve the module for a library include: explicit map, auto-imports, or
@@ -1610,11 +2004,12 @@ export SourceRewriteResult rewrite_source(
     if (umbrella_include) {
       auto sep = hyphen_macros ? "-" : "_";
       auto dir = std::filesystem::path(inc.path).parent_path().string();
-      extra_macro_includes.insert(
+      extra_macro_includes.emplace(
           (dir.empty() ? "" : dir + "/") +
-          macro_base_name(std::filesystem::path(inc.path).stem().string(),
-                          hyphen_macros) +
-          sep + "macros.h");
+              macro_base_name(std::filesystem::path(inc.path).stem().string(),
+                              hyphen_macros) +
+              sep + "macros.h",
+          inc.guard_stack);
     }
 
     // An include that is this very module's interface is implicitly visible in
@@ -1629,7 +2024,7 @@ export SourceRewriteResult rewrite_source(
       // System/third-party include: move to the global module fragment.
       if (!inc.skip_gmf) {
         auto rc = classify_replacement(inc, source_path, extra_args,
-                                       imported_mods, module_replaces);
+                                       imported_mods, module_replacements);
         if (rc.other_replaced || rc.std_replaced) {
           drop_include(inc);
           continue;
@@ -1740,9 +2135,13 @@ export SourceRewriteResult rewrite_source(
       library_name.str(), library_name.str(), sep);
   if (macro_files.count(umbrella_macros))
     out += std::format("#include \"{}\"\n", umbrella_macros);
-  for (auto &em : extra_macro_includes)
-    if (macro_files.count(em))
+  for (auto &[em, guards] : extra_macro_includes)
+    if (macro_files.count(em)) {
+      auto vg = valid_guards(guards);
+      for (auto &g : vg) out += g;
       out += std::format("#include \"{}\"\n", em);
+      for (std::size_t i = 0; i < vg.size(); ++i) out += "#endif\n";
+    }
   // This module's own macro file: its include directory is the module path
   // minus the final segment (`mylib/mylib-printers-macros.h`,
   // `mylib/internal/mylib-port-macros.h`).
@@ -1755,7 +2154,7 @@ export SourceRewriteResult rewrite_source(
     out += std::format("#include \"{}\"\n", own_macros);
   emit_gmf_blocks(out, gmf_incs);
   out += std::format("\nmodule {};\n", module_name.str());
-  if (import_std) out += std::format("import {};\n", std_module_name(module_replaces));
+  if (import_std) out += std::format("import {};\n", std_module_name(module_replacements));
   for (auto &m : unique_imports)
     out += std::format("import {};\n", m);
 
@@ -1819,7 +2218,7 @@ export SourceRewriteResult rewrite_source(
     dual_body += std::format("import {};\n", module_name.str());
     if (import_std)
       dual_body += std::format("import {};\n",
-                               std_module_name(module_replaces));
+                               std_module_name(module_replacements));
     for (auto &m : unique_imports)
       dual_body += std::format("import {};\n", m);
     dual_body += "#endif\n";

@@ -62,3 +62,89 @@ TEST(Util, BaseCompileFlagsCarryClangsResourceDir) {
   EXPECT_TRUE(std::ranges::contains(flags, std::format("-resource-dir={}", rd)))
       << "every parse must be told where clang's builtin headers are";
 }
+
+// --module-replaces spells out a module that provides headers. One flag covers
+// both shapes: a named module standing for a list of headers, and a whole
+// converted library standing for everything under a path.
+
+TEST(Util, ParsesAModuleStandingForNamedHeaders) {
+  std::string err;
+  auto r = parse_module_replacement("std=vector,string", err);
+  ASSERT_TRUE(r.has_value()) << err;
+  EXPECT_EQ(r->module, "std");
+  EXPECT_EQ(r->headers, (std::set<std::string>{"vector", "string"}));
+  EXPECT_TRUE(r->guard.empty()) << "nothing to switch off";
+  EXPECT_FALSE(r->carries_macros_file);
+}
+
+TEST(Util, ParsesOneConvertedModuleAndTheHeaderItProvides) {
+  // A converted library contributes one of these per module it generated, so
+  // that the narrowest module providing a header is the one chosen.
+  std::string err;
+  auto r = parse_module_replacement("boost.mp11.list=boost/mp11/list.hpp", err);
+  ASSERT_TRUE(r.has_value()) << err;
+  EXPECT_EQ(r->module, "boost.mp11.list");
+  EXPECT_EQ(r->headers, (std::set<std::string>{"boost/mp11/list.hpp"}));
+}
+
+TEST(Util, ParsesTheGuardAndMacrosOptions) {
+  std::string err;
+  auto r = parse_module_replacement(
+      "boost.mp11.list=boost/mp11/list.hpp:guard=BOOST_MP11X_IMPORT_MODULES:macros",
+      err);
+  ASSERT_TRUE(r.has_value()) << err;
+  EXPECT_EQ(r->guard, "BOOST_MP11X_IMPORT_MODULES");
+  EXPECT_TRUE(r->carries_macros_file)
+      << "a module carries no macros, so the provider's macros file travels "
+         "with the import";
+}
+
+TEST(Util, ParsesAGuardOnANamedModuleToo) {
+  // The options are not tied to the prefix form: a named module can be
+  // switched off as well.
+  std::string err;
+  auto r = parse_module_replacement("mylib.thing=mylib/thing.hpp:guard=USE_IT",
+                                    err);
+  ASSERT_TRUE(r.has_value()) << err;
+  EXPECT_EQ(r->module, "mylib.thing");
+  EXPECT_EQ(r->headers, (std::set<std::string>{"mylib/thing.hpp"}));
+  EXPECT_EQ(r->guard, "USE_IT");
+}
+
+TEST(Util, PrefersTheModuleStandingForTheFewestHeaders) {
+  // `std` and `std.variant` both provide <variant>; the answer wanted is the
+  // narrower one.
+  ModuleReplacements reps = {
+      ModuleReplacement{.module = "std", .headers = {"variant", "vector"}},
+      ModuleReplacement{.module = "std.variant", .headers = {"variant"}},
+  };
+  auto *r = find_replacement("variant", reps);
+  ASSERT_NE(r, nullptr);
+  EXPECT_EQ(r->module, "std.variant");
+  EXPECT_EQ(find_replacement("vector", reps)->module, "std");
+  EXPECT_EQ(find_replacement("string", reps), nullptr);
+}
+
+TEST(Util, RejectsASpecWithNothingToReplace) {
+  std::string err;
+  EXPECT_FALSE(parse_module_replacement("std", err).has_value())
+      << "no '=' at all";
+  EXPECT_FALSE(err.empty()) << "and it must say why";
+  err.clear();
+  EXPECT_FALSE(parse_module_replacement("std=", err).has_value())
+      << "a module replacing no headers replaces nothing";
+  EXPECT_FALSE(err.empty());
+  err.clear();
+  EXPECT_FALSE(parse_module_replacement("m=a.hpp:guard=", err).has_value())
+      << "an empty guard would read as unconditional, which is the opposite "
+         "of what was asked for";
+  EXPECT_FALSE(err.empty());
+  err.clear();
+  EXPECT_FALSE(parse_module_replacement("m=a.hpp:nonsense", err).has_value())
+      << "an unknown option is a typo, not something to ignore";
+  EXPECT_FALSE(err.empty());
+  err.clear();
+  EXPECT_FALSE(parse_module_replacement("=a.hpp", err).has_value())
+      << "a replacement with no module names nothing to import";
+  EXPECT_FALSE(err.empty());
+}

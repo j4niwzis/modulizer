@@ -96,7 +96,12 @@ export std::map<std::string, std::string> compute_auto_imports(
     llvm::StringRef library_name, llvm::StringRef module_name,
     llvm::StringRef header_path, const std::vector<std::string> &extra_args,
     std::vector<std::pair<std::string, std::string>> &imported_modules,
-    std::set<std::string> &extra_macro_includes, bool hyphen_macros,
+    // Macro header -> the conditional context the include it came from sat
+    // in. A header included only in one branch must have its macros chained in
+    // only in that branch, or a macro the other branch defines differently is
+    // overwritten by the one that was never meant to be visible.
+    std::map<std::string, std::vector<std::string>> &extra_macro_includes,
+    bool hyphen_macros,
     const std::set<std::string> *converted = nullptr) {
   std::map<std::string, std::string> auto_imports;
   // Records the import and the macro header that must come with it: macros do
@@ -107,11 +112,11 @@ export std::map<std::string, std::string> compute_auto_imports(
     imported_modules.push_back({inc.path, mod});
     auto sep = hyphen_macros ? "-" : "_";
     auto dir = std::filesystem::path(inc.path).parent_path().string();
-    extra_macro_includes.insert(
+    extra_macro_includes.emplace(
         (dir.empty() ? "" : dir + "/") +
         macro_base_name(std::filesystem::path(inc.path).stem().string(),
                         hyphen_macros) +
-        sep + "macros.h");
+        sep + "macros.h", inc.guard_stack);
   };
 
   for (const auto &inc : includes) {
@@ -204,7 +209,7 @@ export ReplacementClass classify_replacement(
     const IncludeDirective &inc, llvm::StringRef header_path,
     const std::vector<std::string> &extra_args,
     const std::set<std::string> &imported_modules,
-    const std::map<std::string, std::set<std::string>> &module_replaces) {
+    const ModuleReplacements &module_replacements) {
   ReplacementClass rc;
   auto replaced_by = [&](const std::string &hdr) {
     // Feature-test headers like `<version>` (and `<compare>`) only define
@@ -212,11 +217,10 @@ export ReplacementClass classify_replacement(
     // never provide. They must stay in the GMF even under import std, so they
     // are never std-replaced.
     if (hdr == "version" || hdr == "compare") return;
-    for (auto &[mod, set] : module_replaces) {
-      if (imported_modules.count(mod) && set.count(hdr)) {
-        if (mod == "std" || mod == "std.compat") rc.std_replaced = true;
-        else rc.other_replaced = true;
-      }
+    for (auto &r : module_replacements) {
+      if (!r.headers.count(hdr) || !imported_modules.count(r.module)) continue;
+      if (r.module == "std" || r.module == "std.compat") rc.std_replaced = true;
+      else rc.other_replaced = true;
     }
   };
   if (!inc.is_quoted) {
@@ -262,9 +266,9 @@ export ReplacementClass classify_replacement(
 // (`errno`, `assert`, ...) are never provided by either module and still come
 // from the C headers kept in the global module fragment.
 export std::string std_module_name(
-    const std::map<std::string, std::set<std::string>> &module_replaces) {
-  for (auto &[mod, set] : module_replaces)
-    if (mod == "std.compat") return "std.compat";
+    const ModuleReplacements &module_replacements) {
+  for (auto &r : module_replacements)
+    if (r.module == "std.compat") return "std.compat";
   return "std";
 }
 
@@ -356,9 +360,49 @@ export void emit_gmf_blocks(std::string &cc,
 
 // Wrap include directives in hdr with #ifndef USE_MODULES.
 // Skip includes that are inside #ifdef blocks (they keep original guards).
+// An include the body keeps (see skip_gmf) is read in the module purview, and
+// what it declares is attached to this module. Nothing in it carries the export
+// marker: it belongs to another project, and the conversion does not rewrite
+// it. Attached but unexported, a consumer that imports the module cannot see
+// what it declared --
+//
+//   cstdio_test.cpp:86: error: missing '#include
+//     "boost/detail/utf8_codecvt_facet.hpp"'; 'utf8_codecvt_facet' must be
+//     declared before it is used
+//
+// -- so the whole of what it brings is exported at the point it is read. Only
+// under the module build: read classically the same lines are an ordinary
+// include, and `export` is not a word that means anything there.
+export std::string export_body_read_includes(
+    std::string hdr, const std::vector<IncludeDirective> &includes,
+    const std::string &use_modules_macro) {
+  std::set<std::string> kept;
+  for (const auto &inc : includes)
+    if (inc.skip_gmf && !inc.transitive) kept.insert(inc.path);
+  if (kept.empty()) return hdr;
+  std::string out;
+  std::size_t pos = 0;
+  while (pos < hdr.size()) {
+    auto nl = hdr.find('\n', pos);
+    if (nl == std::string::npos) nl = hdr.size() - 1;
+    auto line = std::string_view(hdr).substr(pos, nl - pos + 1);
+    auto inc = parse_include_line(line, /*skip_hash_ws=*/true);
+    if (inc && kept.count(inc->path)) {
+      out += std::format("#ifdef {}\nexport {{\n#endif\n", use_modules_macro);
+      out += line;
+      out += std::format("#ifdef {}\n}}\n#endif\n", use_modules_macro);
+    } else {
+      out += line;
+    }
+    pos = nl + 1;
+  }
+  return out;
+}
+
 export std::string wrap_includes_with_guard(
     std::string hdr, const std::vector<IncludeDirective> &includes,
-    const std::string &use_modules_macro, bool remove = false) {
+    const std::string &use_modules_macro, bool remove = false,
+    const ModuleReplacements &module_replacements = {}) {
   auto find_inc = [](const std::vector<IncludeDirective> &incs,
                      const std::string &path) -> const IncludeDirective * {
     for (auto &i : incs) if (i.path == path) return &i;
@@ -402,7 +446,26 @@ export std::string wrap_includes_with_guard(
         // library headers are imported and system headers live in the GMF).
       } else {
         wrapped_hdr += std::format("#ifndef {}\n", use_modules_macro);
+        // A header some module provides, under the negation of that module's
+        // own guard. This file is read by consumers, and a consumer may have
+        // imported the provider already — its own pair said to. Including the
+        // provider textually then declares a second time what the import gave
+        // it, and the two are not one entity:
+        //
+        //   error: declaration of 'source_location' in the global module
+        //          follows declaration in module boost.assert.source_location
+        //
+        // The guard above does not answer this. It says whether this file is
+        // being read as its own module's unit, which is a different question
+        // from whether the PROVIDER is a module here — and only the second one
+        // decides whether the include is a duplicate. The import half is left
+        // to the consumer's own pair; a header is not the place to write one.
+        auto *rep = find_replacement(inc_path, module_replacements);
+        bool guarded = rep && !rep->guard.empty();
+        if (guarded)
+          wrapped_hdr += std::format("#if !defined({})\n", rep->guard);
         wrapped_hdr += line;
+        if (guarded) wrapped_hdr += "#endif\n";
         // Named, so the merge below can tell this `#endif` from one the source
         // already had. Merging on a bare `#endif` deletes the wrong one.
         wrapped_hdr += std::format("#endif  // {}\n", use_modules_macro);

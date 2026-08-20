@@ -3,6 +3,7 @@ module;
 export module modulizer.rewrite_macros;
 import modulizer.astutil;
 import modulizer.include_analysis;
+import modulizer.rewrite_includes;
 import modulizer.rewrite_util;
 import libtooling;
 import std;
@@ -50,20 +51,9 @@ public:
     // `_H`/`_H_` suffix) are rejected; a default-value macro guarded by
     // `#ifndef X`/`#define X` (e.g. LIB_DEFAULT_STYLE) must be
     // kept so implementation units can use it.
-    bool is_guard = false;
-    {
-      std::string_view before(buf, hashOff);
-      auto nl = before.rfind('\n');
-      if (nl != std::string_view::npos && nl > 0) {
-        auto pnl = before.rfind('\n', nl - 1);
-        auto start = pnl == std::string_view::npos ? 0 : pnl + 1;
-        auto prev = before.substr(start, nl - start);
-        is_guard = prev.starts_with("#ifndef") &&
-                   prev.find(macro_name) != std::string_view::npos &&
-                   looks_like_guard_name(macro_name);
-      }
-    }
-    if (is_guard) return;
+    if (is_include_guard_define(llvm::StringRef(buf, hashOff + 1), hashOff,
+                                macro_name))
+      return;
 
     macros.push_back({std::move(macro_name), std::move(body), hashOff, endOff});
     macros.back().cond_depth = cond_depth;
@@ -165,19 +155,98 @@ std::string strip_block_includes(std::string full) {
   return cleaned;
 }
 
-export void extract_textual_macros(const std::string &original,
-                                   std::vector<MacroRec> &macros) {
+// A header whose guarded body is nothing but directives -- it defines the
+// macros an include fragment is read under, includes it, and takes them back
+// -- has no code inside its guard to disqualify the guard from being emitted
+// whole. Emitted whole, the guard's own `#define` reaches the macros file, and
+// the header reads that file ABOVE its guard: the guard is already defined,
+// the body never runs, and what it was there to do never happens.
+//
+//   cstdio_test.cpp:86: error: no type named 'utf8_codecvt_facet' in
+//     namespace 'boost::filesystem::detail'
+//
+// The macros file carries `#pragma once` and has no use for a guard of its
+// own, so the guard's three lines come out and what they held stays.
+std::string strip_include_guard(std::string block) {
+  std::vector<std::string_view> lines;
+  std::string_view v(block);
+  for (std::size_t p = 0; p <= v.size();) {
+    auto nl = v.find('\n', p);
+    if (nl == std::string_view::npos) {
+      if (p < v.size()) lines.push_back(v.substr(p));
+      break;
+    }
+    lines.push_back(v.substr(p, nl - p));
+    p = nl + 1;
+  }
+  if (lines.empty()) return block;
+  // The guard opens the block, but the block can open with the file's
+  // copyright banner: the guard is the first DIRECTIVE, not the first line.
+  std::size_t guard_at = 0;
+  std::optional<DirectiveParts> d;
+  for (; guard_at < lines.size(); ++guard_at)
+    if ((d = parse_directive(lines[guard_at], true, true))) break;
+  if (!d || d->keyword != "ifndef") return block;
+  auto after = d->after;
+  auto ns = after.find_first_not_of(" \t");
+  if (ns == std::string_view::npos) return block;
+  auto ne = after.find_first_of(" \t", ns);
+  auto name = after.substr(ns, ne == std::string_view::npos ? ne : ne - ns);
+  if (!looks_like_guard_name(name)) return block;
+  // Its `#define`, and the `#endif` that closes the block.
+  std::size_t def_at = lines.size(), endif_at = lines.size();
+  for (std::size_t i = guard_at + 1; i < lines.size(); ++i) {
+    auto ld = parse_directive(lines[i], true, true);
+    if (!ld) continue;
+    if (def_at == lines.size() && ld->keyword == "define") {
+      auto a = ld->after;
+      auto s0 = a.find_first_not_of(" \t");
+      if (s0 == std::string_view::npos) continue;
+      auto e0 = a.find_first_of("( \t", s0);
+      if (a.substr(s0, e0 == std::string_view::npos ? e0 : e0 - s0) == name)
+        def_at = i;
+    }
+    if (ld->keyword == "endif") endif_at = i;
+  }
+  if (def_at == lines.size()) return block;
+  std::string out;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    if (i == guard_at || i == def_at || i == endif_at) continue;
+    out += lines[i];
+    out += '\n';
+  }
+  return out;
+}
+
+export void extract_textual_macros(
+    const std::string &original, std::vector<MacroRec> &macros,
+    // Conditionals that choose between arms and are NOT emitted verbatim.
+    // What is defined inside one belongs to the arm that selects it, and no
+    // emitted block carries that arm along, so neither the header nor the
+    // macros file may take the definition out on its own.
+    std::vector<std::pair<unsigned, unsigned>> *unemitted_arm_ranges = nullptr,
+    // Blocks that raise a diagnostic about a macro this file itself defines.
+    // They are cut out of the header body; see the loop that fills them.
+    std::vector<std::pair<unsigned, unsigned>> *rejection_ranges = nullptr) {
   std::string_view src(original);
   std::size_t pos = 0;
   std::set<std::string> seen_macro_names;
   for (auto &m : macros)
     seen_macro_names.insert(m.name);
+  // Every non-guard name this file defines, wherever it sits, and the blocks
+  // that raise a diagnostic without defining anything.
+  std::set<std::string, std::less<>> defined_names;
+  std::vector<std::pair<std::size_t, std::size_t>> rejections;
 
   struct CondBlock {
     std::size_t start;  // offset of the `#if` line
     bool is_zero;       // `#if 0` (dead on every platform)
     bool has_define;    // contains a non-guard #define (in any nested branch)
     bool has_code;      // contains a non-preprocessor (declaration) line
+    bool has_error;     // contains `#error`/`#warning` and nothing else
+    // Has `#elif`/`#else` arms, so what is inside it belongs to one arm and
+    // not to the block as a whole.
+    bool has_arms = false;
     // Conditionals closed while this one was open, as indices into `cands`.
     std::vector<std::size_t> children;
   };
@@ -191,6 +260,7 @@ export void extract_textual_macros(const std::string &original,
   struct Cand {
     std::size_t start, end;
     bool worth;
+    bool has_arms = false;
     std::vector<std::size_t> children;
   };
   std::vector<Cand> cands;
@@ -246,7 +316,7 @@ export void extract_textual_macros(const std::string &original,
           auto ns = rest.find_first_not_of(" \t");
           is_zero = ns != std::string_view::npos && rest[ns] == '0';
         }
-        blocks.push_back({pos, is_zero, false, false, {}});
+        blocks.push_back({pos, is_zero, false, false, false, false, {}});
       } else if (dir == "endif") {
         if (!blocks.empty()) {
           auto b = std::move(blocks.back());
@@ -257,8 +327,14 @@ export void extract_textual_macros(const std::string &original,
           // fragment); its macros are still captured individually by
           // PPCallbacks. Whether a nested one is redundant — covered by an
           // enclosing block that gets emitted — is settled after the scan.
-          cands.push_back({b.start, nl + 1,
-                           b.has_define && !b.has_code && !b.is_zero,
+          bool worth = b.has_define && !b.has_code && !b.is_zero;
+          if (unemitted_arm_ranges && b.has_arms && !worth)
+            unemitted_arm_ranges->push_back(
+                {(unsigned)b.start, (unsigned)(nl + 1)});
+          if (rejection_ranges && b.has_error && !b.has_define &&
+              !b.has_code && !b.has_arms && !b.is_zero)
+            rejections.push_back({b.start, nl + 1});
+          cands.push_back({b.start, nl + 1, worth, b.has_arms,
                            std::move(b.children)});
           auto idx = cands.size() - 1;
           if (!blocks.empty())
@@ -266,9 +342,27 @@ export void extract_textual_macros(const std::string &original,
           else
             roots.push_back(idx);
         }
+      } else if (dir == "error" || dir == "warning") {
+        // A diagnostic the library raises about its own configuration. Which
+        // macros it is judging is settled after the scan: the ones it rejects
+        // are usually defined below it.
+        if (!blocks.empty()) blocks.back().has_error = true;
       } else if (dir == "else" || dir == "elif") {
-        // keep blocks unchanged
+        // keep blocks unchanged, but remember that this one chooses between
+        // arms: what is nested inside belongs to the arm it sits in, which is
+        // not something recorded here.
+        if (!blocks.empty()) blocks.back().has_arms = true;
       } else if (dir == "define" && !d->after.empty()) {
+        {
+          auto after = d->after;
+          auto ns = after.find_first_not_of(" \t");
+          if (ns != std::string_view::npos) {
+            auto ne = after.find_first_of("( \t", ns);
+            auto mname = after.substr(
+                ns, ne == std::string_view::npos ? ne : ne - ns);
+            if (!is_guard_name(mname)) defined_names.emplace(mname);
+          }
+        }
         if (blocks.empty()) {
           capture_macro(line, d->hash_pos, nl);
         } else {
@@ -319,17 +413,79 @@ export void extract_textual_macros(const std::string &original,
   auto emit = [&](auto &&self, std::size_t idx) -> void {
     auto &c = cands[idx];
     if (c.worth) {
-      auto full = std::string(src.substr(c.start, c.end - c.start));
+      auto full = strip_include_guard(
+          std::string(src.substr(c.start, c.end - c.start)));
       macros.push_back({"", strip_block_includes(std::move(full)),
                         (unsigned)c.start, (unsigned)c.end});
       return;
     }
+    // An unemitted block with arms takes what is inside it down too. A nested
+    // block means
+    // what its enclosing one says it means: emitted on its own it is read by
+    // every build, including the ones the enclosing condition was there to
+    // exclude —
+    //
+    //   #if defined(__clang__)
+    //   ...
+    //   #elif defined(_MSC_VER)
+    //   #  if _MSC_FULL_VER < 190024210
+    //   #    undef LIB_CONSTEXPR
+    //   #    define LIB_CONSTEXPR      // nothing, for a compiler this is not
+    //   #  endif
+    //   #endif
+    //
+    // and `_MSC_FULL_VER` is undefined elsewhere, which the preprocessor reads
+    // as 0 and finds true. Boost.Mp11 loses every constexpr that way.
+    //
+    // The arm cannot be carried along instead: the enclosing record spans the
+    // whole chain from `#if` to `#endif`, and which arm a nested block sits in
+    // is not something the scan keeps. What the active branch defines is
+    // captured macro by macro regardless, so what goes unemitted here is only
+    // what another platform would have defined — which is the part that must
+    // not be written unconditionally.
+    //
+    // Without arms there is nothing to be in the wrong one of, and descending
+    // is what a header whose include guard wraps the whole file needs: that
+    // guard holds code by definition, and everything real is nested in it.
+    if (c.has_arms) return;
     // Siblings are recorded as they close, which for siblings is source order —
     // and source order is what has to be kept, since a macro used in a later
     // conditional's `#if` must already be defined by an earlier one.
     for (auto child : c.children) self(self, child);
   };
   for (auto idx : roots) emit(emit, idx);
+
+  // A header that rejects one of its own macros as user input reads its
+  // generated macros file above that rejection, so what the rejection finds is
+  // the library's own definition and it fires on the first read:
+  //
+  //   config.hpp:76: error: BOOST_FILESYSTEM_WINDOWS_API and
+  //     BOOST_FILESYSTEM_POSIX_API must not be defined by users
+  //
+  // Once the macros are the library's to replay, the header can no longer tell
+  // a user's definition from its own, and the question the rejection asks has
+  // no answer left. Only the ones judging a macro this file defines go: a
+  // diagnostic about anything else is still about something the header can see.
+  for (auto [start, end] : rejections) {
+    auto nl = src.find('\n', start);
+    auto cond = src.substr(start, nl == std::string_view::npos ? nl
+                                                               : nl - start);
+    for (std::size_t i = 0; i < cond.size();) {
+      if (!(std::isalpha((unsigned char)cond[i]) || cond[i] == '_')) {
+        ++i;
+        continue;
+      }
+      auto j = i;
+      while (j < cond.size() &&
+             (std::isalnum((unsigned char)cond[j]) || cond[j] == '_'))
+        ++j;
+      if (defined_names.count(cond.substr(i, j - i))) {
+        rejection_ranges->push_back({(unsigned)start, (unsigned)end});
+        break;
+      }
+      i = j;
+    }
+  }
 }
 
 // Result of override-guard analysis for a macro define.
@@ -425,9 +581,121 @@ export OverrideGuardRange override_guard_with_code(const std::string &src,
 // plus its doc comment, chained dependency macros files, and export-marker
 // insertions applied to macro bodies that declare library entities (a
 // declaration macro). Returns an empty string when there is nothing to emit.
+// Whether the header protects itself against being included twice. One that
+// does not is meant to be re-read — Boost's `assert.hpp` recomputes BOOST_ASSERT
+// from whatever is defined at each inclusion — and its macros file must be
+// re-read with it, or the second include silently keeps the first answer.
+// The `#undef X` lines a header writes BEFORE it defines X — the "start from
+// nothing, then decide" opening of a header meant to be re-read. They belong
+// with the definitions they precede: left behind while the definitions move to
+// the macros file, they undo the file the header just included.
+//
+// An `#undef` that comes AFTER a definition is a different idiom (retract and
+// redefine under a condition) and is handled where the definition is collected.
+export std::vector<std::pair<unsigned, std::string>> leading_undefs(
+    const std::string &src, const std::vector<MacroRec> &macros,
+    // Names defined only INSIDE a reproduced conditional block. They have no
+    // record of their own, so their resets are found by name; the ones written
+    // inside a block travel with it and are skipped here.
+    const std::set<std::string> &block_names = {},
+    const std::vector<std::pair<unsigned, unsigned>> &block_ranges = {}) {
+  std::vector<std::pair<unsigned, std::string>> out;
+  auto in_a_block = [&](std::size_t pos) {
+    for (auto &[start, end] : block_ranges)
+      if (pos >= start && pos < end) return true;
+    return false;
+  };
+  auto line_starts_here = [&](std::size_t pos, std::size_t len) {
+    auto after = pos + len;
+    if (after < src.size() && is_ident_char(src[after])) return false;
+    auto ls = src.rfind('\n', pos);
+    return src.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1) == pos;
+  };
+  for (const auto &name : block_names) {
+    auto needle = std::format("#undef {}", name);
+    for (std::size_t pos = src.find(needle); pos != std::string::npos;
+         pos = src.find(needle, pos + 1))
+      if (!in_a_block(pos) && line_starts_here(pos, needle.size()))
+        out.emplace_back(static_cast<unsigned>(pos), name);
+  }
+  for (const auto &m : macros) {
+    if (m.name.empty()) continue;
+    auto needle = std::format("#undef {}", m.name);
+    for (std::size_t pos = src.find(needle); pos != std::string::npos;
+         pos = src.find(needle, pos + 1)) {
+      if (pos >= m.start_off) break;  // after the definition: not this idiom
+      auto after = pos + needle.size();
+      if (after < src.size() && is_ident_char(src[after])) continue;
+      auto ls = src.rfind('\n', pos);
+      if (src.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1) != pos)
+        continue;
+      out.emplace_back(static_cast<unsigned>(pos), m.name);
+    }
+  }
+  return out;
+}
+
+export bool header_guards_itself(const std::string &src) {
+  if (src.contains("#pragma once")) return true;
+  std::size_t pos = 0;
+  std::string pending;
+  while (pos < src.size()) {
+    auto nl = src.find('\n', pos);
+    if (nl == std::string::npos) nl = src.size();
+    auto line = std::string_view(src).substr(pos, nl - pos);
+    pos = nl + 1;
+    auto d = parse_directive(line);
+    if (!d) continue;
+    if (pending.empty()) {
+      if (d->keyword != "ifndef") return false;  // some other directive first
+      auto e = d->after.find_first_of(" \t\r");
+      pending = e == std::string::npos ? d->after : d->after.substr(0, e);
+      continue;
+    }
+    if (d->keyword != "define") return false;
+    auto e = d->after.find_first_of(" \t\r");
+    return (e == std::string::npos ? d->after : d->after.substr(0, e)) == pending;
+  }
+  return false;
+}
+
+
+// The preprocessor lines of a conditional, and nothing else. A chain that
+// chooses between arms and also declares something cannot be emitted whole --
+// the declarations would land in the global module fragment -- but its macros
+// are meaningless without the arms that select them, and a module unit that
+// imports the header rather than reading it has only this file to learn them
+// from. What defines a macro is a directive, so dropping every other line
+// keeps the machine and leaves the declarations behind.
+std::string directives_only(std::string_view block) {
+  std::string out;
+  bool cont = false;
+  std::size_t pos = 0;
+  while (pos < block.size()) {
+    auto nl = block.find('\n', pos);
+    if (nl == std::string_view::npos) nl = block.size();
+    auto line = block.substr(pos, nl - pos);
+    bool keep = cont;
+    if (!keep) {
+      auto d = parse_directive(line, /*skip_hash_ws=*/true,
+                              /*keyword_ends_crlf=*/true);
+      // An include would bring the declarations back by another door.
+      keep = d && d->keyword != "include";
+    }
+    if (keep) {
+      out += line;
+      out += '\n';
+      cont = !line.empty() && line.back() == '\\';
+    }
+    pos = nl + 1;
+  }
+  return out;
+}
+
 export std::string build_macros_file(
     const std::vector<MacroRec> &export_macros,
-    const std::set<std::string> &extra_macro_includes,
+    // Macro header -> the conditional context it must be chained in under.
+    const std::map<std::string, std::vector<std::string>> &extra_macro_includes,
     // Include lines the reproduced conditional blocks need in order to be
     // evaluated here. See the caller.
     const std::vector<std::string> &block_support_includes,
@@ -435,13 +703,42 @@ export std::string build_macros_file(
     const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
     const std::string &original,
     const std::vector<ModPoint> &mods,
-    const std::string &export_include) {
+    const std::string &export_include,
+    // See header_guards_itself: a re-includable header's macros file must be
+    // re-read too — and it is the only copy of that header's conditional
+    // machine, so the includes inside those branches belong to it as well.
+    // (For a header included once, the branch is reproduced here AND kept in
+    // the body, and the includes stay with the body.)
+    bool guard_once = true,
+    // See extract_textual_macros: a definition inside an arm nobody carries
+    // stays where its arm selects it, which is the header.
+    const std::vector<std::pair<unsigned, unsigned>> &unemitted_arm_ranges =
+        {}) {
+  const bool sole_copy = !guard_once;
   std::string mout;
-  mout += "#pragma once\n\n";
+  if (guard_once) mout += "#pragma once\n\n";
+  // See leading_undefs: the header's own "start from nothing" undefs come
+  // first, so re-reading this file recomputes rather than collides.
+  {
+    std::set<std::string> seen;
+    for (auto &[off, name] :
+         leading_undefs(original, export_macros, block_defined_names,
+                        block_ranges))
+      if (seen.insert(name).second) mout += std::format("#undef {}\n", name);
+    if (!seen.empty()) mout += "\n";
+  }
   for (const auto &bi : block_support_includes) mout += bi;
   if (!block_support_includes.empty()) mout += "\n";
-  for (const auto &em : extra_macro_includes)
+  for (const auto &[em, guards] : extra_macro_includes) {
+    // The condition the include sat under travels with it: a header included
+    // only in one branch defines its macros only in that branch, and chaining
+    // them in unconditionally lets a definition the other branch never wanted
+    // win.
+    auto vg = valid_guards(guards);
+    for (const auto &g : vg) mout += g;
     mout += std::format("#include \"{}\"\n", em);
+    for (std::size_t i = 0; i < vg.size(); ++i) mout += "#endif\n";
+  }
   if (!extra_macro_includes.empty()) mout += "\n";
   // Apply the export-marker insertions that fall inside a macro's definition
   // range to the moved macro text, so a macro whose body declares a library
@@ -479,6 +776,7 @@ export std::string build_macros_file(
     return out;
   };
   bool has_marked_macros = false;
+  std::set<unsigned> emitted_arm_chains;
   for (auto &m : export_macros) {
     // Skip bare active definitions covered by an emitted conditional block:
     // one that covers every platform makes any definition of the name dead,
@@ -491,6 +789,24 @@ export std::string build_macros_file(
       for (auto &[start, end] : block_ranges)
         if (m.start_off >= start && m.end_off <= end) { in_block = true; break; }
       if (in_block) continue;
+      // And a definition inside an arm-bearing chain that is NOT emitted: no
+      // block carries its condition, so written here it is written for every
+      // compiler, saying what only the converting one had any right to say.
+      // A definition inside an arm-bearing chain that is not emitted whole.
+      // Written bare it speaks for every compiler; left out altogether it is
+      // gone from the one file a module unit importing this header can learn
+      // it from. So the chain arrives here as its directives alone, once, in
+      // the place its first definition would have taken.
+      bool in_arm = false;
+      for (auto &[start, end] : unemitted_arm_ranges)
+        if (m.start_off >= start && m.end_off <= end) {
+          if (emitted_arm_chains.insert(start).second)
+            mout += directives_only(
+                std::string_view(original).substr(start, end - start));
+          in_arm = true;
+          break;
+        }
+      if (in_arm) continue;
     }
     // Move the doc-comment block that precedes the macro into the macros file
     // next to the macro it documents.
@@ -512,7 +828,19 @@ export std::string build_macros_file(
           std::string(original, m.start_off, m.end_off - m.start_off),
           m.start_off);
       if (m.name.empty()) {
-        auto stripped = strip_block_includes(std::move(marked));
+        if (sole_copy) {
+          // The branch's own includes come with it: nothing else will bring
+          //   # include <assert.h>
+          //   # define LIB_ASSERT(expr) assert(expr)
+          // and the macro is expanded where the file is included.
+          mout += std::move(marked);
+          continue;
+        }
+        // The record's body had the guard taken out of it; the slice must
+        // lose it too, or they differ for that reason alone and this reads a
+        // marker that was never applied -- putting the guard back.
+        auto stripped =
+            strip_block_includes(strip_include_guard(std::move(marked)));
         if (stripped != m.body) {
           has_marked_macros = true;
           mout += std::move(stripped);
