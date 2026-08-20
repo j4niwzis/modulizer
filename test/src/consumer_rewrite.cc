@@ -931,3 +931,31 @@ TEST(ConsumerRewrite, CreditsAFragmentsDeclarationToTheHeaderThatOwnsIt) {
       << "the header that defines its terms and reads it is what a consumer "
          "includes";
 }
+
+TEST(ConsumerRewrite, KeepsEveryLineWhereItWasWhenIncludesFollowTheLibrarysOwn) {
+  // The library include is replaced where it stands, and it restores the count
+  // with a `#line` naming the source line after itself. The includes BELOW it
+  // are taken up into the block above it, and those lines are gone from the
+  // body too — so the line after the replacement is not the next one, it is
+  // the next one nobody took.
+  //
+  // Counted the first way, everything below reports low by however many were
+  // taken, and only something that asks where it is ever notices:
+  //
+  //   source_location_test4.cpp(35): test 's_loc.line() == 24' ('22' == '24')
+  //                                  failed in function 'int main()'
+  auto src = read_file(data_path("lineno/use2.cc"));
+  ASSERT_EQ(reported_line_of(src, "LINENO_MARKER2"), 11u)
+      << "the fixture itself must have the marker on line 11";
+
+  // The quoted include stays where it is and sets the point the block goes
+  // in; the two standard headers BELOW it are lifted into that block, so
+  // their lines leave the body from underneath the line that stayed. One
+  // `#line` after the block cannot say both where the kept line is and where
+  // the first line after the lifted ones is.
+  ConsumerRewriteOptions cfg;
+  auto out = rewrite_consumer_source(src, cfg);
+  EXPECT_EQ(reported_line_of(out, "LINENO_MARKER2"), 11u)
+      << "the marker has to still report line 11; got:\n"
+      << out;
+}
