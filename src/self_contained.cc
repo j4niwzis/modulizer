@@ -194,7 +194,17 @@ export bool include_stands_alone(const std::string &name,
   // under the other spelling is simply not there -- which reads as "this header
   // does not compile" for every header asked about.
   const std::string probe = "__mz_stands_alone.cc";
-  auto text = std::format("#include <{}>\n", name);
+  // Twice. Once says whether it parses; a consumer needs more than that, since
+  // its build reads a header again wherever the next thing needs it. Half a
+  // bracket compiles perfectly well alone and says what it thinks of the
+  // second reading:
+  //
+  //   config/abi_prefix.hpp:12: error: double inclusion of header
+  //     boost/config/abi_prefix.hpp is an error
+  //
+  // and its partner, which takes the guard back, does not survive the first.
+  // Neither is a header a consumer can be handed.
+  auto text = std::format("#include <{0}>\n#include <{0}>\n", name);
   clang::tooling::ClangTool tool(db, {probe});
   // Both spellings: the tool makes a relative argument absolute against the
   // working directory, and a virtual file mapped under only one of them is

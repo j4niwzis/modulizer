@@ -988,3 +988,23 @@ TEST(ConsumerRewrite, DoesNotNameAGuardedFragmentAConsumerCannotIncludeAlone) {
            return s;
          }();
 }
+
+TEST(ConsumerRewrite, HalfABracketIsNotAHeaderAConsumerCanInclude) {
+  // A bracket half opens state its partner closes. It compiles on its own, so
+  // asking only whether it parses says yes — and a consumer handed it then
+  // fails where its build reads the header again for the next thing:
+  //
+  //   config/abi_prefix.hpp:12: error: double inclusion of header
+  //     boost/config/abi_prefix.hpp is an error
+  //
+  // Its partner takes the guard back and does not survive being read first at
+  // all. Neither is something a consumer can be given.
+  EXPECT_FALSE(include_stands_alone("outsidelib/bracket/prefix.hpp",
+                                    {"-I", gDataDir}))
+      << "the half that opens says so itself when read twice";
+  EXPECT_FALSE(include_stands_alone("outsidelib/bracket/suffix.hpp",
+                                    {"-I", gDataDir}))
+      << "the half that closes has nothing to close when read first";
+  EXPECT_TRUE(include_stands_alone("outside/gadget.h", {"-I", gDataDir}))
+      << "an ordinary header is read twice without complaint";
+}
