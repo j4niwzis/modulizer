@@ -408,6 +408,24 @@ export inline int run_wrapper(int argc, const char **argv) {
   return 0;
 }
 
+// What --gcc-modules asks for, in one place. It is two settings and they are
+// wanted together: the linkage macro, and the using-directive workaround. Set
+// at each call site separately they drifted -- --full got the macro and not the
+// flag, so gcc importers lost every name behind an ADL barrier:
+//
+//   gmock-matchers-arithmetic_test.cc: error: 'Conditional' was not declared
+//     in this scope
+//
+// One function, so a caller cannot ask for half of it.
+void apply_gcc_modules(RewriteBatchConfig &cfg, const std::string &library_name) {
+  cfg.gcc_modules = GccModulesOpt.getValue();
+  if (!cfg.gcc_modules) return;
+  cfg.extern_cxx_macro = (MacroPrefixOpt.getValue().empty()
+                              ? macro_prefix(library_name)
+                              : macro_prefix(MacroPrefixOpt.getValue())) +
+                         "_EXTERN_CXX";
+}
+
 export inline int run_headers_rewrite(int argc, const char **argv) {
   auto parser_opt = open_options_parser(argc, argv);
   if (!parser_opt) return 1;
@@ -502,12 +520,7 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   cfg.module_replacements = module_replacements;
   cfg.combined_macros = CombinedMacrosOpt;
   cfg.extern_cxx = !NoExternCxxOpt;
-  cfg.gcc_modules = GccModulesOpt.getValue();
-  if (GccModulesOpt.getValue())
-    cfg.extern_cxx_macro = (MacroPrefixOpt.getValue().empty()
-                                ? macro_prefix(library_name)
-                                : macro_prefix(MacroPrefixOpt.getValue())) +
-                           "_EXTERN_CXX";
+  apply_gcc_modules(cfg, library_name);
   cfg.import_std = ImportStdOpt.getValue();
   cfg.cc_only = CCOnlyOpt.getValue();
   cfg.macro_prefix_override = MacroPrefixOpt.getValue();
@@ -1252,11 +1265,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;
   cfg.extern_cxx = extern_cxx;
-  if (GccModulesOpt.getValue())
-    cfg.extern_cxx_macro = (MacroPrefixOpt.getValue().empty()
-                                ? macro_prefix(library_name)
-                                : macro_prefix(MacroPrefixOpt.getValue())) +
-                           "_EXTERN_CXX";
+  apply_gcc_modules(cfg, library_name);
   cfg.import_std = ImportStdOpt.getValue();
   cfg.cc_only = CCOnlyOpt.getValue();
   cfg.same_module_free_fqns = same_module_free_fqns;
