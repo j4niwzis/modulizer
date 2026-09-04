@@ -2,6 +2,7 @@ module;
 
 export module modulizer.self_contained;
 import modulizer.include_analysis;
+import modulizer.rewrite_macros;
 import modulizer.util;
 import libtooling;
 import std;
@@ -71,6 +72,24 @@ bool parses_with(const std::string &path,
 // module boundary at all.
 bool is_bracket_half(const std::string &src) {
   int depth = 0;
+  // A bracket kept by a macro rather than by pragma state: one half sets a
+  // flag the other clears, and each refuses to be read out of turn --
+  //
+  //   #ifdef BOOST_ITERATOR_CONFIG_DEF
+  //   # error you have nested config_def #inclusion.
+  //   #else
+  //   # define BOOST_ITERATOR_CONFIG_DEF
+  //   #endif
+  //
+  // A macros file that replays that flag makes the next legitimate reading of
+  // the header a nested one, and the header says so:
+  //
+  //   config_def_macros.h:16: error: you have nested config_def #inclusion.
+  //
+  // The refusal is what marks it. A header that merely defines a flag is
+  // ordinary; one that treats reading it twice in a row as an error is written
+  // to be pasted around something, exactly like the pragma halves.
+  bool refuses_out_of_turn = false, pending_flag_test = false;
   std::size_t pos = 0;
   while (pos < src.size()) {
     auto nl = src.find('\n', pos);
@@ -79,13 +98,21 @@ bool is_bracket_half(const std::string &src) {
     pos = nl + 1;
     auto d = parse_directive(line, /*skip_hash_ws=*/true,
                              /*keyword_ends_crlf=*/true);
-    if (!d || d->keyword != "pragma") continue;
+    if (!d) continue;
+    if (d->keyword == "ifdef" || d->keyword == "ifndef" ||
+        d->keyword == "if")
+      pending_flag_test = true;
+    else if (d->keyword == "error" && pending_flag_test)
+      refuses_out_of_turn = true;
+    else if (d->keyword == "endif")
+      pending_flag_test = false;
+    if (d->keyword != "pragma") continue;
     // Only the state-stacking pragmas: `#pragma once` and
     // `#pragma warning(disable: …)` stack nothing.
     if (d->after.contains("push")) ++depth;
     if (d->after.contains("pop")) --depth;
   }
-  return depth != 0;
+  return depth != 0 || (refuses_out_of_turn && !header_guards_itself(src));
 }
 
 // One place a header is included from: which header does it, and what that

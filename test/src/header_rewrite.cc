@@ -2932,3 +2932,78 @@ TEST(HeaderRewrite, PutsAFragmentsIncludesInTheGlobalModuleFragment) {
       << "what it declares must be exported where it is read; got:\n"
       << r.h_content;
 }
+
+TEST(HeaderRewrite, DoesNotMarkIntoAMacroBodyAClassExpands) {
+  // One macro expanded twice: as a friend inside the class, and at namespace
+  // scope for the definition. They are two separate declarations spelling the
+  // same place, so a marker written there for the second reaches the first,
+  // where neither `export` nor `extern "C++"` can be written — and the classic
+  // build breaks too, the export macro being empty and the linkage
+  // specification left standing on its own:
+  //
+  //   iterator_facade.hpp:506: error: expected member name or ';' after
+  //     declaration specifiers
+  //   note: expanded from macro 'BOOST_ITERATOR_FACADE_PLUS_HEAD'
+  //     BOOST_ITERATORX_EXPORT extern "C++" template< ... >
+  auto r = rewrite_header(
+      data_path("friendmacro.h"), "friendmacro_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir}, .extern_cxx = true});
+  // The macro is never #undef'd, so it moves to the macros file.
+  const auto &where = r.macros_content.contains("#define FRIENDMACRO_PLUS_HEAD")
+                          ? r.macros_content
+                          : r.h_content;
+  auto at = where.find("#define FRIENDMACRO_PLUS_HEAD");
+  ASSERT_NE(at, std::string::npos)
+      << "the macro must still be defined somewhere; got header:\n"
+      << r.h_content << "\nand macros file:\n"
+      << r.macros_content;
+  auto body = where.substr(at, 200);
+  EXPECT_EQ(body.find("extern \"C++\""), std::string::npos)
+      << "a linkage specification cannot be written at class scope; got:\n"
+      << body;
+  EXPECT_EQ(body.find("_EXPORT"), std::string::npos)
+      << "and neither can an export; got:\n"
+      << body;
+}
+
+TEST(HeaderRewrite, RecognisesAGuardSpelledWithATrailingUnderscore) {
+  // A guard is the header's own bookkeeping, never a macro to export. Spelled
+  // with a trailing underscore it went unrecognised, so it was carried off to
+  // the macros file and taken out of the header — which then had nothing left
+  // to stop a second reading:
+  //
+  //   eval_if_default.hpp:40:8: error: redefinition of 'eval_if_default'
+  auto r = rewrite_header(data_path("guardstyle.h"), "guardstyle_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_EQ(r.macros_content.find("#define GUARDSTYLE_HPP_INCLUDED_"),
+            std::string::npos)
+      << "the guard must not be exported as a macro; got:\n"
+      << r.macros_content;
+  EXPECT_NE(r.h_content.find("#ifndef GUARDSTYLE_HPP_INCLUDED_"),
+            std::string::npos)
+      << "and it must stay in the header, where it does its work; got:\n"
+      << r.h_content;
+}
+
+TEST(HeaderRewrite, QualifiesAReExportForTheScopeItIsWrittenIn) {
+  // A using-directive is re-exported as one using-declaration per name, and
+  // the qualification has to be valid where that declaration lands. The
+  // directive's own scope is not always the namespace containing the one it
+  // nominates: Boost.Iterator writes `using namespace
+  // iterators::advance_adl_barrier;` in namespace boost, and the short name
+  // cannot be named there:
+  //
+  //   advance.hpp:90:30: error: use of undeclared identifier
+  //     'advance_adl_barrier'; did you mean 'iterators::advance_adl_barrier'?
+  auto r = rewrite_header(data_path("adlq/barrier.h"), "adlq_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_NE(r.h_content.find("using barrier::thing;"), std::string::npos)
+      << "inside the namespace that contains it, the short name is right; "
+         "got:\n"
+      << r.h_content;
+  EXPECT_NE(r.h_content.find("using inner::barrier::thing;"),
+            std::string::npos)
+      << "one scope further out it must be reached through the namespace that "
+         "holds it; got:\n"
+      << r.h_content;
+}

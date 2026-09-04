@@ -373,6 +373,18 @@ public:
     return false;
   }
 
+  // A friend is never visited as a declaration of its own -- the traversal
+  // reaches it only here -- but the macro body it spells is shared with the
+  // namespace-scope definition that IS visited, and marking that one writes
+  // into this use as well, where nothing can be written. Claiming the place
+  // first is what stops it: the class body is read before the definition that
+  // follows it, so the later visit finds it taken.
+  bool VisitFriendDecl(clang::FriendDecl *f) {
+    if (!f) return true;
+    if (auto *fd = f->getFriendDecl()) claim_macro_body_spelling(fd);
+    return true;
+  }
+
   bool VisitCXXRecordDecl(clang::CXXRecordDecl *rd) {
     if (!rd || rd->isImplicit() || !isMainFile(rd)) return true;
     if (llvm::isa<clang::CXXRecordDecl>(rd->getDeclContext())) return true;
@@ -712,10 +724,39 @@ public:
     while (off < buf.size() && buf[off] != ';') ++off;
     if (off >= buf.size()) return true;
     ++off;  // just past the `;`
+    // The qualification has to name the namespace from where the declaration
+    // lands, and that is not always the scope the directive sits in. Boost's
+    // ADL barriers are opened from one level further out --
+    //
+    //   namespace boost {
+    //   using namespace iterators::advance_adl_barrier;
+    //
+    // -- and there the innermost name is not something that can be named:
+    //
+    //   advance.hpp:90:30: error: use of undeclared identifier
+    //     'advance_adl_barrier'; did you mean 'iterators::advance_adl_barrier'?
+    //
+    // So the path is walked from the nominated namespace out to the scope the
+    // declaration is written in, and stops there: a namespace already reachable
+    // by its own name keeps being spelled that way.
+    std::string qual;
+    {
+      const auto *scope = udd->getDeclContext()->getPrimaryContext();
+      std::vector<std::string> parts;
+      for (const clang::DeclContext *p = ns; p && !p->isTranslationUnit();
+           p = p->getParent()) {
+        if (p->getPrimaryContext() == scope) break;
+        if (const auto *nd = llvm::dyn_cast<clang::NamespaceDecl>(p))
+          parts.push_back(nd->getNameAsString());
+      }
+      for (const auto &part : std::views::reverse(parts)) {
+        qual += part;
+        qual += "::";
+      }
+    }
     std::string text;
     for (auto &n : names)
-      text += std::format("\n{} using {}::{};", export_macro,
-                          ns->getNameAsString(), n);
+      text += std::format("\n{} using {}{};", export_macro, qual, n);
     mods.push_back({off, 0, std::move(text)});
     return true;
   }
@@ -806,6 +847,17 @@ private:
     return library_headers->count(canon) ? canon : std::string();
   }
 
+  // The place a declaration spells inside a macro body, taken so that no other
+  // declaration expanded from the same body can be marked there.
+  void claim_macro_body_spelling(clang::Decl *d) {
+    if (auto *td = d->getDescribedTemplate()) d = td;
+    auto begin = d->getBeginLoc();
+    if (!begin.isMacroID()) return;
+    auto loc = sm.getSpellingLoc(begin);
+    if (!loc.isValid()) return;
+    marked.insert({macro_body_route(d, loc), sm.getFileOffset(loc)});
+  }
+
   // `shared`: this declares an entity another module defines, so the marker is
   // the one whose expansion depends on whether the purview is wrapped.
   void addExport(clang::Decl *d, bool need_extern_cxx = false,
@@ -825,9 +877,37 @@ private:
         if (ct->getFriendObjectKind() != clang::Decl::FOK_None) return;
       if (llvm::isa<clang::CXXRecordDecl>(rd->getLexicalDeclContext())) return;
     }
+    // A friend, or anything else written at class scope, takes no marker:
+    // `export` and `extern "C++"` are namespace-scope constructs. Skipping it
+    // is not enough, though. A macro that expands to a friend inside the class
+    // is usually expanded again at namespace scope for the definition, and
+    // those are two separate declarations that spell the SAME place -- the
+    // body of the macro:
+    //
+    //   FriendDecl <line:2:5, line:11:71> line:3:14
+    //     `-FunctionTemplateDecl 0x...b328 friend_undeclared plus_head
+    //   FunctionTemplateDecl 0x...c908 line:3:14 plus_head
+    //
+    // Nothing links them -- they are not redeclarations of each other -- so
+    // marking the namespace-scope one writes into the shared body, and the
+    // class-scope expansion stops parsing. In the classic build too, where the
+    // export macro is empty and the linkage specification is left standing:
+    //
+    //   iterator_facade.hpp:506: error: expected member name or ';' after
+    //     declaration specifiers
+    //   note: expanded from macro 'BOOST_ITERATOR_FACADE_PLUS_HEAD'
+    //     BOOST_ITERATORX_EXPORT extern "C++" template< ... >
+    //
+    // So the place is claimed here rather than merely skipped, and the later
+    // visit finds it taken. Only a macro body can be shared this way; a friend
+    // written out in full spells a place of its own, and claiming that would
+    // take the marker off a definition that is entitled to one.
     if (auto *fd = llvm::dyn_cast<clang::FunctionDecl>(d)) {
-      if (fd->getFriendObjectKind() != clang::Decl::FOK_None) return;
-      if (llvm::isa<clang::CXXRecordDecl>(fd->getLexicalDeclContext())) return;
+      if (fd->getFriendObjectKind() != clang::Decl::FOK_None ||
+          llvm::isa<clang::CXXRecordDecl>(fd->getLexicalDeclContext())) {
+        claim_macro_body_spelling(d);
+        return;
+      }
     }
     if (auto *td = d->getDescribedTemplate()) d = td;
     auto begin = d->getBeginLoc();
