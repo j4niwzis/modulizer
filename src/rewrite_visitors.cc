@@ -30,7 +30,11 @@ public:
                 const std::set<std::string> &same_module_free_fqns = {},
                 const std::set<std::string> *library_headers = nullptr,
                 std::map<std::string, std::vector<ModPoint>> *
-                    external_macro_mods = nullptr)
+                    external_macro_mods = nullptr,
+                // --gcc-modules. gcc does not carry an exported using-directive
+                // to an importer, so there the members are re-declared one by
+                // one instead. See compiler-bugs/gcc-exported-using-directive.
+                bool gcc_modules = false)
       : sm(sm), mods(mods),
         internal_re(internal_re), export_macro(export_macro),
         shared_export_macro(shared_export_macro),
@@ -42,7 +46,7 @@ public:
         friend_extern_fqns(friend_extern_fqns),
         same_module_free_fqns(same_module_free_fqns),
         library_headers(library_headers),
-        external_macro_mods(external_macro_mods) {}
+        external_macro_mods(external_macro_mods), gcc_modules(gcc_modules) {}
 
   bool shouldVisitTemplateInstantiations() const { return false; }
   bool shouldVisitImplicitCode() const { return false; }
@@ -709,6 +713,15 @@ public:
     // Only a namespace this header itself declares: `using namespace std;` is
     // not this rewrite's to re-declare.
     if (!ns || !isMainFile(ns)) { addExport(udd); return true; }
+    // Exporting the directive is what the standard asks for, and what an ADL
+    // barrier needs: the members are reachable through it without being
+    // DECLARED in the enclosing namespace, so an unqualified call at the point
+    // of use still finds only what it should --
+    //
+    //   adl_test.cpp:21:5: error: call to 'advance' is ambiguous
+    //
+    // which is what re-declaring them one by one causes, against std::advance.
+    if (!gcc_modules) { addExport(udd); return true; }
     std::set<std::string> names;
     for (auto *d : ns->decls()) {
       auto *nd = llvm::dyn_cast<clang::NamedDecl>(d);
@@ -772,6 +785,9 @@ private:
   std::vector<ModPoint> &mods;
   // Where a marker was already inserted, by (routed-to file, offset).
   std::set<std::pair<std::string, unsigned>> marked;
+  // Macro bodies an expansion at class scope shares. A marker written into one
+  // reaches that expansion too, where it cannot be written at all.
+  std::set<std::pair<std::string, unsigned>> class_scope_claims;
   const std::regex &internal_re;
   std::string_view export_macro;
   std::string_view shared_export_macro;
@@ -799,6 +815,7 @@ private:
   // into that header's macros file instead of exported at the invocation.
   const std::set<std::string> *library_headers = nullptr;
   std::map<std::string, std::vector<ModPoint>> *external_macro_mods = nullptr;
+  bool gcc_modules = false;
 
   bool is_internal(const std::string &entity_name) const {
     if (no_internal_filter) return false;
@@ -861,7 +878,7 @@ private:
     if (!begin.isMacroID()) return;
     auto loc = sm.getSpellingLoc(begin);
     if (!loc.isValid()) return;
-    marked.insert({macro_body_route(d, loc), sm.getFileOffset(loc)});
+    class_scope_claims.insert({macro_body_route(d, loc), sm.getFileOffset(loc)});
   }
 
   // `shared`: this declares an entity another module defines, so the marker is
@@ -966,6 +983,31 @@ private:
         if (ls_loc.isValid() && sm.getFileID(ls_loc) == fid)
           off = sm.getFileOffset(ls_loc);
       }
+    // A macro body shared with an expansion at class scope. The marker cannot
+    // go there -- neither `export` nor `extern "C++"` can be written inside a
+    // class -- but this use is at namespace scope and needs one: without it
+    // the operators an iterator facade defines are not exported, and an
+    // importer cannot find them by ADL:
+    //
+    //   stl_algobase.h:461: error: invalid operands to binary expression
+    //     ('counting_iterator<int>' and 'counting_iterator<int>')
+    //
+    // So the marker goes on the expansion rather than into the body: it is
+    // written once, here, and the class-scope expansion is left alone.
+    if (class_scope_claims.count({route_to, off})) {
+      auto exp = sm.getExpansionLoc(begin);
+      if (!exp.isValid() || !sm.isInMainFile(exp)) return;
+      route_to.clear();
+      off = sm.getFileOffset(exp);
+      // And no linkage-specification with it. A declaration inside one is
+      // attached to the global module, while the friend the class wrote is
+      // attached to this one, and the two cannot be the same entity:
+      //
+      //   iterator_facade.hpp:891: error: declaration of 'operator+' in the
+      //     global module follows declaration in module
+      //     boost.iterator.iterator_facade
+      need_extern_cxx = false;
+    }
     // One marker per declaration: an entity can be reached twice (a class and
     // the variable it declares share a begin location, and a using-declaration
     // exports a target its own visit already marked), and a second insertion at

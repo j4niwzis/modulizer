@@ -502,6 +502,7 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   cfg.module_replacements = module_replacements;
   cfg.combined_macros = CombinedMacrosOpt;
   cfg.extern_cxx = !NoExternCxxOpt;
+  cfg.gcc_modules = GccModulesOpt.getValue();
   if (GccModulesOpt.getValue())
     cfg.extern_cxx_macro = (MacroPrefixOpt.getValue().empty()
                                 ? macro_prefix(library_name)

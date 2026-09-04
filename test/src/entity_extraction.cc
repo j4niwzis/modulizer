@@ -271,6 +271,27 @@ TEST(SelfContained, AMacroBracketIsAFragmentToo) {
       << "an ordinary header is unaffected";
 }
 
+TEST(SelfContained, AHeaderThatRefusesAConfigurationIsStillAHeader) {
+  // Raising an #error about a macro it does not control is what an ordinary
+  // configuration header does. Reading that alone as half a bracket takes the
+  // header out of the conversion, and with it every macro it defines:
+  //
+  //   gmock-spec-builders.h:205:25: error: unknown type name
+  //     'GTEST_DECLARE_STATIC_MUTEX_'
+  //
+  // The bracket shape is the whole of it — one macro tested, refused in one
+  // arm, and set or cleared in the other.
+  std::vector<std::string> headers = {
+      data_path("needctx_lib/refuses_config.h"),
+      data_path("needctx_lib/macro_def.h"), data_path("needctx_lib/thing.h")};
+  auto found = discover_header_contexts(headers, {"-I", gDataDir,
+                                                  "-DNEEDCTX_LANG=202302L"});
+  EXPECT_FALSE(found.fragments.count(data_path("needctx_lib/refuses_config.h")))
+      << "it refuses a configuration; it does not bracket anything";
+  EXPECT_TRUE(found.fragments.count(data_path("needctx_lib/macro_def.h")))
+      << "and the one that does is still recognised";
+}
+
 TEST(SelfContained, ContextArgsAreIncludeFlags) {
   auto args = context_args({{"a.h", {"/x/one.h", "/x/two.h"}}});
   ASSERT_TRUE(args.count("a.h"));
