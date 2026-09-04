@@ -198,12 +198,54 @@ GmfAndImports classify_includes(
           // so the include asks:
           //
           //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+          //
+          // It goes in the GMF and not beside the import, though the import is
+          // what it belongs to. A macros file is text, and text read after
+          // `export module` is read into the module: a macros file carrying the
+          // standard header one of its bodies names would attach that header's
+          // declarations to this module, and they are the global module's —
+          //
+          //   error: declaration of 'source_location' in module
+          //          boost.exception.exception follows declaration in the
+          //          global module
+          //
+          // Reading it earlier costs nothing, macros being no respecters of the
+          // purview: what is defined before `export module` is still defined
+          // after it. The unit's own macros file is read there for the same
+          // reason.
           auto mh = replacement_macros_header(inc.path, options.hyphen_macros);
-          line += std::format(
-              "\n#if __has_include(\"{}\")\n#include \"{}\"\n#endif", mh, mh);
+          IncludeDirective minc = inc;
+          minc.path = mh;
+          minc.is_quoted = true;
+          minc.line = std::format(
+              "#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n", mh, mh);
+          // Outermost, as the include below is given the negation of the
+          // same guard. The condition the include sat under may call a macro
+          // the provider itself defines —
+          //
+          //   #if (BOOST_MP11_WORKAROUND( BOOST_MP11_GCC, >= 140000 ) && ...)
+          //
+          // and asking it first is asking the provider's macros for
+          // permission to read the provider's macros:
+          //
+          //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not
+          //          defined
+          //
+          // Under the provider's own guard the whole block is skipped where
+          // there is no import, and where there is one the macros have
+          // arrived with it by the time the condition is read.
+          minc.guard_stack.insert(minc.guard_stack.begin(),
+                                  std::format("#if defined({})\n", rep->guard));
+          out.gmf_incs.push_back(std::move(minc));
         }
-        out.purview_imports.push_back(guarded_import(
-            inc, std::format("#if defined({})\n{}\n#endif", rep->guard, line)));
+        // The provider's guard outside the condition here too, and for the
+        // reason the macros file above is given the same order: the condition
+        // an include of the provider sat under is written in the provider's
+        // terms, and reading it first asks a question only the import can
+        // answer.
+        out.purview_imports.push_back(
+            std::format("#if defined({})\n{}\n#endif", rep->guard,
+                        guarded_import(inc, line)));
         inc.guard_stack.insert(inc.guard_stack.begin(),
                                std::format("#if !defined({})\n", rep->guard));
         out.gmf_incs.push_back(inc);
@@ -847,8 +889,20 @@ std::vector<std::string> macros_file_support_includes(
   // the condition it was written under rather than skipped: the header that
   // declares the type is guarded by the very feature-test macro the macro
   // definition is guarded by, so the two branches stand or fall together.
+  //
+  // Not where std is imported. The import already carries these declarations,
+  // and a textual header beside it declares them a second time without making
+  // them one entity:
+  //
+  //   bits/stringfwd.h: error: reference to 'basic_string' is ambiguous
+  //   __new/allocate.h: error: call to 'operator new' is ambiguous
+  //
+  // The macro keeps what the import gives it. Carrying the header there would
+  // trade one broken build for another, which is the same bargain the
+  // foreign-macro case above refuses.
   std::vector<const IncludeDirective *> std_entity_includes;
   for (auto &inc : includes) {
+    if (options.import_std) break;
     if (inc.transitive || inc.is_quoted) continue;
     auto stem = include_stem(inc.path);
     if (stem.empty() || stem.find('/') != std::string::npos) continue;
@@ -1189,7 +1243,8 @@ export HeaderRewriteResult rewrite_header(
   // In cc-only mode the header body is inlined into the interface unit where
   // USE_MODULES is always defined, so these includes are dropped entirely.
   hdr = wrap_includes_with_guard(std::move(hdr), includes, use_modules_macro,
-                                 /*remove=*/options.cc_only);
+                                 /*remove=*/options.cc_only,
+                                 options.module_replacements);
 
   auto prelude = std::format(
       "#pragma once\n"
