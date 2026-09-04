@@ -78,9 +78,44 @@ export bool is_ident_char(char c) {
          (c >= '0' && c <= '9') || c == '_';
 }
 
+
+// Whether the `#define` at `hash_off` is the file's own include guard: the
+// line before it is `#ifndef <the same name>` and the name is spelled like a
+// guard. `collectible_macro` already rejects the guards clang detects itself;
+// this catches the rest — a guard whose `#ifndef` sits on the previous line.
+//
+// Shared, because the macro collector and the check for whether a header
+// produces a macros file at all have to give the same answer: disagree, and a
+// consumer is told to include a macros file that was never written.
+// The base name of a generated macro header for a header stem, e.g. the stem
+// `mylib_pred_impl` stays `mylib_pred_impl` (underscore style) or becomes
+// `mylib-pred-impl` (--hyphen-macros style).
 export bool looks_like_guard_name(llvm::StringRef name) {
+  // `_INCLUDED` is Boost's spelling (`BOOST_CORE_ADDRESSOF_HPP_INCLUDED`). A
+  // guard hoisted into the macros file is a guard taken OUT of the header, and
+  // a header without one is included twice the moment two others include it:
+  //
+  //   error: redefinition of 'make_void'
+  //   note: unguarded header; consider using #ifdef guards or #pragma once
+  //
+  // Invisible while only module units are built — each includes its header
+  // exactly once — and immediate in a classic build.
   return name.starts_with("_") || name.ends_with("_H") ||
-         name.ends_with("_H_") || name.ends_with("_HPP");
+         name.ends_with("_H_") || name.ends_with("_HPP") ||
+         name.ends_with("_INCLUDED");
+}
+
+export bool is_include_guard_define(llvm::StringRef buf, unsigned hash_off,
+                                    llvm::StringRef macro_name) {
+  std::string_view before(buf.data(), hash_off);
+  auto nl = before.rfind('\n');
+  if (nl == std::string_view::npos || nl == 0) return false;
+  auto pnl = before.rfind('\n', nl - 1);
+  auto start = pnl == std::string_view::npos ? 0 : pnl + 1;
+  auto prev = before.substr(start, nl - start);
+  return prev.starts_with("#ifndef") &&
+         prev.find(macro_name) != std::string_view::npos &&
+         looks_like_guard_name(macro_name);
 }
 
 export unsigned template_header_start(llvm::StringRef text, unsigned pos) {

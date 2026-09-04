@@ -9,6 +9,7 @@ import modulizer.header_rewriter;
 import modulizer.include_analysis;
 import modulizer.macro_analyzer;
 import modulizer.naming;
+import modulizer.rewrite_macros;
 import modulizer.rewrite_orchestration;
 import modulizer.self_contained;
 import modulizer.util;
@@ -155,9 +156,16 @@ llvm::cl::opt<std::string> InternalModeOpt(
 
 llvm::cl::list<std::string> ModuleReplacesOpt(
     "module-replaces",
-    llvm::cl::desc("Mark a module as replacing headers, format "
-                   "module=header1,header2 (repeatable); includes replaced by "
-                   "an imported module are removed from the GMF"));
+    llvm::cl::desc("A module that provides headers, so an include of one "
+                   "becomes an import of it: "
+                   "<module>=<header1>,<header2>[:<option>...] (repeatable). "
+                   "An empty module name derives one per include path, which "
+                   "is what a converted library needs. Options: "
+                   "guard=<MACRO> emits the import under that macro and keeps "
+                   "the include under its negation, so each provider is "
+                   "switched on by itself; macros brings the provider's "
+                   "macros file along with the import, which a module cannot "
+                   "carry."));
 
 llvm::cl::list<std::string> ConsumerSourcesOpt(
     "consumer-source",
@@ -188,6 +196,15 @@ llvm::cl::opt<std::string> MacroPrefixOpt(
     llvm::cl::desc("Override the LIB prefix used in the LIB_USE_MODULES / "
                    "LIB_IMPORT_STD / LIB_USE_IMPORT_STD / LIB_EXPORT macros; "
                    "defaults to the uppercased library name"));
+
+
+
+llvm::cl::opt<bool> DualConsumersOpt(
+    "dual-consumers",
+    llvm::cl::desc("(--consumers mode) Keep the includes the imports replace, "
+                   "behind `#else`, so the consumer still compiles as a plain "
+                   "translation unit against the same headers. The imports are "
+                   "taken where <PREFIX>_IMPORT_MODULES is defined"));
 
 llvm::cl::opt<bool> DualImplOpt(
     "dual-impl",
@@ -237,27 +254,22 @@ bool write_macro_file(const HeaderRewriteResult &r) {
   return true;
 }
 
-// Parse --module-replaces "module=header1,header2" into a map.
-std::map<std::string, std::set<std::string>> parse_module_replaces() {
-  std::map<std::string, std::set<std::string>> module_replaces;
+// Parse every --module-replaces spec, reporting all the bad ones rather than
+// stopping at the first.
+std::optional<std::vector<ModuleReplacement>> parse_module_replacements() {
+  std::vector<ModuleReplacement> out;
+  bool ok = true;
   for (auto &spec : ModuleReplacesOpt) {
-    auto eq = spec.find('=');
-    if (eq == std::string::npos) continue;
-    auto mod = spec.substr(0, eq);
-    std::set<std::string> headers;
-    std::string cur;
-    for (char c : std::string_view(spec).substr(eq + 1)) {
-      if (c == ',') {
-        if (!cur.empty()) headers.insert(std::move(cur));
-        cur.clear();
-      } else {
-        cur += c;
-      }
+    std::string error;
+    if (auto r = parse_module_replacement(spec, error)) {
+      out.push_back(std::move(*r));
+    } else {
+      llvm::errs() << "error: --module-replaces " << error << "\n";
+      ok = false;
     }
-    if (!cur.empty()) headers.insert(std::move(cur));
-    module_replaces[mod] = std::move(headers);
   }
-  return module_replaces;
+  if (!ok) return std::nullopt;
+  return out;
 }
 
 // Parse manually specified FQNs from the --reachable-fqn option.
@@ -447,7 +459,9 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
                     internal_sources);
   }
 
-  auto module_replaces = parse_module_replaces();
+  auto module_replacements_opt = parse_module_replacements();
+  if (!module_replacements_opt) return 1;
+  auto &module_replacements = *module_replacements_opt;
 
   // Macro reachability: internal entities referenced by public macros
   // must be exported so module consumers can expand those macros. This
@@ -485,7 +499,7 @@ export inline int run_headers_rewrite(int argc, const char **argv) {
   cfg.library_name = library_name;
   cfg.public_modules = public_modules;
   cfg.no_internal_filter = ExportAllOpt.getValue();
-  cfg.module_replaces = module_replaces;
+  cfg.module_replacements = module_replacements;
   cfg.combined_macros = CombinedMacrosOpt;
   cfg.extern_cxx = !NoExternCxxOpt;
   if (GccModulesOpt.getValue())
@@ -569,6 +583,12 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
     llvm::errs() << "error: --module-name is required\n";
     return 1;
   }
+  // The same providers the headers were converted against: a consumer that
+  // keeps including one textually while the library it uses imports it ends up
+  // with two of it.
+  auto module_replacements_opt = parse_module_replacements();
+  if (!module_replacements_opt) return 1;
+  auto &module_replacements = *module_replacements_opt;
   auto &parser = *parser_opt;
 
   std::vector<std::string> header_paths, consumer_paths;
@@ -604,8 +624,39 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
   auto include_map = build_include_module_map(
       header_paths, library_name, all_extra, HyphenMacrosOpt.getValue(),
       headers_with_macros);
+  // Whether a header ends up with a macros file is not something to predict:
+  // it has one when it defines a macro of its own OR when the modules it
+  // imports do, and only the run that wrote it knows. Ask the include path,
+  // which by now holds the generated headers — a consumer told to include a
+  // macros file that was never written does not compile, and one not told
+  // about the file that was is missing the macros it used to get textually.
+  for (auto &[path, info] : include_map) {
+    auto name = info.macro_header;
+    if (name.empty()) {
+      // The conventional name for this header's macros file, to be kept only
+      // if the run that wrote the headers actually produced it.
+      auto dir = std::filesystem::path(path).parent_path().string();
+      auto stem = std::filesystem::path(path).stem().string();
+      name = (dir.empty() ? "" : dir + "/") +
+             macro_base_name(stem, HyphenMacrosOpt.getValue()) +
+             (HyphenMacrosOpt.getValue() ? "-macros.h" : "_macros.h");
+    }
+    info.macro_header =
+        resolve_include(name, consumer_paths.front(), all_extra).empty()
+            ? std::string()
+            : name;
+    // Where a header is included matters when it does not guard itself; see
+    // ConsumerHeaderInfo::reincludable.
+    auto resolved = resolve_include(path, consumer_paths.front(), all_extra);
+    if (!resolved.empty())
+      info.reincludable = !header_guards_itself(read_file(resolved));
+  }
+
   ConsumerRewriteOptions cfg;
   cfg.import_std = ImportStdOpt.getValue();
+  // The same separator the headers were generated with, so a macros file is
+  // asked for by the name it was actually written under.
+  cfg.hyphen_macros = HyphenMacrosOpt.getValue();
   cfg.include_to_module = std::move(include_map);
 
   // The consumer references internal entities (e.g. entities the library's
@@ -622,6 +673,8 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
   // macros or POSIX declarations/types, so those includes are re-added by the
   // rewriter once the library headers no longer pull them in textually.
   std::map<std::string, std::set<std::string>> system_includes_by_consumer;
+  std::set<std::string> plain_includes_for_consumers;
+  std::vector<ModuleReplacement> module_includes_for_consumers;
   {
     bool any_library_include = false;
     for (auto &c : consumer_paths) {
@@ -659,6 +712,48 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
       }
       system_includes_by_consumer =
           std::move(traced.system_includes_by_consumer);
+
+      // What the consumer reached THROUGH the library headers and can no
+      // longer reach through the imports that replace them: the library's
+      // module units keep those includes in their global module fragment,
+      // where the declarations attach to the global module and are invisible
+      // to importers, and macros do not cross a module boundary at all.
+      //
+      // Merged into the same set: both are includes the consumer must now
+      // write for itself, and the rewriter emits them the same way.
+      auto outside = trace_consumer_outside_includes(
+          consumer_paths, header_paths, all_extra, &virtual_sources);
+      for (auto &[c, incs] : outside)
+        system_includes_by_consumer[c].insert(incs.begin(), incs.end());
+
+      // And what the consumer never names but still needs. A global module
+      // fragment is pruned to what is decl-reachable from the exported
+      // declarations, so an outside type in the interface survives while an
+      // operator found only by ADL — at a template instantiation in the
+      // consumer's own translation unit — does not. Tracing the consumer
+      // cannot see that: the name is never written there.
+      auto lib_outside = trace_library_outside_includes(
+          header_paths, all_extra, module_replacements,
+          (MacroPrefixOpt.getValue().empty()
+               ? macro_prefix(library_name_of(ModuleNameOpt.getValue()))
+               : macro_prefix(MacroPrefixOpt.getValue())) +
+              "_USE_MODULES");
+      // One a module provides is emitted as the import/include pair its guard
+      // chooses between; the rest as plain includes.
+      for (const auto &inc : lib_outside) {
+        if (auto *rep = find_replacement(inc, module_replacements);
+            rep && !rep->guard.empty()) {
+          ModuleReplacement one = *rep;
+          one.headers = {inc};
+          module_includes_for_consumers.push_back(std::move(one));
+        } else {
+          plain_includes_for_consumers.insert(inc);
+        }
+      }
+      for (auto &c : consumer_paths)
+        system_includes_by_consumer[c].insert(
+            plain_includes_for_consumers.begin(),
+            plain_includes_for_consumers.end());
     }
   }
 
@@ -675,10 +770,21 @@ export inline int run_consumers_rewrite(int argc, const char **argv) {
     auto sit = system_includes_by_consumer.find(c);
     if (sit != system_includes_by_consumer.end())
       per_cfg.required_system_includes = sit->second;
+    per_cfg.required_module_includes = module_includes_for_consumers;
     // A consumer header is included by other consumers, which have imported by
     // then; what it may carry differs (see ConsumerRewriteOptions::is_header).
     auto ext = std::filesystem::path(c).extension().string();
     per_cfg.is_header = ext == ".h" || ext == ".hpp" || ext == ".hh";
+    // A macro of its own, NOT the one the interface units define. That one
+    // means "I am the module unit for this header" and each unit defines it
+    // for itself immediately before including its header; defined for anyone
+    // else it would strip the headers of the includes a consumer still needs.
+    per_cfg.module_replacements = module_replacements;
+    if (DualConsumersOpt.getValue())
+      per_cfg.dual_macro =
+          (MacroPrefixOpt.getValue().empty()
+               ? macro_prefix(library_name_of(ModuleNameOpt.getValue()))
+               : macro_prefix(MacroPrefixOpt.getValue())) + "_IMPORT_MODULES";
     auto out = rewrite_consumer_source(src, per_cfg);
     if (out != src) {
       if (!write_file(c, out)) return 1;
@@ -789,6 +895,11 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   //    AND are re-exported by the wrapper.
   std::map<std::string, std::vector<std::string>> internal_reachable;
   std::map<std::string, std::vector<std::string>> public_reachable;
+  // Class FQN -> the headers defining its members out of line. Naming such a
+  // class is not enough to use it: an inline virtual defined in another module
+  // is not reachable from the declaration alone, and the vtable of anything
+  // deriving from it is left with nothing to point at.
+  std::map<std::string, std::set<std::string>> member_definer_files;
   // The compile arguments come from the same set as before the headers are
   // narrowed below, so they do not depend on what the sweep finds.
   std::vector<std::string> arg_paths = header_paths;
@@ -862,7 +973,9 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   trace_and_merge(public_reachable, header_paths, library_name, all_extra,
                   public_sources);
 
-  auto module_replaces = parse_module_replaces();
+  auto module_replacements_opt = parse_module_replacements();
+  if (!module_replacements_opt) return 1;
+  auto &module_replacements = *module_replacements_opt;
 
 
   std::vector<std::string> macro_reachable;
@@ -970,8 +1083,8 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     // Attaching the class to the global module is what puts them back
     // together, which both sides say with `extern "C++"`.
     {
-      auto member_classes =
-          out_of_line_member_class_fqns(header_paths, all_extra);
+      auto member_classes = out_of_line_member_class_fqns(
+          header_paths, all_extra, {}, &member_definer_files);
       fwd_declared_fqns.insert(fwd_declared_fqns.end(), member_classes.begin(),
                                member_classes.end());
     }
@@ -1105,7 +1218,13 @@ export inline int run_full_rewrite(int argc, const char **argv) {
         auto it = tpl_defined_files.find(fqn);
         if (it == tpl_defined_files.end()) continue;
         auto self = derive_module_name(header_paths[i], library_name);
-        for (auto &definer : it->second) {
+        // Wherever its members are defined counts as defining it too: the
+        // definitions have to be reachable, not just the class.
+        auto definers = it->second;
+        if (auto mit = member_definer_files.find(fqn);
+            mit != member_definer_files.end())
+          definers.insert_range(mit->second);
+        for (auto &definer : definers) {
           if (definer == header_paths[i]) continue;
           auto mod = derive_module_name(definer, library_name);
           if (mod == self) continue;
@@ -1128,7 +1247,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
   cfg.no_internal_filter = ExportAllOpt.getValue();
   cfg.extra_imports = std::move(extra_imports);
   cfg.context_args = header_ctx_args;
-  cfg.module_replaces = module_replaces;
+  cfg.module_replacements = module_replacements;
   cfg.defined_fqns = defined_fqns;
   cfg.fwd_declared_fqns = fwd_declared_fqns;
   cfg.extern_cxx = extern_cxx;
@@ -1249,7 +1368,7 @@ export inline int run_full_rewrite(int argc, const char **argv) {
     o.per_file_module = per_file_module;
     auto r = rewrite_source(src, per_file_module, {}, extra_args,
                             ImportStdOpt.getValue(), extern_cxx,
-                            module_replaces, macro_files, interface_modules,
+                            module_replacements, macro_files, interface_modules,
                             fwd_declared_fqns, HyphenMacrosOpt.getValue(),
                             WrapperModuleOpt.getValue()
                                 ? std::format("{}.umbrella", library_name)

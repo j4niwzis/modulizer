@@ -55,8 +55,8 @@ cmake -S /src/standalone -B /build-modulizer -G Ninja \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DCMAKE_CXX_FLAGS=-fno-rtti \
   \$LLVM_CMAKE_ARGS
-# CMake 4.4 synthesizes a second `std` target for the executable, so main.cc is
-# handed a different `std` BMI than the library's module units were built
+# CMake 4.4 synthesizes a second \`std\` target for the executable, so main.cc is
+# handed a different \`std\` BMI than the library's module units were built
 # against. Clang segfaults in ASTReader rather than diagnosing it:
 #
 #   main.cc:6:8: current parser token 'vector'

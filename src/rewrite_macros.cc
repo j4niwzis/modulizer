@@ -3,6 +3,7 @@ module;
 export module modulizer.rewrite_macros;
 import modulizer.astutil;
 import modulizer.include_analysis;
+import modulizer.rewrite_includes;
 import modulizer.rewrite_util;
 import libtooling;
 import std;
@@ -50,20 +51,9 @@ public:
     // `_H`/`_H_` suffix) are rejected; a default-value macro guarded by
     // `#ifndef X`/`#define X` (e.g. LIB_DEFAULT_STYLE) must be
     // kept so implementation units can use it.
-    bool is_guard = false;
-    {
-      std::string_view before(buf, hashOff);
-      auto nl = before.rfind('\n');
-      if (nl != std::string_view::npos && nl > 0) {
-        auto pnl = before.rfind('\n', nl - 1);
-        auto start = pnl == std::string_view::npos ? 0 : pnl + 1;
-        auto prev = before.substr(start, nl - start);
-        is_guard = prev.starts_with("#ifndef") &&
-                   prev.find(macro_name) != std::string_view::npos &&
-                   looks_like_guard_name(macro_name);
-      }
-    }
-    if (is_guard) return;
+    if (is_include_guard_define(llvm::StringRef(buf, hashOff + 1), hashOff,
+                                macro_name))
+      return;
 
     macros.push_back({std::move(macro_name), std::move(body), hashOff, endOff});
     macros.back().cond_depth = cond_depth;
@@ -425,9 +415,88 @@ export OverrideGuardRange override_guard_with_code(const std::string &src,
 // plus its doc comment, chained dependency macros files, and export-marker
 // insertions applied to macro bodies that declare library entities (a
 // declaration macro). Returns an empty string when there is nothing to emit.
+// Whether the header protects itself against being included twice. One that
+// does not is meant to be re-read — Boost's `assert.hpp` recomputes BOOST_ASSERT
+// from whatever is defined at each inclusion — and its macros file must be
+// re-read with it, or the second include silently keeps the first answer.
+// The `#undef X` lines a header writes BEFORE it defines X — the "start from
+// nothing, then decide" opening of a header meant to be re-read. They belong
+// with the definitions they precede: left behind while the definitions move to
+// the macros file, they undo the file the header just included.
+//
+// An `#undef` that comes AFTER a definition is a different idiom (retract and
+// redefine under a condition) and is handled where the definition is collected.
+export std::vector<std::pair<unsigned, std::string>> leading_undefs(
+    const std::string &src, const std::vector<MacroRec> &macros,
+    // Names defined only INSIDE a reproduced conditional block. They have no
+    // record of their own, so their resets are found by name; the ones written
+    // inside a block travel with it and are skipped here.
+    const std::set<std::string> &block_names = {},
+    const std::vector<std::pair<unsigned, unsigned>> &block_ranges = {}) {
+  std::vector<std::pair<unsigned, std::string>> out;
+  auto in_a_block = [&](std::size_t pos) {
+    for (auto &[start, end] : block_ranges)
+      if (pos >= start && pos < end) return true;
+    return false;
+  };
+  auto line_starts_here = [&](std::size_t pos, std::size_t len) {
+    auto after = pos + len;
+    if (after < src.size() && is_ident_char(src[after])) return false;
+    auto ls = src.rfind('\n', pos);
+    return src.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1) == pos;
+  };
+  for (const auto &name : block_names) {
+    auto needle = std::format("#undef {}", name);
+    for (std::size_t pos = src.find(needle); pos != std::string::npos;
+         pos = src.find(needle, pos + 1))
+      if (!in_a_block(pos) && line_starts_here(pos, needle.size()))
+        out.emplace_back(static_cast<unsigned>(pos), name);
+  }
+  for (const auto &m : macros) {
+    if (m.name.empty()) continue;
+    auto needle = std::format("#undef {}", m.name);
+    for (std::size_t pos = src.find(needle); pos != std::string::npos;
+         pos = src.find(needle, pos + 1)) {
+      if (pos >= m.start_off) break;  // after the definition: not this idiom
+      auto after = pos + needle.size();
+      if (after < src.size() && is_ident_char(src[after])) continue;
+      auto ls = src.rfind('\n', pos);
+      if (src.find_first_not_of(" \t", ls == std::string::npos ? 0 : ls + 1) != pos)
+        continue;
+      out.emplace_back(static_cast<unsigned>(pos), m.name);
+    }
+  }
+  return out;
+}
+
+export bool header_guards_itself(const std::string &src) {
+  if (src.contains("#pragma once")) return true;
+  std::size_t pos = 0;
+  std::string pending;
+  while (pos < src.size()) {
+    auto nl = src.find('\n', pos);
+    if (nl == std::string::npos) nl = src.size();
+    auto line = std::string_view(src).substr(pos, nl - pos);
+    pos = nl + 1;
+    auto d = parse_directive(line);
+    if (!d) continue;
+    if (pending.empty()) {
+      if (d->keyword != "ifndef") return false;  // some other directive first
+      auto e = d->after.find_first_of(" \t\r");
+      pending = e == std::string::npos ? d->after : d->after.substr(0, e);
+      continue;
+    }
+    if (d->keyword != "define") return false;
+    auto e = d->after.find_first_of(" \t\r");
+    return (e == std::string::npos ? d->after : d->after.substr(0, e)) == pending;
+  }
+  return false;
+}
+
 export std::string build_macros_file(
     const std::vector<MacroRec> &export_macros,
-    const std::set<std::string> &extra_macro_includes,
+    // Macro header -> the conditional context it must be chained in under.
+    const std::map<std::string, std::vector<std::string>> &extra_macro_includes,
     // Include lines the reproduced conditional blocks need in order to be
     // evaluated here. See the caller.
     const std::vector<std::string> &block_support_includes,
@@ -435,13 +504,38 @@ export std::string build_macros_file(
     const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
     const std::string &original,
     const std::vector<ModPoint> &mods,
-    const std::string &export_include) {
+    const std::string &export_include,
+    // See header_guards_itself: a re-includable header's macros file must be
+    // re-read too — and it is the only copy of that header's conditional
+    // machine, so the includes inside those branches belong to it as well.
+    // (For a header included once, the branch is reproduced here AND kept in
+    // the body, and the includes stay with the body.)
+    bool guard_once = true) {
+  const bool sole_copy = !guard_once;
   std::string mout;
-  mout += "#pragma once\n\n";
+  if (guard_once) mout += "#pragma once\n\n";
+  // See leading_undefs: the header's own "start from nothing" undefs come
+  // first, so re-reading this file recomputes rather than collides.
+  {
+    std::set<std::string> seen;
+    for (auto &[off, name] :
+         leading_undefs(original, export_macros, block_defined_names,
+                        block_ranges))
+      if (seen.insert(name).second) mout += std::format("#undef {}\n", name);
+    if (!seen.empty()) mout += "\n";
+  }
   for (const auto &bi : block_support_includes) mout += bi;
   if (!block_support_includes.empty()) mout += "\n";
-  for (const auto &em : extra_macro_includes)
+  for (const auto &[em, guards] : extra_macro_includes) {
+    // The condition the include sat under travels with it: a header included
+    // only in one branch defines its macros only in that branch, and chaining
+    // them in unconditionally lets a definition the other branch never wanted
+    // win.
+    auto vg = valid_guards(guards);
+    for (const auto &g : vg) mout += g;
     mout += std::format("#include \"{}\"\n", em);
+    for (std::size_t i = 0; i < vg.size(); ++i) mout += "#endif\n";
+  }
   if (!extra_macro_includes.empty()) mout += "\n";
   // Apply the export-marker insertions that fall inside a macro's definition
   // range to the moved macro text, so a macro whose body declares a library
@@ -512,6 +606,14 @@ export std::string build_macros_file(
           std::string(original, m.start_off, m.end_off - m.start_off),
           m.start_off);
       if (m.name.empty()) {
+        if (sole_copy) {
+          // The branch's own includes come with it: nothing else will bring
+          //   # include <assert.h>
+          //   # define LIB_ASSERT(expr) assert(expr)
+          // and the macro is expanded where the file is included.
+          mout += std::move(marked);
+          continue;
+        }
         auto stripped = strip_block_includes(std::move(marked));
         if (stripped != m.body) {
           has_marked_macros = true;

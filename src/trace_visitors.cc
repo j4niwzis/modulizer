@@ -2,6 +2,7 @@ module;
 
 export module modulizer.trace_visitors;
 import modulizer.astutil;
+import modulizer.rewrite_util;
 import modulizer.util;
 import libtooling;
 import std;
@@ -691,20 +692,36 @@ bool is_private_system_header(llvm::StringRef path) {
 // relative to whichever search directory the header was found under — so a
 // header in a subdirectory keeps it (`sys/types.h`, not `types.h`, which names
 // nothing). Falls back to the bare filename when no search directory covers it.
+// How a consumer should spell an include of `fe`, as an ANGLED include: the
+// re-added includes are emitted `#include <...>`, so the spelling has to
+// resolve against the search path.
+//
+// `relative_to_main` decides whether clang may answer with a path relative to
+// the including file. For a system header that is harmless — it never happens.
+// For a header beside the consumer it produces a spelling that only works in
+// quotes, and emitted in angle brackets it resolves to nothing:
+//
+//   test/production.cc:35:10: fatal error: production.h: No such file
+//     35 | #include <production.h>
+//
+// Denied the shortcut, clang answers with the search-dir-relative
+// `test/production.h`, which is what an angled include needs.
 std::string include_spelling_for(clang::FileEntryRef fe,
                                  const clang::SourceManager &sm,
                                  clang::FileID main_fid,
-                                 const clang::HeaderSearch *hs) {
+                                 const clang::HeaderSearch *hs,
+                                 bool relative_to_main = true) {
   std::string fallback =
       std::filesystem::path(fe.getName().str()).filename().string();
   if (!hs) return fallback;
   std::string main_path;
-  if (auto mfe = sm.getFileEntryRefForID(main_fid))
-    main_path = mfe->getName().str();
+  if (relative_to_main)
+    if (auto mfe = sm.getFileEntryRefForID(main_fid))
+      main_path = mfe->getName().str();
   auto spelled = hs->suggestPathToFileForDiagnostics(fe, main_path);
   if (spelled.empty() || spelled.contains("..") ||
       std::filesystem::path(spelled).is_absolute())
-    return fallback;
+    return relative_to_main ? fallback : std::string();
   return spelled;
 }
 
@@ -740,6 +757,46 @@ std::string system_include_name_for(clang::SourceLocation loc,
   return {};
 }
 
+// Derive the include a consumer must write to get an entity defined at `loc`
+// when that entity comes from a header OUTSIDE the library being converted.
+//
+// Converting a library does not convert what it includes. Its module units
+// keep those includes in the global module fragment, where the declarations
+// attach to the global module — reachable while compiling the unit, invisible
+// to anyone importing it. A macro does not cross a module boundary at all. So
+// a consumer that used to get these through the library header now gets
+// nothing, and has to include the header itself:
+//
+//   error: missing '#include "boost/assert/source_location.hpp"';
+//          'source_location' must be declared before it is used
+//
+// The defining file itself, not anything further out on the include chain: an
+// outer header provides the declaration only by having happened to include
+// this one.
+std::string outside_include_name_for(
+    clang::SourceLocation loc, const clang::SourceManager &sm,
+    clang::FileID main_fid, const clang::HeaderSearch *hs,
+    const std::set<std::string> &library_files) {
+  auto fid = sm.getFileID(loc);
+  if (!fid.isValid() || fid == main_fid) return {};
+  auto fe = sm.getFileEntryRefForID(fid);
+  if (!fe) return {};
+  // A header of the library itself becomes a module. Importing it is what
+  // supplies these declarations, and re-adding the include beside that import
+  // declares everything in it twice.
+  std::error_code ec;
+  auto canon = std::filesystem::weakly_canonical(
+      std::filesystem::path(fe->getName().str()), ec);
+  if (library_files.count(ec ? fe->getName().str() : canon.string())) return {};
+  // The C++ standard library belongs to `import std`, and the C headers it
+  // cannot cover are traced as system includes already.
+  if (fe->getName().contains("/c++/") ||
+      sm.isInSystemHeader(sm.getLocForStartOfFile(fid)))
+    return {};
+  return include_spelling_for(*fe, sm, main_fid, hs,
+                              /*relative_to_main=*/false);
+}
+
 // PP callbacks: records the system header of every macro EXPANDED in the
 // consumer's main file. Macros defined in the consumer itself or in library
 // headers produce no include (library macro headers are handled by the include
@@ -748,9 +805,13 @@ std::string system_include_name_for(clang::SourceLocation loc,
 // since `import std.compat` cannot provide the C library's macros.
 export class SystemHeaderUsageTracer : public clang::PPCallbacks {
 public:
-  SystemHeaderUsageTracer(clang::CompilerInstance &ci, std::set<std::string> &out)
+  using Resolver = std::function<std::string(clang::SourceLocation)>;
+
+  SystemHeaderUsageTracer(clang::CompilerInstance &ci, std::set<std::string> &out,
+                          Resolver resolver = {})
       : sm(ci.getSourceManager()), main_fid(ci.getSourceManager().getMainFileID()),
-        hs(&ci.getPreprocessor().getHeaderSearchInfo()), out(out) {}
+        hs(&ci.getPreprocessor().getHeaderSearchInfo()), out(out),
+        resolver(std::move(resolver)) {}
 
   void MacroExpands(const clang::Token &MacroNameTok,
                     const clang::MacroDefinition &MD,
@@ -763,7 +824,8 @@ public:
     if (!mi || mi->isBuiltinMacro() || mi->isUsedForHeaderGuard()) return;
     auto def_loc = mi->getDefinitionLoc();
     if (!def_loc.isValid() || sm.isInMainFile(def_loc)) return;
-    auto name = system_include_name_for(def_loc, sm, main_fid, hs);
+    auto name = resolver ? resolver(def_loc)
+                         : system_include_name_for(def_loc, sm, main_fid, hs);
     if (!name.empty()) out.insert(std::move(name));
   }
 
@@ -772,6 +834,7 @@ private:
   clang::FileID main_fid;
   const clang::HeaderSearch *hs;
   std::set<std::string> &out;
+  Resolver resolver;
 };
 
 // AST visitor: records the system header of every declaration (function, type,
@@ -781,10 +844,13 @@ private:
 export class SystemHeaderRefFinder
     : public clang::RecursiveASTVisitor<SystemHeaderRefFinder> {
 public:
+  using Resolver = std::function<std::string(clang::SourceLocation)>;
+
   SystemHeaderRefFinder(const clang::SourceManager &sm,
                         const clang::HeaderSearch *hs,
-                        std::set<std::string> &out)
-      : sm(sm), main_fid(sm.getMainFileID()), hs(hs), out(out) {}
+                        std::set<std::string> &out, Resolver resolver = {})
+      : sm(sm), main_fid(sm.getMainFileID()), hs(hs), out(out),
+        resolver(std::move(resolver)) {}
 
   bool shouldVisitImplicitCode() const { return true; }
   bool shouldVisitTemplateInstantiations() const { return true; }
@@ -899,7 +965,8 @@ private:
       cd = dtor->getParent();
     auto loc = sm.getExpansionLoc(cd->getLocation());
     if (!loc.isValid() || sm.isInMainFile(loc)) return;
-    auto name = system_include_name_for(loc, sm, main_fid, hs);
+    auto name = resolver ? resolver(loc)
+                         : system_include_name_for(loc, sm, main_fid, hs);
     if (!name.empty()) out.insert(std::move(name));
   }
 
@@ -908,10 +975,263 @@ private:
   clang::FileID main_fid;
   const clang::HeaderSearch *hs;
   std::set<std::string> &out;
+  Resolver resolver;
 };
 
 // Frontend-action factory that installs the PP macro tracer and runs the AST
 // visitor, both recording into the same per-consumer include set.
+// PP callbacks: records every header a LIBRARY header includes that the
+// library does not own.
+//
+// Not for the library's sake — its own units include these in their global
+// module fragment and compile fine. For its consumers'. A module's global
+// module fragment is pruned to what is decl-reachable from its exported
+// declarations, so an outside type named in the interface survives while an
+// operator found only by ADL, at a template instantiation in the consumer's
+// own translation unit, does not:
+//
+//   error: invalid operands to binary expression
+//   note: candidate function not viable: operator==(monostate, monostate)
+//
+// The header was plainly visible and the one operator that mattered was gone.
+// Before the conversion the consumer got all of this transitively through the
+// library header; an import gives back only part, so the rest is written out.
+export class LibraryOutsideIncludeTracer : public clang::PPCallbacks {
+public:
+  LibraryOutsideIncludeTracer(clang::CompilerInstance &ci,
+                              const std::set<std::string> &library_files,
+                              const std::set<std::string> &provided,
+                              const std::set<std::string> &transparent_macros,
+                              std::set<std::string> &out)
+      : sm(ci.getSourceManager()), lo(ci.getLangOpts()),
+        library_files(library_files), provided(provided),
+        transparent_macros(transparent_macros), out(out) {}
+
+  // Only what the library includes UNCONDITIONALLY is the consumer's to
+  // include too. A header reached only on another platform, or behind a
+  // feature test, is handed to a build that cannot compile it:
+  //
+  //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not available"
+  //
+  // The conversion's own `<PREFIX>_USE_MODULES` guard is the exception: every
+  // generated header wraps its includes in it, and it says nothing about
+  // whether the include was conditional before the conversion.
+  void If(clang::SourceLocation, clang::SourceRange range,
+          ConditionValueKind) override {
+    push(condition_text(range));
+  }
+  void Ifdef(clang::SourceLocation, const clang::Token &tok,
+             const clang::MacroDefinition &) override {
+    push(tok.getIdentifierInfo() ? tok.getIdentifierInfo()->getName().str() : "");
+  }
+  void Ifndef(clang::SourceLocation, const clang::Token &tok,
+              const clang::MacroDefinition &) override {
+    auto name = tok.getIdentifierInfo()
+                    ? tok.getIdentifierInfo()->getName()
+                    : llvm::StringRef();
+    // A header's own include guard is not a condition on what it includes: it
+    // wraps the whole file and is true exactly once. Counting it makes EVERY
+    // include in EVERY guarded header conditional, which is every header there
+    // is, and the trace then reports nothing at all.
+    if (looks_like_guard_name(name))
+      conds.push_back(false);
+    else
+      push(name.str());
+  }
+  void Elif(clang::SourceLocation, clang::SourceRange range, ConditionValueKind,
+            clang::SourceLocation) override {
+    if (!conds.empty()) conds.back() = !is_transparent(condition_text(range));
+  }
+  void Endif(clang::SourceLocation, clang::SourceLocation) override {
+    if (!conds.empty()) conds.pop_back();
+  }
+
+  void InclusionDirective(clang::SourceLocation hash_loc,
+                          const clang::Token &, llvm::StringRef file_name,
+                          bool is_angled, clang::CharSourceRange,
+                          clang::OptionalFileEntryRef file, llvm::StringRef,
+                          llvm::StringRef, const clang::Module *, bool,
+                          clang::SrcMgr::CharacteristicKind file_type) override {
+    if (!file) return;
+    // Angled only. A quoted include is resolved relative to the header that
+    // wrote it, and the consumer sits somewhere else entirely, so the same
+    // spelling handed on resolves to nothing:
+    //
+    //   fatal error: production.h: No such file or directory
+    if (!is_angled) return;
+    // Only what the LIBRARY reaches for. An outside header's own includes are
+    // that header's business and arrive with it.
+    if (!in_library(hash_loc)) return;
+    if (conditional()) return;
+    std::error_code ec;
+    auto canon = std::filesystem::weakly_canonical(
+        std::filesystem::path(file->getName().str()), ec);
+    auto path = ec ? file->getName().str() : canon.string();
+    if (library_files.count(path)) return;          // its own; becomes a module
+    if (provided.count(file_name.str())) return;    // some module provides it
+    // The standard library is `import std`'s business, and the C headers it
+    // cannot cover are traced from the consumer's own usage.
+    if (file->getName().contains("/c++/")) return;
+    if (sm.isInSystemHeader(hash_loc)) return;
+    // Where the header was FOUND, which the callback already knows: anything
+    // reached through a system search path is not the library's to hand on.
+    if (file_type != clang::SrcMgr::C_User) return;
+    out.insert(file_name.str());
+  }
+
+private:
+  void push(const std::string &cond) { conds.push_back(!is_transparent(cond)); }
+
+  // A guard the conversion itself wrote: the `<PREFIX>_USE_MODULES` wrapper
+  // every generated header carries, and the `_IMPORT_MODULES` guard of each
+  // module that provides headers. Neither says the include was conditional
+  // before the conversion, and for the second the caller emits both branches
+  // anyway.
+  bool is_transparent(const std::string &cond) const {
+    for (const auto &m : transparent_macros)
+      if (!m.empty() && cond.contains(m)) return true;
+    return false;
+  }
+
+  bool conditional() const {
+    for (bool b : conds)
+      if (b) return true;
+    return false;
+  }
+
+  std::string condition_text(clang::SourceRange range) const {
+    auto text = clang::Lexer::getSourceText(
+        clang::CharSourceRange::getTokenRange(range), sm, lo);
+    return text.str();
+  }
+
+  bool in_library(clang::SourceLocation loc) const {
+    auto fid = sm.getFileID(sm.getExpansionLoc(loc));
+    auto fe = sm.getFileEntryRefForID(fid);
+    if (!fe) return false;
+    std::error_code ec;
+    auto canon = std::filesystem::weakly_canonical(
+        std::filesystem::path(fe->getName().str()), ec);
+    return library_files.count(ec ? fe->getName().str() : canon.string()) != 0;
+  }
+
+  const clang::SourceManager &sm;
+  const clang::LangOptions &lo;
+  const std::set<std::string> &library_files;
+  const std::set<std::string> &provided;
+  const std::set<std::string> &transparent_macros;
+  std::set<std::string> &out;
+  // One entry per open conditional: true when it is a real condition, false
+  // when it is only the conversion's own guard.
+  std::vector<bool> conds;
+};
+
+export class LibraryOutsideIncludeFactory
+    : public clang::tooling::FrontendActionFactory {
+public:
+  LibraryOutsideIncludeFactory(std::set<std::string> &out,
+                               const std::set<std::string> &library_files,
+                               const std::set<std::string> &provided,
+                               const std::set<std::string> &transparent_macros)
+      : out(out), library_files(library_files), provided(provided),
+        transparent_macros(transparent_macros) {}
+
+  std::unique_ptr<clang::FrontendAction> create() override {
+    return std::make_unique<Action>(out, library_files, provided,
+                                    transparent_macros);
+  }
+
+private:
+  class Action : public clang::PreprocessOnlyAction {
+  public:
+    Action(std::set<std::string> &out, const std::set<std::string> &library_files,
+           const std::set<std::string> &provided,
+           const std::set<std::string> &transparent_macros)
+        : out(out), library_files(library_files), provided(provided),
+          transparent_macros(transparent_macros) {}
+
+    bool BeginSourceFileAction(clang::CompilerInstance &ci) override {
+      ci.getPreprocessor().addPPCallbacks(
+          std::make_unique<LibraryOutsideIncludeTracer>(
+              ci, library_files, provided, transparent_macros, out));
+      return true;
+    }
+
+    // A header that cannot be read here cannot say what a consumer needs.
+    //
+    // Every library header is parsed on its own, which reaches headers no
+    // build on this platform ever includes. Their own includes are
+    // unconditional — the condition is on whoever includes THEM — so nothing
+    // inside the file says "not here", and taking them hands a header for
+    // another platform to every consumer:
+    //
+    //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not
+    //   available"
+    void EndSourceFileAction() override {
+      if (getCompilerInstance().getDiagnostics().hasErrorOccurred()) out.clear();
+    }
+
+  private:
+    std::set<std::string> &out;
+    const std::set<std::string> &library_files;
+    const std::set<std::string> &provided;
+    const std::set<std::string> &transparent_macros;
+  };
+
+  std::set<std::string> &out;
+  const std::set<std::string> &library_files;
+  const std::set<std::string> &provided;
+  const std::set<std::string> &transparent_macros;
+};
+
+// The same pair of passes, resolving to headers OUTSIDE the library rather
+// than to system headers: what the consumer used to reach through the library
+// header and can no longer reach through the import that replaced it.
+export class OutsideHeaderUsageFactory
+    : public clang::tooling::FrontendActionFactory {
+public:
+  OutsideHeaderUsageFactory(std::set<std::string> &out,
+                            const std::set<std::string> &library_files)
+      : out(out), library_files(library_files) {}
+
+  std::unique_ptr<clang::FrontendAction> create() override {
+    return std::make_unique<Action>(out, library_files);
+  }
+
+private:
+  class Action : public clang::ASTFrontendAction {
+  public:
+    Action(std::set<std::string> &out, const std::set<std::string> &library_files)
+        : out(out), library_files(library_files) {}
+
+    std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
+        clang::CompilerInstance &ci, llvm::StringRef) override {
+      auto &sm = ci.getSourceManager();
+      auto *hs = &ci.getPreprocessor().getHeaderSearchInfo();
+      auto main_fid = sm.getMainFileID();
+      auto &lib = library_files;
+      // By value into both passes. make_traverse_consumer keeps an lvalue
+      // argument BY REFERENCE — its referents are expected to outlive the
+      // factory — and this one would die at the end of this function.
+      SystemHeaderRefFinder::Resolver resolve =
+          [&sm, hs, main_fid, &lib](clang::SourceLocation loc) {
+            return outside_include_name_for(loc, sm, main_fid, hs, lib);
+          };
+      ci.getPreprocessor().addPPCallbacks(
+          std::make_unique<SystemHeaderUsageTracer>(ci, out, resolve));
+      return make_traverse_consumer<SystemHeaderRefFinder>(hs, out,
+                                                           std::move(resolve));
+    }
+
+  private:
+    std::set<std::string> &out;
+    const std::set<std::string> &library_files;
+  };
+
+  std::set<std::string> &out;
+  const std::set<std::string> &library_files;
+};
+
 export class SystemHeaderUsageFactory
     : public clang::tooling::FrontendActionFactory {
 public:
