@@ -606,7 +606,9 @@ TEST(ConsumerRewrite, OnlyAsksForIncludesThatResolveOnTheSearchPath) {
   auto lib = data_path("outsidelib/api.h");
   auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
   auto it = needed.find(use);
-  if (it == needed.end()) return;  // nothing traced at all is fine here
+  ASSERT_NE(it, needed.end())
+      << "this consumer does reach an outside header, so a trace that found "
+         "nothing is the thing going wrong, not a case to wave through";
   EXPECT_EQ(it->second.count("sidecar.h"), 0u)
       << "a bare name resolves against no search directory";
   for (const auto &inc : it->second)
@@ -903,5 +905,57 @@ TEST(ConsumerRewrite, LeavesAThirdPartyIncludeBelowTheImportItFollowed) {
   EXPECT_LT(imp, other)
       << "the import stands where the include it replaced stood, above what "
          "followed it; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, CreditsAFragmentsDeclarationToTheHeaderThatOwnsIt) {
+  // A declaration is credited to the file it is written in, and some files are
+  // not headers: an x-macro fragment carries no include guard and names terms
+  // its includer defines around it. Handed to a consumer as an include, it is
+  // read once, alone, with none of them —
+  //
+  //   bind/detail/bind_cc.hpp:16: error: unknown type name 'BOOST_BIND_ST'
+  //   bind/detail/bind_cc.hpp:16: error: use of undeclared identifier '_bi'
+  //
+  // and the second of those because the fragment is read outside the namespace
+  // its includer opened. The header that owns it is the one to name.
+  auto use = data_path("outsidelib/xmac/use_xmac.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end())
+      << "the consumer reaches an outside declaration, so something is owed";
+  EXPECT_EQ(it->second.count("outsidelib/xmac/body.hpp"), 0u)
+      << "a fragment with no guard of its own cannot be included alone";
+  EXPECT_NE(it->second.count("outsidelib/xmac/wrapper.hpp"), 0u)
+      << "the header that defines its terms and reads it is what a consumer "
+         "includes";
+}
+
+TEST(ConsumerRewrite, KeepsEveryLineWhereItWasWhenIncludesFollowTheLibrarysOwn) {
+  // The library include is replaced where it stands, and it restores the count
+  // with a `#line` naming the source line after itself. The includes BELOW it
+  // are taken up into the block above it, and those lines are gone from the
+  // body too — so the line after the replacement is not the next one, it is
+  // the next one nobody took.
+  //
+  // Counted the first way, everything below reports low by however many were
+  // taken, and only something that asks where it is ever notices:
+  //
+  //   source_location_test4.cpp(35): test 's_loc.line() == 24' ('22' == '24')
+  //                                  failed in function 'int main()'
+  auto src = read_file(data_path("lineno/use2.cc"));
+  ASSERT_EQ(reported_line_of(src, "LINENO_MARKER2"), 11u)
+      << "the fixture itself must have the marker on line 11";
+
+  // The quoted include stays where it is and sets the point the block goes
+  // in; the two standard headers BELOW it are lifted into that block, so
+  // their lines leave the body from underneath the line that stayed. One
+  // `#line` after the block cannot say both where the kept line is and where
+  // the first line after the lifted ones is.
+  ConsumerRewriteOptions cfg;
+  auto out = rewrite_consumer_source(src, cfg);
+  EXPECT_EQ(reported_line_of(out, "LINENO_MARKER2"), 11u)
+      << "the marker has to still report line 11; got:\n"
       << out;
 }

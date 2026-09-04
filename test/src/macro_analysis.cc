@@ -16,7 +16,9 @@ std::string data_path(llvm::StringRef fname) {
 // MacroAnalysis suite
 TEST(MacroAnalysis, FindsQualifiedInternalName) {
   auto model = analyze_file(data_path("macro_test.h"));
-  if (model.macros.empty()) { GTEST_SKIP(); return; }
+  ASSERT_FALSE(model.macros.empty())
+      << "the fixture defines macros; finding none is the extraction breaking, "
+         "not a reason to skip";
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);
   bool has_detail = false;
@@ -44,7 +46,9 @@ TEST(MacroAnalysis, TokenPasteWildcard) {
 
 TEST(MacroAnalysis, PublicMacroReferencesInternalClass) {
   auto model = analyze_file(data_path("macro_public_internal.h"));
-  if (model.macros.empty()) { GTEST_SKIP(); return; }
+  ASSERT_FALSE(model.macros.empty())
+      << "the fixture defines macros; finding none is the extraction breaking, "
+         "not a reason to skip";
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);
   bool has_foo = false;
@@ -56,7 +60,9 @@ TEST(MacroAnalysis, PublicMacroReferencesInternalClass) {
 
 TEST(MacroAnalysis, KeywordBeforeQualifiedName) {
   auto model = analyze_file(data_path("macro_new_keyword.h"));
-  if (model.macros.empty()) { GTEST_SKIP(); return; }
+  ASSERT_FALSE(model.macros.empty())
+      << "the fixture defines macros; finding none is the extraction breaking, "
+         "not a reason to skip";
   auto r = analyze_macro_reachability(model.macros, model,
                                        kDefaultInternalFilter);
   bool has_foo = false;

@@ -360,12 +360,16 @@ TEST(ConsumerTrace, TracesSystemIncludesOfConvertedConsumer) {
   std::map<std::string, std::string> virtual_sources = {
       {consumer,
        demodularize_consumer_source(read_file(consumer), include_to_module)}};
-  // No assertion on the contents (this consumer uses no C library macros) —
-  // the point is that tracing runs on the reconstruction instead of dying on
-  // the unresolvable import.
+  // What is being checked is that tracing RAN — on the reconstruction rather
+  // than dying on the unresolvable import. This consumer uses no C library
+  // macros, so it needs no includes; the parse of the file as it stands finds
+  // nothing either, which is why the two are compared instead.
   auto traced = trace_consumer_system_includes({consumer}, extra_args,
                                                &virtual_sources);
-  EXPECT_TRUE(traced.empty() || traced.count(consumer) == 1);
+  auto unreconstructed = trace_consumer_system_includes({consumer}, extra_args);
+  EXPECT_EQ(traced, unreconstructed)
+      << "a reconstruction must not change what a consumer needs from the "
+         "system";
 }
 
 TEST(ConsumerTrace, VirtualSourceAppliesToRelativeConsumerPaths) {
