@@ -402,7 +402,8 @@ export std::string export_body_read_includes(
 export std::string wrap_includes_with_guard(
     std::string hdr, const std::vector<IncludeDirective> &includes,
     const std::string &use_modules_macro, bool remove = false,
-    const ModuleReplacements &module_replacements = {}) {
+    const ModuleReplacements &module_replacements = {},
+    const std::map<std::string, std::string> &own_modules = {}) {
   auto find_inc = [](const std::vector<IncludeDirective> &incs,
                      const std::string &path) -> const IncludeDirective * {
     for (auto &i : incs) if (i.path == path) return &i;
@@ -446,24 +447,44 @@ export std::string wrap_includes_with_guard(
         // library headers are imported and system headers live in the GMF).
       } else {
         wrapped_hdr += std::format("#ifndef {}\n", use_modules_macro);
-        // A header some module provides, under the negation of that module's
-        // own guard. This file is read by consumers, and a consumer may have
-        // imported the provider already — its own pair said to. Including the
-        // provider textually then declares a second time what the import gave
-        // it, and the two are not one entity:
+        // A header stands an include down only for a reader that told it to.
+        // The provider's own IMPORT_MODULES cannot: it says the provider is a
+        // module SOMEWHERE in this build, which is true of every unit in that
+        // build, including the ones that import nothing and reach this header
+        // through a library nobody converted --
         //
-        //   error: declaration of 'source_location' in the global module
-        //          follows declaration in module boost.assert.source_location
+        //   iterator/modules/iterator/function_input_iterator.cc:12
+        //     -> boost/optional/optional.hpp:52        (never converted)
+        //       -> throw_exception/include/boost/throw_exception.hpp:26
+        //         -> exception.hpp:262: error: no type named 'source_location'
+        //            in namespace 'boost'
         //
-        // The guard above does not answer this. It says whether this file is
-        // being read as its own module's unit, which is a different question
-        // from whether the PROVIDER is a module here — and only the second one
-        // decides whether the include is a duplicate. The import half is left
-        // to the consumer's own pair; a header is not the place to write one.
+        // -- where nothing imported it and nothing could. The flag is the
+        // reader's own word, written at the top of a unit that imports the
+        // provider, and only there. Without it the include stands, and the
+        // reader gets the declarations it came for; with it the include would
+        // hand a second, global-module copy of what the import already gave --
+        //
+        //   variant.hpp:61: error: declaration of 'bad_variant_access' in the
+        //     global module follows declaration in module boost.variant2.variant
+        //
+        // which is the same header reached the same way, by a unit that DID
+        // import it. Only the reader can tell those two apart.
+        // This library's own headers answer to its own switch. A consumer
+        // that imported one of them says so under that name, and the umbrella
+        // header must stand down for it exactly as it would for a stranger:
+        //
+        //   variant.hpp:61: error: declaration of 'bad_variant_access' in the
+        //     global module follows declaration in module boost.variant2.variant
+        //
+        // reached through boost/variant2.hpp, by a unit that had imported it.
         auto *rep = find_replacement(inc_path, module_replacements);
-        bool guarded = rep && !rep->guard.empty();
-        if (guarded)
-          wrapped_hdr += std::format("#if !defined({})\n", rep->guard);
+        std::string flag;
+        if (rep && !rep->guard.empty()) flag = imported_flag(rep->module);
+        else if (auto own = own_modules.find(inc_path); own != own_modules.end())
+          flag = imported_flag(own->second);
+        bool guarded = !flag.empty();
+        if (guarded) wrapped_hdr += std::format("#if !defined({})\n", flag);
         wrapped_hdr += line;
         if (guarded) wrapped_hdr += "#endif\n";
         // Named, so the merge below can tell this `#endif` from one the source

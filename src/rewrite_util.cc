@@ -120,9 +120,33 @@ export bool is_include_guard_define(llvm::StringRef buf, unsigned hash_off,
   auto pnl = before.rfind('\n', nl - 1);
   auto start = pnl == std::string_view::npos ? 0 : pnl + 1;
   auto prev = before.substr(start, nl - start);
-  return prev.starts_with("#ifndef") &&
-         prev.find(macro_name) != std::string_view::npos &&
-         looks_like_guard_name(macro_name);
+  if (!prev.starts_with("#ifndef") ||
+      prev.find(macro_name) == std::string_view::npos)
+    return false;
+  if (looks_like_guard_name(macro_name)) return true;
+  // The file's own guard, whatever it is called. Boost.ThrowException spells
+  // one as a UUID -- BOOST_EXCEPTION_274DA366004E11DCB1DDFE2E56D89593 -- and no
+  // test on the shape of a name is going to recognise that. What marks it is
+  // its place: the `#ifndef` above is the FIRST directive in the file, so
+  // nothing has been read before it. Unrecognised, the guard is taken for a
+  // macro the library exports -- carried off to the macros file and taken out
+  // of the header, which then has nothing left to stop a second reading of
+  // itself:
+  //
+  //   exception.hpp:55: error: redefinition of 'refcount_ptr'
+  //
+  // A `#ifndef X` / `#define X 10` further down the file is the default-value
+  // idiom and not this, which is why the count has to be exactly one.
+  int directives = 0;
+  for (std::size_t p = 0; p < before.size();) {
+    auto e = before.find('\n', p);
+    if (e == std::string_view::npos) e = before.size();
+    auto line = before.substr(p, e - p);
+    auto ns = line.find_first_not_of(" \t");
+    if (ns != std::string_view::npos && line[ns] == '#') ++directives;
+    p = e + 1;
+  }
+  return directives == 1;
 }
 
 export unsigned template_header_start(llvm::StringRef text, unsigned pos) {
