@@ -19,6 +19,7 @@ public:
                 std::string_view shared_export_macro,
                 std::string_view linkage_macro,
                 std::string_view extern_decl_macro,
+                std::string_view inline_macro,
                 const std::vector<std::string> &reachable_fqns,
                 std::vector<std::string> &internal_fqns,
                 bool no_internal_filter = false,
@@ -34,7 +35,7 @@ public:
         internal_re(internal_re), export_macro(export_macro),
         shared_export_macro(shared_export_macro),
         linkage_macro(linkage_macro),
-        extern_decl_macro(extern_decl_macro),
+        extern_decl_macro(extern_decl_macro), inline_macro(inline_macro),
         reachable_fqns(reachable_fqns), internal_fqns(internal_fqns),
         no_internal_filter(no_internal_filter), defined_fqns(defined_fqns),
         extern_cxx(extern_cxx), fwd_declared_fqns(fwd_declared_fqns),
@@ -307,6 +308,31 @@ public:
     return false;
   }
 
+  // Replace a definition's `inline` keyword with the macro that is `inline`
+  // only outside the module unit that owns it.
+  void demote_inline(clang::FunctionDecl *fd) {
+    if (inline_macro.empty() || !fd->isInlineSpecified()) return;
+    auto begin = sm.getExpansionLoc(fd->getBeginLoc());
+    if (!begin.isValid() || !sm.isInMainFile(begin)) return;
+    auto fid = sm.getFileID(begin);
+    auto src = sm.getBufferData(fid);
+    auto off = sm.getFileOffset(begin);
+    // Between the start of the declaration and its name — `inline` cannot be
+    // further along, and stopping there keeps a parameter named `inline_`
+    // (or a comment past the signature) out of the search.
+    auto name_loc = sm.getExpansionLoc(fd->getLocation());
+    auto limit = name_loc.isValid() && sm.getFileID(name_loc) == fid
+                     ? sm.getFileOffset(name_loc)
+                     : off;
+    for (auto p = off; p + 6 <= limit; ++p) {
+      if (src.substr(p, 6) != "inline") continue;
+      if (p > 0 && is_ident_char(src[p - 1])) continue;
+      if (p + 6 < src.size() && is_ident_char(src[p + 6])) continue;
+      mods.push_back({p, 6, std::string(inline_macro)});
+      return;
+    }
+  }
+
   // Whether this class, or any class it is nested in, is `extern "C++"`. A
   // class nested inside one is attached to the global module as well, so its
   // members are owed the same treatment even though only the outer class
@@ -469,6 +495,22 @@ public:
         return true;  // in-class definition, covered by the class
       auto *cls = llvm::dyn_cast<clang::CXXRecordDecl>(md->getDeclContext());
       if (!cls) return true;
+      // Before the marker: both land on the declaration's first token, and
+      // apply_mods keeps push order there — the replacement has to go in
+      // first or the marker's insertion is what gets replaced.
+      //
+      // A virtual defined out of line decides where its class's vtable and
+      // typeinfo are emitted — but only if it is a strong definition. Left
+      // `inline` in a module interface unit it emits nothing, and it is not
+      // reachable for inlining from the module that derives from the class,
+      // so that module's vtable references resolve to nothing:
+      //
+      //   undefined reference to `lib::category::default_condition(int) const'
+      //   undefined reference to `typeinfo for lib::category'
+      //
+      // The unit compiles once, so it does not need the keyword; the classic
+      // build, where every includer sees the definition, still does.
+      if (md->isVirtual()) demote_inline(fd);
       if (in_extern_cxx_class(cls)) make_extern_cxx(fd);
       return true;
     }
@@ -692,6 +734,9 @@ private:
   std::string_view linkage_macro;
   // The spelling for a declaration whose own `extern` the marker replaces.
   std::string_view extern_decl_macro;
+  // How `inline` is spelled on a definition the module unit owns: nothing
+  // there, `inline` for every textual includer. See demote_inline.
+  std::string_view inline_macro;
   const std::vector<std::string> &reachable_fqns;
   bool no_internal_filter = false;
   std::vector<std::string> &internal_fqns;

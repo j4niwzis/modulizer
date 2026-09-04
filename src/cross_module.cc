@@ -657,7 +657,16 @@ export TemplateBodyRefResult cross_module_template_body_referenced_fqns(
 export std::vector<std::string> out_of_line_member_class_fqns(
     const std::vector<std::string> &paths,
     const std::vector<std::string> &extra_args,
-    const std::set<std::string> &same_module_stems = {}) {
+    const std::set<std::string> &same_module_stems = {},
+    // Filled with class FQN -> the files defining its members out of line. A
+    // module that USES such a class needs those definitions reachable, not
+    // merely the declaration: an inline virtual defined in another module
+    // leaves the vtable of anything deriving from it with nothing to point at.
+    //
+    //   undefined reference to `lib::category::message(int) const'
+    //   undefined reference to `typeinfo for lib::category'
+    //
+    std::map<std::string, std::set<std::string>> *definers = nullptr) {
   class MemberClassCollector
       : public clang::RecursiveASTVisitor<MemberClassCollector> {
   public:
@@ -746,6 +755,9 @@ export std::vector<std::string> out_of_line_member_class_fqns(
                              out, source_stem);
                        });
                  });
+  if (definers)
+    for (std::size_t i = 0; i < paths.size(); ++i)
+      for (const auto &fqn : partials[i]) (*definers)[fqn].insert(paths[i]);
   return merge_sets(partials);
 }
 

@@ -30,9 +30,25 @@ const std::vector<std::string> kStdIncludes = {
 
 } // namespace
 
+// Where a header's macros file sits when the include map does not say. The
+// conversion writes one whenever a header defines macros, so a lookup that
+// came back empty is worth asking the compiler about rather than treating as
+// an answer: a path that resolves differently at rewrite time than at build
+// time otherwise costs the consumer every macro it used to get textually.
+std::string conventional_macros_header(const std::string &include_path,
+                                       bool hyphen_macros) {
+  return replacement_macros_header(include_path, hyphen_macros);
+}
+
 export struct ConsumerHeaderInfo {
   std::string module;
   std::string macro_header;  // empty when the header has no generated macro file
+  // The header does not guard itself against being included twice, so WHERE it
+  // is included matters: Boost's `assert.hpp` recomputes BOOST_ASSERT from
+  // whatever is defined at each inclusion, and a test includes it eight times
+  // with different macros set between. Such an include is replaced where it
+  // stands rather than hoisted into the block at the top.
+  bool reincludable = false;
 };
 
 export struct ConsumerRewriteOptions {
@@ -42,6 +58,10 @@ export struct ConsumerRewriteOptions {
   // imported by the time it reaches them, and the declarations collide —
   //   error: redefinition of 'void* memchr(void*, int, size_t)'
   bool is_header = false;
+  // How this library names its files. A hyphenated library gets hyphenated
+  // macros files, and asking for the underscored name asks for a file nobody
+  // wrote — taking with it every macro the consumer came for.
+  bool hyphen_macros = false;
   std::map<std::string, ConsumerHeaderInfo> include_to_module;
   // System C/POSIX headers the consumer uses macros/symbols from (traced from
   // its source via trace_consumer_system_includes). `import std.compat` cannot
@@ -49,12 +69,32 @@ export struct ConsumerRewriteOptions {
   // POSIX declarations/types (ssize_t, pthread_*), so these includes must be
   // re-added once the library headers no longer pull them in textually.
   std::set<std::string> required_system_includes;
+  // Headers the library reached for that some module also provides. Whether
+  // the module actually provides them is a build-time choice, so both answers
+  // are emitted: the import where the provider's guard is on, the include
+  // where it is not. Without the second the consumer gets neither — the
+  // library's own units include it in their global module fragment, which is
+  // pruned to what is decl-reachable and drops anything found only by ADL.
+  std::vector<ModuleReplacement> required_module_includes;
   // Modules the consumer references internal entities of (traced from the
   // consumer's source against the library headers). Those entities are
   // exported from their defining sub-modules but not re-exported by the
   // wrapper (internal-consumer reachability), so the consumer must import the
   // owning modules itself.
   std::vector<std::string> traced_imports;
+  // Non-empty switches on dual mode: the includes this rewrite replaces are
+  // kept in an `#else` branch, so the file still compiles as a plain
+  // translation unit against the same headers. A test that only ever imports
+  // proves the module build and nothing about the classic one.
+  std::string dual_macro;
+  // The modules that provide headers this consumer includes. Their includes
+  // become imports too, behind each provider's own guard: a consumer that
+  // keeps including a provider textually while the library it uses imports the
+  // same provider ends up with two of it —
+  //
+  //   error: declaration of 'mp_bool' in the global module follows declaration
+  //          in module boost.mp11.integral
+  ModuleReplacements module_replacements;
 };
 
 // Convert a consumer source file to use module imports: `#include
@@ -102,6 +142,8 @@ export std::string rewrite_consumer_source(
     }
   }
 
+
+
   // Pass 2: rewrite the lines.
   //
   // A library include can sit inside a preprocessor conditional (a
@@ -114,8 +156,17 @@ export std::string rewrite_consumer_source(
   // not lose them.
   std::vector<std::string> pending_imports;
   std::vector<std::string> pending_macros;
+  // Those among them that are a guess at the conventional name rather than a
+  // file the include map pointed at; they are asked for, not assumed.
+  std::set<std::string> probed_macros;
+  // The library includes this rewrite takes out, kept for dual mode's `#else`.
+  std::vector<std::string> replaced_includes;
   std::vector<std::string> out;
   std::optional<std::size_t> insert_at;
+  // The source line the block will sit above. Rewriting moves everything below
+  // it, and a test that reports where it is — BOOST_CURRENT_LOCATION, __LINE__
+  // — then reports the wrong place, so a `#line` puts the numbering back.
+  std::size_t insert_at_src_line = 1;
   // Where each system include the consumer already writes ends up in `out`.
   // An include that survives BELOW the block does not spare the block from
   // emitting it: after the imports is exactly where it must not be.
@@ -124,6 +175,7 @@ export std::string rewrite_consumer_source(
   std::vector<std::string> hoisted_system_includes;
   {
     std::size_t pos = 0;
+    std::size_t src_line = 1;
     // Depth of open #if/#ifdef/#ifndef blocks, and where the outermost
     // currently-open one started in `out` (the last unconditional position).
     int cond_depth = 0;
@@ -152,30 +204,79 @@ export std::string rewrite_consumer_source(
         // header below an import is the one order that has to be avoided, and
         // the import can arrive through an include like this one.
         if (inc->is_quoted && cond_depth == 0 && !insert_at &&
-            !options.include_to_module.count(inc->path))
+            !options.include_to_module.count(inc->path)) {
           insert_at = out.size();
+          insert_at_src_line = src_line;
+        }
+        if (auto *rep = find_replacement(inc->path, options.module_replacements);
+            rep && !rep->guard.empty() &&
+            !options.include_to_module.count(inc->path)) {
+          const auto &mod = rep->module;
+          out.push_back(std::format("#if defined({})\n", rep->guard));
+          out.push_back(std::format("import {};\n", mod));
+          if (rep->carries_macros_file) {
+            auto mh = replacement_macros_header(inc->path, options.hyphen_macros);
+            out.push_back(std::format("#if __has_include(\"{}\")\n", mh));
+            out.push_back(std::format("#include \"{}\"\n", mh));
+            out.push_back("#endif\n");
+          }
+          out.push_back("#else\n");
+          out.push_back(line);
+          out.push_back("#endif\n");
+          pos = nl + 1;
+          ++src_line;
+          out.push_back(std::format("#line {}\n", src_line));
+          if (pos >= src.size()) break;
+          continue;
+        }
         auto it = options.include_to_module.find(inc->path);
         if (it != options.include_to_module.end()) {
           auto &mod = it->second.module;
-          auto &mh = it->second.macro_header;
+          // The name the include map gave, or the conventional one to ask
+          // about when it gave none.
+          const bool probed = it->second.macro_header.empty();
+          std::string mh = probed ? conventional_macros_header(inc->path,
+                                                               options.hyphen_macros)
+                                  : it->second.macro_header;
           bool have_import = existing_imports.count(mod) ||
                              std::ranges::contains(pending_imports, mod);
-          bool have_macro = mh.empty() || existing_quoted_includes.count(mh) ||
+          bool have_macro = existing_quoted_includes.count(mh) ||
                             std::ranges::contains(pending_macros, mh);
-          if (cond_depth > 0) {
-            // Guarded include: replace it where it stands so the import is
-            // subject to the same condition.
+          if (cond_depth > 0 || it->second.reincludable) {
+            // Guarded, or re-includable: replace it where it stands, so the
+            // import is subject to the same condition and arrives at the same
+            // point in the file.
             if (!insert_at) insert_at = outermost_cond_start;
+            if (!options.dual_macro.empty())
+              out.push_back(std::format("#if defined({})\n", options.dual_macro));
             if (!have_import) out.push_back(std::format("import {};\n", mod));
-            if (!have_macro) out.push_back(std::format("#include \"{}\"\n", mh));
+            if (!have_macro)
+              out.push_back(probed
+                                ? std::format("#if __has_include(\"{0}\")\n"
+                                              "#include \"{0}\"\n#endif\n",
+                                              mh)
+                                : std::format("#include \"{}\"\n", mh));
+            if (!options.dual_macro.empty()) {
+              out.push_back("#else\n");
+              out.push_back(std::string(line));
+              out.push_back("#endif\n");
+            }
+            out.push_back(std::format("#line {}\n", src_line + 1));
             pos = nl + 1;
+            ++src_line;
             if (pos >= src.size()) break;
             continue;
           }
           if (!insert_at) insert_at = out.size();
           if (!have_import) pending_imports.push_back(mod);
-          if (!have_macro) pending_macros.push_back(mh);
+          if (!have_macro) {
+            pending_macros.push_back(mh);
+            if (probed) probed_macros.insert(mh);
+          }
+          replaced_includes.push_back(std::string(line));
           pos = nl + 1;
+          ++src_line;
+          insert_at_src_line = src_line;  // the block swallowed this line
           if (pos >= src.size()) break;
           continue;
         }
@@ -184,6 +285,8 @@ export std::string rewrite_consumer_source(
         if (options.import_std && options.is_header && !inc->is_quoted &&
             kStdProvidedCHeaders.count(inc->path)) {
           pos = nl + 1;
+          ++src_line;
+          if (insert_at) insert_at_src_line = src_line;
           if (pos >= src.size()) break;
           continue;
         }
@@ -192,6 +295,8 @@ export std::string rewrite_consumer_source(
             inc->path != "cerrno" && inc->path != "cassert" &&
             inc->path != "climits") {
           pos = nl + 1;
+          ++src_line;
+          if (insert_at) insert_at_src_line = src_line;
           if (pos >= src.size()) break;
           continue;
         }
@@ -207,6 +312,8 @@ export std::string rewrite_consumer_source(
           if (insert_at && cond_depth == 0) {
             hoisted_system_includes.push_back(line);
             pos = nl + 1;
+            ++src_line;
+            insert_at_src_line = src_line;
             if (pos >= src.size()) break;
             continue;
           }
@@ -215,6 +322,7 @@ export std::string rewrite_consumer_source(
       }
       out.push_back(line);
       pos = nl + 1;
+      ++src_line;
       if (pos >= src.size()) break;
     }
   }
@@ -235,7 +343,8 @@ export std::string rewrite_consumer_source(
     return !insert_at || it->second < *insert_at;
   };
 
-  std::string block;
+  std::string block;      // needed whichever way the file is built
+  std::string modular;    // the imports, and what only they need
   for (auto &l : hoisted_system_includes) block += l;
 
   // Usage-based C-header re-add: `import std.compat;` cannot provide the C
@@ -259,6 +368,21 @@ export std::string rewrite_consumer_source(
   for (auto &inc : options.required_system_includes)
     if (!already_above_block(inc))
       block += std::format("#include <{}>\n", inc);
+  for (auto &r : options.required_module_includes) {
+    for (auto &inc : r.headers) {
+      if (already_above_block(inc)) continue;
+      block += std::format("#if defined({})\n", r.guard);
+      block += std::format("import {};\n", r.module);
+      if (r.carries_macros_file) {
+        auto mh = replacement_macros_header(inc, options.hyphen_macros);
+        block += std::format("#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n",
+                             mh, mh);
+      }
+      block += "#else\n";
+      block += std::format("#include <{}>\n", inc);
+      block += "#endif\n";
+    }
+  }
   // A translation unit that imports std but never includes <string.h> makes
   // gcc compile the module's own definition of memset, and it dies there:
   //   internal compiler error: in nonnull_arg_p, at tree.cc
@@ -272,19 +396,41 @@ export std::string rewrite_consumer_source(
     // std.compat (rather than std) also provides the C library's global names
     // the consumer code may rely on.
     if (!existing_imports.count("std.compat"))
-      block += "import std.compat;\n";
+      modular += "import std.compat;\n";
   } else {
     for (auto &h : kStdIncludes)
       if (!already_above_block(h))
         block += std::format("#include <{}>\n", h);
   }
-  for (auto &m : pending_imports) block += std::format("import {};\n", m);
+  for (auto &m : pending_imports) modular += std::format("import {};\n", m);
   for (auto &m : options.traced_imports)
     if (!existing_imports.count(m) &&
         !std::ranges::contains(pending_imports, m))
-      block += std::format("import {};\n", m);
+      modular += std::format("import {};\n", m);
   for (auto &mh : pending_macros)
-    block += std::format("#include \"{}\"\n", mh);
+    modular += probed_macros.count(mh)
+                   ? std::format("#if __has_include(\"{0}\")\n"
+                                 "#include \"{0}\"\n#endif\n", mh)
+                   : std::format("#include \"{}\"\n", mh);
+
+  // Dual mode: only the imports are conditional. What the file included
+  // besides the library — `<boost/config/workaround.hpp>`, the C headers the
+  // block hoisted — it needs whichever way it is built, and putting those
+  // behind the macro leaves the classic build without them:
+  //
+  //   error: token is not a valid binary operator in a preprocessor
+  //          subexpression
+  if (options.dual_macro.empty()) {
+    block += modular;
+  } else if (!modular.empty() || !replaced_includes.empty()) {
+    block += std::format("#if defined({})\n", options.dual_macro);
+    block += modular;
+    block += "#else\n";
+    for (auto &l : replaced_includes) block += l;
+    block += "#endif\n";
+  }
+
+  if (!block.empty()) block += std::format("#line {}\n", insert_at_src_line);
 
   if (!block.empty()) {
     if (insert_at)

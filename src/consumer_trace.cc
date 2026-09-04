@@ -4,6 +4,7 @@ export module modulizer.consumer_trace;
 import modulizer.analyzer;
 import modulizer.astutil;
 import modulizer.include_analysis;
+import modulizer.rewrite_util;
 import modulizer.trace_visitors;
 import modulizer.util;
 import libtooling;
@@ -64,9 +65,22 @@ class MacroPresence : public clang::PPCallbacks {
 public:
   MacroPresence(const clang::SourceManager &sm, char &out) : sm(sm), out(out) {}
 
-  void MacroDefined(const clang::Token &,
+  void MacroDefined(const clang::Token &name,
                     const clang::MacroDirective *md) override {
-    if (collectible_macro(md, sm)) out = 1;
+    auto *mi = collectible_macro(md, sm);
+    if (!mi) return;
+    auto def = mi->getDefinitionLoc();
+    auto fid = sm.getFileID(def);
+    unsigned name_off = sm.getFileOffset(def);
+    const char *buf = sm.getCharacterData(sm.getLocForStartOfFile(fid));
+    unsigned hash_off = name_off;
+    while (hash_off > 0 && buf[hash_off - 1] != '#') --hash_off;
+    --hash_off;
+    auto *id = name.getIdentifierInfo();
+    if (id && is_include_guard_define(llvm::StringRef(buf, hash_off + 1),
+                                      hash_off, id->getName()))
+      return;
+    out = 1;
   }
 
 private:
@@ -549,6 +563,88 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
 // SystemHeaderRefFinder), so a consumer that never uses a given C header does
 // not get a redundant include.
 // `virtual_sources` has the same meaning as in trace_consumer_modules.
+// The outside headers a library's own headers pull in — what its consumers
+// used to get transitively through the library header and no longer get from
+// the import that replaced it. See LibraryOutsideIncludeTracer for why the
+// module cannot supply them.
+//
+// `provided` are the modules that stand for headers (a converted dependency,
+// `std`): those arrive as imports where their guards say so, and a textual
+// include beside the import would declare everything twice.
+export std::set<std::string> trace_library_outside_includes(
+    const std::vector<std::string> &library_headers,
+    const std::vector<std::string> &extra_args,
+    const ModuleReplacements &provided = {},
+    // The conversion's own `<PREFIX>_USE_MODULES` guard, which wraps the
+    // includes in every generated header and says nothing about whether they
+    // were conditional before the conversion. Each provider's guard joins it:
+    // that one is the conversion's doing too, and both of its branches are
+    // emitted for the consumer.
+    std::string transparent_macro = {}) {
+  std::set<std::string> transparent_macros;
+  if (!transparent_macro.empty()) transparent_macros.insert(transparent_macro);
+  for (const auto &r : provided)
+    if (!r.guard.empty()) transparent_macros.insert(r.guard);
+  std::set<std::string> library_files;
+  for (const auto &h : library_headers) {
+    std::error_code ec;
+    auto c = std::filesystem::weakly_canonical(std::filesystem::path(h), ec);
+    library_files.insert(ec ? h : c.string());
+  }
+  // Not excluded from the trace: whether a module actually provides one of
+  // these is decided at build time by its guard, and where the guard is off
+  // the consumer needs the include as much as for any other outside header.
+  // The caller splits them out and emits both answers.
+  std::set<std::string> provided_headers;
+
+  std::vector<std::set<std::string>> partials(library_headers.size());
+  parallel_parse(library_headers, extra_args, ParseOptions{},
+                 [&](std::size_t i, const std::string &) {
+                   return std::make_unique<LibraryOutsideIncludeFactory>(
+                       partials[i], library_files, provided_headers,
+                       transparent_macros);
+                 });
+  std::set<std::string> out;
+  for (auto &p : partials) out.insert(p.begin(), p.end());
+  return out;
+}
+
+// The headers a consumer must include for itself once the library it uses is
+// imported rather than included: the ones the library pulled in but does not
+// own, whose declarations its modules cannot re-export and whose macros cannot
+// cross a module boundary at all.
+//
+// `library_headers` are the headers being converted; anything defined in one
+// of those comes from the import and must NOT be asked for again.
+export std::map<std::string, std::set<std::string>>
+trace_consumer_outside_includes(
+    const std::vector<std::string> &consumer_sources,
+    const std::vector<std::string> &library_headers,
+    const std::vector<std::string> &extra_args,
+    const std::map<std::string, std::string> *virtual_sources = nullptr) {
+  // Canonical, so the visitor's comparison against a file it opened is against
+  // the same spelling however the caller wrote the path.
+  std::set<std::string> library_files;
+  for (const auto &h : library_headers) {
+    std::error_code ec;
+    auto c = std::filesystem::weakly_canonical(std::filesystem::path(h), ec);
+    library_files.insert(ec ? h : c.string());
+  }
+  std::vector<std::set<std::string>> partials(consumer_sources.size());
+  parallel_parse(
+      consumer_sources, extra_args,
+      ParseOptions{/*delayed_template_parsing=*/true, virtual_sources},
+      [&](std::size_t i, const std::string &) {
+        return std::make_unique<OutsideHeaderUsageFactory>(partials[i],
+                                                           library_files);
+      });
+  std::map<std::string, std::set<std::string>> result;
+  for (std::size_t i = 0; i < consumer_sources.size(); ++i)
+    if (!partials[i].empty())
+      result[consumer_sources[i]] = std::move(partials[i]);
+  return result;
+}
+
 export std::map<std::string, std::set<std::string>>
 trace_consumer_system_includes(
     const std::vector<std::string> &consumer_sources,

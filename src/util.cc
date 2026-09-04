@@ -121,15 +121,131 @@ export std::string include_prefix(llvm::StringRef header_path,
   return "";
 }
 
-// The base name of a generated macro header for a header stem, e.g. the stem
-// `mylib_pred_impl` stays `mylib_pred_impl` (underscore style) or becomes
-// `mylib-pred-impl` (--hyphen-macros style).
+
 export std::string macro_base_name(llvm::StringRef stem, bool hyphen) {
   if (!hyphen) return stem.str();
   std::string s(stem);
   std::ranges::replace(s, '_', '-');
   return s;
 }
+
+// A module that provides headers, so an include of one of them becomes an
+// import of it. `std` providing <vector> and a converted library providing its
+// own headers are the same arrangement described two ways, and this is the one
+// description: what the module is called, which headers it stands for, and
+// whether the build can turn the replacement off.
+export struct ModuleReplacement {
+  // The module the headers come from.
+  std::string module;
+  // The headers this module provides. A converted library contributes one
+  // entry per module it generated — `boost.mp11.list=boost/mp11/list.hpp` —
+  // rather than one entry for the whole library, so that the narrowest module
+  // providing a header is the one an include of it becomes.
+  std::set<std::string> headers;
+  // The macro that switches the replacement on. Empty means it is on whenever
+  // the module is imported at all.
+  //
+  // A guard changes what can be emitted. An include belongs in the global
+  // module fragment and an import in the purview, so a replacement the build
+  // can turn off cannot swap one for the other: the import goes under the
+  // guard and the include stays under its negation. Each provider brings its
+  // own, so a library is switched to modules on its own rather than every
+  // library at once.
+  std::string guard;
+  // A module carries declarations but not macros, so a consumer that took a
+  // macro from the header it no longer includes is left without it. Where the
+  // provider wrote a macros file, it travels with the import.
+  bool carries_macros_file = false;
+};
+
+export using ModuleReplacements = std::vector<ModuleReplacement>;
+
+// The module replacement covering this include, if any — the most specific one
+// when several do. `std` and `std.variant` both provide <variant>; the answer
+// wanted is the narrower.
+export const ModuleReplacement *find_replacement(
+    const std::string &include_path, const ModuleReplacements &replacements) {
+  const ModuleReplacement *best = nullptr;
+  for (const auto &r : replacements) {
+    if (!r.headers.count(include_path)) continue;
+    if (!best || r.headers.size() < best->headers.size()) best = &r;
+  }
+  return best;
+}
+
+// Parse one --module-replaces spec:
+//
+//   <module>=<header>[,<header>...][:<option>...]
+//
+// Options are `guard=<MACRO>` and `macros`; see ModuleReplacement.
+//
+//   std=vector,string
+//   boost.mp11.list=boost/mp11/list.hpp:guard=BOOST_MP11X_IMPORT_MODULES:macros
+//
+// Returns nothing and sets `error` when the spec cannot mean anything.
+export std::optional<ModuleReplacement> parse_module_replacement(
+    std::string_view spec, std::string &error) {
+  auto eq = spec.find('=');
+  if (eq == std::string_view::npos) {
+    error = std::format("wants <module>=<headers>: {}", spec);
+    return std::nullopt;
+  }
+  ModuleReplacement r;
+  r.module = std::string(spec.substr(0, eq));
+  if (r.module.empty()) {
+    error = std::format("names no module: {}", spec);
+    return std::nullopt;
+  }
+  auto rest = spec.substr(eq + 1);
+
+  // Options are appended after the header list, each introduced by a colon.
+  // An include path never contains one, so the split is unambiguous.
+  auto opts_at = rest.find(':');
+  auto header_list = rest.substr(0, opts_at);
+  for (auto part : std::views::split(header_list, ',')) {
+    std::string h(part.begin(), part.end());
+    if (!h.empty()) r.headers.insert(std::move(h));
+  }
+  if (r.headers.empty()) {
+    error = std::format("replaces no headers, so it replaces nothing: {}", spec);
+    return std::nullopt;
+  }
+
+  while (opts_at != std::string_view::npos) {
+    auto next = rest.find(':', opts_at + 1);
+    auto opt = rest.substr(opts_at + 1, next == std::string_view::npos
+                                            ? std::string_view::npos
+                                            : next - opts_at - 1);
+    opts_at = next;
+    if (opt == "macros") {
+      r.carries_macros_file = true;
+    } else if (opt.starts_with("guard=")) {
+      r.guard = std::string(opt.substr(6));
+      if (r.guard.empty()) {
+        // An empty guard would read as unconditional, which is the opposite of
+        // what was asked for.
+        error = std::format("guard= wants a macro name: {}", spec);
+        return std::nullopt;
+      }
+    } else {
+      error = std::format("unknown option '{}' in: {}", opt, spec);
+      return std::nullopt;
+    }
+  }
+  return r;
+}
+
+// Where the provider's macros file sits, given the header being replaced:
+// beside it, named after its stem.
+export std::string replacement_macros_header(const std::string &include_path,
+                                             bool hyphen_macros) {
+  auto dir = std::filesystem::path(include_path).parent_path().string();
+  return (dir.empty() ? "" : dir + "/") +
+         macro_base_name(std::filesystem::path(include_path).stem().string(),
+                         hyphen_macros) +
+         (hyphen_macros ? "-macros.h" : "_macros.h");
+}
+
 
 // Clang's builtin-header directory (`<clang>/lib/clang/<ver>/include`, holding
 // stddef.h and friends). A ClangTool derives it from the running executable's

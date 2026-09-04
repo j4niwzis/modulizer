@@ -460,3 +460,313 @@ TEST(ConsumerRewrite, ReAddedSystemIncludesComeBeforeTheImports) {
   EXPECT_LT(inc, imp)
       << "a re-added C header must precede the standard library import";
 }
+
+TEST(ConsumerRewrite, TracesOutsideHeadersTheImportCannotSupply) {
+  // The consumer includes only the library header and takes `outside::Gadget`
+  // and OUTSIDE_TAG through it. Converting the library does not convert the
+  // outside header: the library's module units include it in their global
+  // module fragment, where its declarations attach to the global module and
+  // are invisible to anyone importing the module. The macro does not cross a
+  // module boundary at all.
+  //
+  // So the include the consumer never wrote has to be written for it:
+  //
+  //   error: missing '#include "boost/assert/source_location.hpp"';
+  //          'source_location' must be declared before it is used
+  //   error: use of undeclared identifier 'BOOST_CURRENT_LOCATION'
+  auto use = data_path("outsidelib/use.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end())
+      << "a consumer naming entities from an unconverted header needs it";
+  EXPECT_NE(it->second.count("outside/gadget.h"), 0u)
+      << "spelled as the include path, not as a bare file name — a bare "
+         "`gadget.h` resolves to nothing";
+}
+
+TEST(ConsumerRewrite, DoesNotAskForTheLibraryHeadersItImports) {
+  // The other half: what the module DOES provide must not come back as an
+  // include. Re-adding a library header alongside the import of the same
+  // module declares everything in it twice, once in the global module and
+  // once attached to the module.
+  auto use = data_path("outsidelib/use.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end());
+  for (const auto &inc : it->second)
+    EXPECT_EQ(inc.find("outsidelib/"), std::string::npos)
+        << "the library's own header must not be re-added: " << inc;
+}
+
+TEST(ConsumerRewrite, TracesTheOutsideHeadersTheLibraryInterfaceLeansOn) {
+  // A module's global module fragment is pruned to what is decl-reachable from
+  // its exported declarations. An outside TYPE named in the interface survives;
+  // an outside operator found only by ADL, when some template using it is
+  // instantiated in the consumer's translation unit, does not:
+  //
+  //   error: invalid operands to binary expression
+  //          ('const variant2::variant<...>' and the same)
+  //   note: candidate function not viable: operator==(monostate, monostate)
+  //
+  // — variant.hpp plainly visible, and the one operator that matters gone. So
+  // the outside headers the library's own headers pull in have to reach the
+  // consumer, which is exactly what it used to get transitively before the
+  // include became an import.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/holder.h"), data_path("outsidelib/api.h")},
+      {"-I", gDataDir});
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "the header carrying the ADL-only operator must reach the consumer";
+}
+
+TEST(ConsumerRewrite, StillReportsAHeaderSomeModuleProvides) {
+  // Whether a module actually provides one of these is decided at BUILD time,
+  // by the provider's own guard. Dropping it from the trace answers that
+  // question at conversion time and gets it wrong for every build with the
+  // guard off: nothing imports the module, the library's units include the
+  // header in their global module fragment, and pruning takes the ADL-only
+  // operators away again.
+  //
+  // So it is reported, and the caller emits both answers — the import under
+  // the guard, the include under its negation.
+  ModuleReplacements provided = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES"}};
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/holder.h")}, {"-I", gDataDir}, provided,
+      "OUTSIDELIB_USE_MODULES");
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "a header a module MIGHT provide is still one the consumer may need";
+}
+
+TEST(ConsumerRewrite, EmitsImportAndIncludeForAProvidedHeader) {
+  // The pair the guard chooses between, so one generated tree serves a build
+  // with the converted dependency and a build without it.
+  ConsumerRewriteOptions cfg;
+  cfg.include_to_module = {{"outsidelib/holder.h", {"outsidelib.holder", ""}}};
+  cfg.required_module_includes = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES",
+                        .carries_macros_file = true}};
+  auto out = rewrite_consumer_source(
+      "#include \"outsidelib/holder.h\"\nint main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("#if defined(OUTSIDE_IMPORT_MODULES)"), std::string::npos)
+      << "got:\n" << out;
+  EXPECT_NE(out.find("import outside.gadget;"), std::string::npos);
+  EXPECT_NE(out.find("#include <outside/gadget.h>"), std::string::npos)
+      << "and the include for the build that has not switched it on";
+  EXPECT_NE(out.find("outside/gadget_macros.h"), std::string::npos)
+      << "with the provider's macros file, which the module cannot carry";
+}
+
+TEST(ConsumerRewrite, LeavesOutAnIncludeTheLibraryOnlyMakesConditionally) {
+  // A header the library reaches for only on another platform is not the
+  // consumer's to include. Handed over unconditionally it is handed to every
+  // platform, and the ones it was never meant for stop compiling:
+  //
+  //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not available"
+  //
+  // The conversion's own `<PREFIX>_USE_MODULES` guard does not count: every
+  // generated header wraps its includes in it, and it says nothing about
+  // whether the include was conditional to begin with.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/holder.h")}, {"-I", gDataDir},
+      /*provided=*/{}, "OUTSIDELIB_USE_MODULES");
+  EXPECT_EQ(needed.count("outside/winonly.h"), 0u)
+      << "a conditional include must not be handed on unconditionally";
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "while one guarded only by the conversion's own macro still must be";
+}
+
+TEST(ConsumerRewrite, ReadsPastAHeadersOwnIncludeGuard) {
+  // An include guard wraps the whole file and is true exactly once; it says
+  // nothing about the includes inside it. Counted as a condition it makes
+  // every include in every guarded header look conditional — which is every
+  // header there is — and the trace reports nothing at all.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/guarded.h")}, {"-I", gDataDir}, /*provided=*/{},
+      "OUTSIDELIB_USE_MODULES");
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "an include guard must not hide what the header includes";
+}
+
+TEST(ConsumerRewrite, OnlyAsksForIncludesThatResolveOnTheSearchPath) {
+  // The re-added includes are emitted `#include <...>`, so a spelling that
+  // only works relative to the file that wrote it is worse than nothing.
+  // Clang will happily suggest one — it is the shortest way to name the file
+  // from the consumer — and the result does not compile:
+  //
+  //   test/production.cc:35:10: fatal error: production.h: No such file
+  //     35 | #include <production.h>
+  auto use = data_path("outsidelib/nested/use_sidecar.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  if (it == needed.end()) return;  // nothing traced at all is fine here
+  EXPECT_EQ(it->second.count("sidecar.h"), 0u)
+      << "a bare name resolves against no search directory";
+  for (const auto &inc : it->second)
+    EXPECT_NE(inc.find('/'), std::string::npos)
+        << "every re-added include must be search-path relative: " << inc;
+}
+
+TEST(ConsumerRewrite, KeepsAMacroOnlyHeaderReachableFromAConsumerHeader) {
+  // A header that defines nothing but a macro has no declarations to export,
+  // so nothing about it crosses a module boundary. A consumer that used the
+  // macro must still be able to: either the include stays, or the macros file
+  // that carries it arrives instead.
+  //
+  //   production.h:44:3: error: 'FRIEND_TEST' has not been declared
+  //   production.h:44:3: error: ISO C++ forbids declaration of 'FRIEND_TEST'
+  //                             with no type
+  ConsumerRewriteOptions cfg;
+  cfg.is_header = true;
+  cfg.include_to_module = {
+      {"macroonly/friend_macro.h",
+       {"macroonly.friend_macro", "macroonly/friend_macro_macros.h"}}};
+  auto out = rewrite_consumer_source(
+      read_file(data_path("macroonly/user.h")), cfg);
+  bool has_macros_header =
+      out.find("macroonly/friend_macro_macros.h") != std::string::npos;
+  bool kept_include =
+      out.find("#include \"macroonly/friend_macro.h\"") != std::string::npos;
+  EXPECT_TRUE(has_macros_header || kept_include)
+      << "the macro has to reach the consumer somehow; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, ProbesForAMacrosFileItCouldNotResolve) {
+  // The macros file is found by asking the include path for it, and a path
+  // that answers differently at rewrite time than at build time leaves the
+  // consumer with an import and nothing else — every macro it used to get
+  // from that header is gone:
+  //
+  //   production.h:44:3: error: 'FRIEND_TEST' has not been declared
+  //
+  // The conversion writes a macros file whenever a header defines macros, so
+  // "not found" is worth a second question rather than a conclusion. Asked
+  // with __has_include, a file that is there is used and one that is not
+  // costs nothing.
+  ConsumerRewriteOptions cfg;
+  cfg.is_header = true;
+  cfg.include_to_module = {
+      {"macroonly/friend_macro.h", {"macroonly.friend_macro", ""}}};
+  auto out = rewrite_consumer_source(
+      read_file(data_path("macroonly/user.h")), cfg);
+  EXPECT_NE(out.find("import macroonly.friend_macro;"), std::string::npos);
+  EXPECT_NE(out.find("__has_include(\"macroonly/friend_macro_macros.h\")"),
+            std::string::npos)
+      << "ask for the macros file rather than assume it is not there; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, IgnoresALibraryHeaderThatCannotBeReadHere) {
+  // Every library header is parsed on its own to see what it includes, which
+  // reaches headers no build on this platform ever includes. Their includes
+  // are unconditional WITHIN them — the condition is on whoever includes them
+  // — so nothing inside the file says "not here", and handing those on gives
+  // every consumer a header for another platform:
+  //
+  //   boost/winapi/basic_types.hpp:38:3: error: "Win32 functions not available"
+  //
+  // A header that cannot be read here cannot say what a consumer needs.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/other_platform.h")}, {"-I", gDataDir},
+      /*provided=*/{}, "OUTSIDELIB_USE_MODULES");
+  EXPECT_EQ(needed.count("outside/platform_only.h"), 0u)
+      << "a header that fails to parse contributes nothing";
+  EXPECT_TRUE(needed.empty()) << "nothing at all, in fact";
+}
+
+TEST(ConsumerRewrite, StillReadsTheHeadersThatDoParse) {
+  // And the ones that do parse are unaffected by a sibling that does not.
+  auto needed = trace_library_outside_includes(
+      {data_path("outsidelib/other_platform.h"),
+       data_path("outsidelib/holder.h")},
+      {"-I", gDataDir}, /*provided=*/{}, "OUTSIDELIB_USE_MODULES");
+  EXPECT_NE(needed.count("outside/gadget.h"), 0u)
+      << "one unreadable header must not silence the rest";
+  EXPECT_EQ(needed.count("outside/platform_only.h"), 0u);
+}
+
+// The line a compiler reports for `needle` in `text`, counting the way one
+// does: each line advances the counter, and `#line N` sets the next line to N.
+static std::size_t reported_line_of(const std::string &text,
+                                    std::string_view needle) {
+  std::size_t line = 1;
+  for (std::size_t pos = 0; pos < text.size();) {
+    auto nl = text.find('\n', pos);
+    if (nl == std::string::npos) nl = text.size();
+    auto content = std::string_view(text).substr(pos, nl - pos);
+    if (content.contains(needle)) return line;
+    auto trimmed = content.substr(std::min(content.find_first_not_of(" \t"),
+                                           content.size()));
+    if (trimmed.starts_with("#line ")) {
+      line = std::strtoul(std::string(trimmed.substr(6)).c_str(), nullptr, 10);
+    } else {
+      ++line;
+    }
+    pos = nl + 1;
+  }
+  return 0;
+}
+
+TEST(ConsumerRewrite, KeepsEveryLineWhereItWas) {
+  // The rewrite adds imports and moves includes, so it restores the numbering
+  // with `#line`. Off by one there is invisible until something reports a
+  // source location, and then every one of them is wrong:
+  //
+  //   ec_location_test.cpp(36): test 'ec.location().line() == 27'
+  //                             ('26' == '27') failed
+  auto src = read_file(data_path("lineno/use.cc"));
+  ASSERT_EQ(reported_line_of(src, "LINENO_MARKER"), 10u)
+      << "the fixture itself must have the marker on line 10";
+
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.include_to_module = {{"lineno/lib.h", {"lineno.lib", ""}}};
+  auto out = rewrite_consumer_source(src, cfg);
+  EXPECT_EQ(reported_line_of(out, "LINENO_MARKER"), 10u)
+      << "the marker has to still report line 10; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, SpellsAMacrosFileTheWayTheLibraryNamesItsFiles) {
+  // A library whose headers are hyphenated gets hyphenated macros files, and a
+  // consumer asked to include the underscored name asks for a file nobody
+  // wrote. The macro it came for is then simply missing:
+  //
+  //   production.h:41:3: error: a type specifier is required for all
+  //                             declarations
+  //     41 |   FRIEND_TEST(PrivateCodeTest, CanAccessPrivateMembers);
+  ConsumerRewriteOptions cfg;
+  cfg.hyphen_macros = true;
+  cfg.include_to_module = {{"lib/thing-here.h", {"lib.thing_here", ""}}};
+  auto out = rewrite_consumer_source(
+      "#include \"lib/thing-here.h\"\nint main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("lib/thing-here-macros.h"), std::string::npos)
+      << "the separator the library uses, not the default; got:\n"
+      << out;
+  EXPECT_EQ(out.find("thing-here_macros.h"), std::string::npos);
+}
+
+TEST(ConsumerRewrite, SpellsAProvidersMacrosFileTheSameWay) {
+  // The same for a module that provides headers: its macros file is named the
+  // way that library names files, not the way this one does.
+  ConsumerRewriteOptions cfg;
+  cfg.hyphen_macros = true;
+  cfg.module_replacements = {
+      ModuleReplacement{.module = "dep.thing_here",
+                        .headers = {"dep/thing-here.h"},
+                        .guard = "DEP_IMPORT_MODULES",
+                        .carries_macros_file = true}};
+  auto out = rewrite_consumer_source(
+      "#include \"dep/thing-here.h\"\nint main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("dep/thing-here-macros.h"), std::string::npos)
+      << "got:\n"
+      << out;
+}
