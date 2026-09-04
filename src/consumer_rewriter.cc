@@ -173,6 +173,11 @@ export std::string rewrite_consumer_source(
   std::map<std::string, std::size_t> system_include_at;
   // System includes lifted out of the body because the block sits above them.
   std::vector<std::string> hoisted_system_includes;
+  // Includes the source wrote that were turned into the guarded pair where
+  // they stood. The block below leaves those alone; anything else a module
+  // provides is still the block's to hand over, since the source never asked
+  // for it and there is no pair in place to do it.
+  std::set<std::string> replaced_in_source;
   {
     std::size_t pos = 0;
     std::size_t src_line = 1;
@@ -212,6 +217,7 @@ export std::string rewrite_consumer_source(
             rep && !rep->guard.empty() &&
             !options.include_to_module.count(inc->path)) {
           const auto &mod = rep->module;
+          replaced_in_source.insert(inc->path);
           out.push_back(std::format("#if defined({})\n", rep->guard));
           out.push_back(std::format("import {};\n", mod));
           if (rep->carries_macros_file) {
@@ -365,9 +371,48 @@ export std::string rewrite_consumer_source(
   // Seen first, the textual declarations are already in place when the module
   // arrives and the two agree. The whole block is emitted at one insertion
   // point, so this is only about the order within it.
-  for (auto &inc : options.required_system_includes)
-    if (!already_above_block(inc))
+  // A header some module provides is left to the loop below, which writes the
+  // import and the include as the two branches of one condition. Written here
+  // as well it would arrive first and unconditionally, and the textual
+  // declarations it brings are the global module's while the ones the import
+  // brings are the provider's. Nothing diagnoses the two standing side by
+  // side; the consumer names one and the library was built against the other,
+  // and only the linker ever says so:
+  //
+  //   undefined reference to `boost::detail::throw_location@
+  //   boost.throw_exception::throw_location(boost::source_location const&)'
+  //
+  // — where the library defines that constructor taking the provider's
+  // `source_location@boost.assert.source_location`, and the two names differ
+  // by the module each type is attached to.
+  std::set<std::string> provided_by_module;
+  for (auto &r : options.required_module_includes)
+    provided_by_module.insert(r.headers.begin(), r.headers.end());
+  for (auto &inc : options.required_system_includes) {
+    if (already_above_block(inc) || provided_by_module.count(inc)) continue;
+    // Replaced where the source includes it: the pair is already in place and
+    // a plain copy here would arrive above it, textually, and win.
+    if (replaced_in_source.count(inc)) continue;
+    // A module provides it, but the source never included it, so there is no
+    // pair in place. It is still owed to the consumer — as the pair, for the
+    // reason the plain copy is refused above.
+    if (auto *rep = find_replacement(inc, options.module_replacements);
+        rep && !rep->guard.empty()) {
+      block += std::format("#if defined({})\n", rep->guard);
+      block += std::format("import {};\n", rep->module);
+      if (rep->carries_macros_file) {
+        auto mh = replacement_macros_header(inc, options.hyphen_macros);
+        block +=
+            std::format("#if __has_include(\"{}\")\n#include \"{}\"\n#endif\n",
+                        mh, mh);
+      }
+      block += "#else\n";
       block += std::format("#include <{}>\n", inc);
+      block += "#endif\n";
+      continue;
+    }
+    block += std::format("#include <{}>\n", inc);
+  }
   for (auto &r : options.required_module_includes) {
     for (auto &inc : r.headers) {
       if (already_above_block(inc)) continue;

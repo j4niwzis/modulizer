@@ -770,3 +770,56 @@ TEST(ConsumerRewrite, SpellsAProvidersMacrosFileTheSameWay) {
       << "got:\n"
       << out;
 }
+
+TEST(ConsumerRewrite, DoesNotAlsoHoistAHeaderReplacedWhereTheSourceIncludesIt) {
+  // The consumer needs a header the library stopped pulling in, so it is
+  // hoisted to the top; the same header has a module replacement, so the
+  // include the source wrote is turned into the guarded pair in place. Both
+  // at once hands the consumer the textual declarations first, and they are
+  // the global module's while the import's are the provider's:
+  //
+  //   error: 'boost::detail::lwt_long_type<true>::type' from module
+  //          'boost.core.lightweight_test' is not present in definition of
+  //          'boost::detail::lwt_long_type<true>' provided earlier
+  //
+  // The guarded pair answers both builds, so the hoisted copy is not the
+  // consumer's to add.
+  ConsumerRewriteOptions cfg;
+  cfg.required_system_includes = {"outside/gadget.h"};
+  cfg.module_replacements = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES"}};
+  auto out = rewrite_consumer_source(
+      "#include <outside/gadget.h>\nint main() { return 0; }\n", cfg);
+  auto guard = out.find("#if defined(OUTSIDE_IMPORT_MODULES)");
+  ASSERT_NE(guard, std::string::npos) << "no guarded pair; got:\n" << out;
+  EXPECT_EQ(out.rfind("#include <outside/gadget.h>", guard), std::string::npos)
+      << "the header must not also be hoisted above the pair; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, StillProvidesAReplacedHeaderTheSourceNeverIncluded) {
+  // The other half of the rule above. This header is hoisted because the
+  // library stopped pulling it in, and the source never wrote an include for
+  // it — so there is no pair standing in place to hand it over. Dropping it
+  // for having a replacement leaves the consumer without it altogether:
+  //
+  //   error: use of undeclared identifier 'BOOST_CURRENT_FUNCTION'
+  //
+  // It is owed, and owed as the pair, so the import serves the build that has
+  // the module and the include the build that has not.
+  ConsumerRewriteOptions cfg;
+  cfg.required_system_includes = {"outside/gadget.h"};
+  cfg.module_replacements = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES"}};
+  auto out = rewrite_consumer_source("int main() { return 0; }\n", cfg);
+  EXPECT_NE(out.find("import outside.gadget;"), std::string::npos)
+      << "the module for the build that has it; got:\n"
+      << out;
+  EXPECT_NE(out.find("#include <outside/gadget.h>"), std::string::npos)
+      << "and the include for the build that has not; got:\n"
+      << out;
+}

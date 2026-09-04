@@ -2621,3 +2621,139 @@ TEST(HeaderRewrite, MacrosFileCarriesAConditionalStandardHeaderUnderItsGuard) {
       << "carried without its guard:\n"
       << r.macros_content;
 }
+
+TEST(HeaderRewrite, ProviderGuardSitsOutsideTheConditionTheIncludeSatUnder) {
+  // The macros file that comes with an import is read under the provider's
+  // guard, and under the condition the include it replaces sat beneath. The
+  // provider's guard has to be the outer of the two.
+  //
+  // Inside it, the condition is read first — and a condition on an include of
+  // the provider is written in the provider's terms:
+  //
+  //   #if (BOOST_MP11_WORKAROUND( BOOST_MP11_GCC, >= 140000 ) && ...)
+  //
+  // which asks the provider's macros for permission to read the provider's
+  // macros. Where nothing imports the provider, nothing has defined them and
+  // the question cannot be asked at all:
+  //
+  //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+  //
+  // Outside, the block is skipped whole where there is no import, and where
+  // there is one the macros arrived with it.
+  auto r = rewrite_header(
+      data_path("replaces_lib/cond_use.hpp"), "replaces_lib.cond",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES",
+                         .carries_macros_file = true}}});
+  auto at = r.cc_content.find("#include \"provider/thing_macros.h\"");
+  ASSERT_NE(at, std::string::npos) << "macros file not read:\n" << r.cc_content;
+  auto above = r.cc_content.substr(0, at);
+  auto guard = above.rfind("#if defined(PROVIDER_IMPORT_MODULES)");
+  auto cond = above.rfind("#if PROVIDER_WORKAROUND");
+  ASSERT_NE(guard, std::string::npos) << "no provider guard:\n" << r.cc_content;
+  ASSERT_NE(cond, std::string::npos) << "no condition:\n" << r.cc_content;
+  EXPECT_LT(guard, cond) << "the provider's guard must be the outer of the two;"
+                            " got:\n"
+                         << r.cc_content;
+}
+
+TEST(HeaderRewrite, ProviderGuardSitsOutsideThatConditionForTheImportToo) {
+  // The same nesting, for the import itself rather than the macros file that
+  // travels with it. The import is written under the provider's guard and
+  // under the condition the include it replaces sat beneath, and again the
+  // provider's guard has to be the outer of the two — for the same reason,
+  // the condition being written in the provider's terms:
+  //
+  //   error: function-like macro 'BOOST_MP11_WORKAROUND' is not defined
+  //
+  // The window starts at `export module`, so what is measured is the import
+  // in the purview and not the macros file above it, which has its own copy
+  // of the same two lines.
+  auto r = rewrite_header(
+      data_path("replaces_lib/cond_use.hpp"), "replaces_lib.cond",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES",
+                         .carries_macros_file = true}}});
+  auto purview = r.cc_content.find("export module");
+  ASSERT_NE(purview, std::string::npos) << r.cc_content;
+  auto at = r.cc_content.find("import provider.thing;", purview);
+  ASSERT_NE(at, std::string::npos) << "no import:\n" << r.cc_content;
+  auto above = r.cc_content.substr(purview, at - purview);
+  auto guard = above.rfind("#if defined(PROVIDER_IMPORT_MODULES)");
+  auto cond = above.rfind("#if PROVIDER_WORKAROUND");
+  ASSERT_NE(guard, std::string::npos) << "no provider guard:\n" << r.cc_content;
+  ASSERT_NE(cond, std::string::npos) << "no condition:\n" << r.cc_content;
+  EXPECT_LT(guard, cond) << "the provider's guard must be the outer of the two;"
+                            " got:\n"
+                         << r.cc_content;
+}
+
+TEST(HeaderRewrite, DoesNotCarryTheStandardHeaderWhereStdIsImported) {
+  // The other side of MacrosFileCarriesTheStandardHeaderItsBodyNames. Where
+  // the consumer imports std, a textual standard header beside that import
+  // declares a second time what the import already carries, and the two are
+  // not one entity:
+  //
+  //   bits/stringfwd.h:79: error: reference to 'basic_string' is ambiguous
+  //   note: candidates are: 'template<...> class std::__cxx11::basic_string'
+  //   note:                 'template<...> class std::__cxx11::basic_string'
+  //
+  //   __new/allocate.h:39: error: call to 'operator new' is ambiguous
+  //
+  // So the header is not carried there. The macro keeps whatever the import
+  // gives it, and where that is not enough the answer is the import's to fix
+  // — carrying the header trades one broken build for another.
+  auto r = rewrite_header(
+      data_path("macrostd/loc.h"), "macrostd.loc",
+      RewriteOptions{.extra_args = {"-I", gDataDir}, .import_std = true});
+  EXPECT_EQ(r.macros_content.find("#include <source_location>"),
+            std::string::npos)
+      << "must not be carried beside import std; got:\n"
+      << r.macros_content;
+}
+
+TEST(HeaderRewrite, GeneratedHeaderSkipsAReplacedIncludeWhereItIsAModule) {
+  // The generated header is read by consumers, and a consumer may already have
+  // imported the provider — the pair at the top of its own file said to. This
+  // header then including the provider textually declares a second time what
+  // the import gave it, and the two are not one entity:
+  //
+  //   assert/source_location.hpp:37: error: declaration of 'source_location'
+  //     in the global module follows declaration in module
+  //     boost.assert.source_location
+  //   assert/source_location.hpp:149: error: declaration of 'operator<<' in
+  //     the global module follows declaration in module
+  //     boost.assert.source_location
+  //
+  // So the include is left to the builds where the provider is not a module.
+  // Only the negation: the import belongs to the consumer's own pair, which
+  // put those declarations there to begin with, and a header — which may be
+  // read anywhere in a translation unit — is no place to write one.
+  //
+  // The library's own USE_MODULES guard does not answer this. It says whether
+  // this file is being read as its module's unit, which is a different
+  // question from whether the PROVIDER is a module here, and only the second
+  // decides whether the include duplicates an import.
+  auto r = rewrite_header(
+      data_path("replaces_lib/use.hpp"), "replaces_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES"}}});
+  auto inc = r.h_content.find("#include <provider/thing.hpp>");
+  if (inc == std::string::npos) return;  // not included at all is also correct
+  auto guard = r.h_content.rfind("#if !defined(PROVIDER_IMPORT_MODULES)", inc);
+  EXPECT_NE(guard, std::string::npos)
+      << "the include must stand down where the provider is a module; got:\n"
+      << r.h_content;
+  EXPECT_LT(r.h_content.rfind("#ifndef REPLACES_LIB_USE_MODULES", inc), guard)
+      << "and stay inside the library's own guard; got:\n"
+      << r.h_content;
+}
