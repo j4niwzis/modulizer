@@ -301,7 +301,8 @@ GmfAndImports classify_includes(
         if (!inc.is_quoted) {
           auto resolved =
               resolve_include(inc.path, header_path.str(), options.extra_args);
-          if (!keep_transitive_system_include(resolved, inc.path,
+          if (!inc.from_body_read &&
+              !keep_transitive_system_include(resolved, inc.path,
                                               used_headers)) {
             // `<version>` defines only preprocessor macros the header body
             // evaluates (e.g. `__cpp_lib_char8_t`); macros are not tracked by
@@ -1213,6 +1214,47 @@ export HeaderRewriteResult rewrite_header(
           inc.skip_gmf = true;
   }
 
+  // And what those bring with them. An include the body keeps is read in the
+  // PURVIEW -- that is the point of keeping it -- so everything it includes is
+  // read there too. A standard header read there attaches what it declares to
+  // this module, against the copy the global module already has:
+  //
+  //   bits/move.h:227: error: declaration of 'swap' in module
+  //     boost.filesystem.detail.utf8_codecvt_facet follows declaration in the
+  //     global module
+  //
+  // The used-headers filter cannot keep them: the uses that need them are
+  // written inside the kept include, not here, and a use outside the main file
+  // is not recorded. So they are kept on the strength of what reached them.
+  //
+  // Only the standard ones. A condition found inside another project's header
+  // belongs to that header and is not carried here (see expand_include_closure),
+  // so anything else kept this way would be written unconditionally --
+  //
+  //   utf8_codecvt_facet.cc:30: fatal error: 'cygwin/version.h' file not found
+  //
+  // -- and it is the standard library's declarations that clash with the
+  // global module's copy anyway. The rest stay where the fragment reads them.
+  {
+    std::set<std::string> body_read;
+    for (auto &inc : includes)
+      if (inc.skip_gmf && !inc.transitive)
+        if (auto r = resolve_include(inc.path, header_path, options.extra_args);
+            !r.empty())
+          body_read.insert(r);
+    for (bool grew = !body_read.empty(); grew;) {
+      grew = false;
+      for (auto &inc : includes) {
+        if (!inc.transitive || inc.from_body_read) continue;
+        if (!body_read.count(inc.parent_resolved)) continue;
+        if (kStdHeaders.count(inc.path)) inc.from_body_read = true;
+        if (auto r = resolve_include(inc.path, header_path, options.extra_args);
+            !r.empty() && body_read.insert(r).second)
+          grew = true;
+      }
+    }
+  }
+
   // PUBLIC macros (never #undef'd before the end of the header) move to the
   // generated macros file and are stripped from the header body; PRIVATE macros
   // (undef'd before the end) stay in the body, exactly as in the original. A
@@ -1262,6 +1304,7 @@ export HeaderRewriteResult rewrite_header(
   hdr = wrap_includes_with_guard(std::move(hdr), includes, use_modules_macro,
                                  /*remove=*/options.cc_only,
                                  options.module_replacements);
+  hdr = export_body_read_includes(std::move(hdr), includes, use_modules_macro);
 
   auto prelude = std::format(
       "#pragma once\n"

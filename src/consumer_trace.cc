@@ -5,6 +5,7 @@ import modulizer.analyzer;
 import modulizer.astutil;
 import modulizer.include_analysis;
 import modulizer.rewrite_util;
+import modulizer.self_contained;
 import modulizer.trace_visitors;
 import modulizer.util;
 import libtooling;
@@ -553,6 +554,32 @@ export std::map<std::string, std::set<std::string>> trace_consumer_modules(
       .producers_by_consumer;
 }
 
+// A name is only owed to a consumer if the consumer could act on it. The walk
+// out of a fragment stops at the first file that guards itself, and a guard
+// says "read me once", not "read me alone": a fragment can carry one and still
+// name terms only its includer defines, so written into a consumer it does not
+// compile --
+//
+//   detail/utf8_codecvt_facet.hpp:99: error: unknown type name
+//     'BOOST_UTF8_BEGIN_NAMESPACE'
+//
+// -- and that is worse than not naming it, which at most leaves a declaration
+// to be found elsewhere. Where the header that reads such a fragment belongs
+// to the library it is a module, and the import carries what the fragment
+// declared; where it does not, what is missing says so at the point of use.
+void drop_what_cannot_be_included_alone(
+    std::set<std::string> &names, const std::vector<std::string> &extra_args,
+    std::map<std::string, bool> &settled) {
+  for (auto it = names.begin(); it != names.end();) {
+    auto [at, fresh] = settled.try_emplace(*it, true);
+    if (fresh) at->second = include_stands_alone(*it, extra_args);
+    if (at->second)
+      ++it;
+    else
+      it = names.erase(it);
+  }
+}
+
 // For every consumer source, the set of system C/POSIX include names (e.g.
 // "errno.h", "assert.h", "pthread.h") the consumer needs re-added once the
 // library headers no longer pull them in textually. `import std.compat` cannot
@@ -606,6 +633,8 @@ export std::set<std::string> trace_library_outside_includes(
                  });
   std::set<std::string> out;
   for (auto &p : partials) out.insert(p.begin(), p.end());
+  std::map<std::string, bool> settled;
+  drop_what_cannot_be_included_alone(out, extra_args, settled);
   return out;
 }
 
@@ -639,9 +668,13 @@ trace_consumer_outside_includes(
                                                            library_files);
       });
   std::map<std::string, std::set<std::string>> result;
-  for (std::size_t i = 0; i < consumer_sources.size(); ++i)
+  std::map<std::string, bool> settled;
+  for (std::size_t i = 0; i < consumer_sources.size(); ++i) {
+    if (partials[i].empty()) continue;
+    drop_what_cannot_be_included_alone(partials[i], extra_args, settled);
     if (!partials[i].empty())
       result[consumer_sources[i]] = std::move(partials[i]);
+  }
   return result;
 }
 
