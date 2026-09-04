@@ -33,7 +33,8 @@ public:
                         const std::vector<std::string> &fwd_declared_fqns = {},
                         const std::set<std::string> &same_module_free_fqns = {},
                         const std::set<std::string> *library_headers = nullptr,
-                        std::map<std::string, std::vector<ModPoint>> *external_macro_mods = nullptr)
+                        std::map<std::string, std::vector<ModPoint>> *external_macro_mods = nullptr,
+                        bool gcc_modules = false)
       : ctx(ctx), mods(mods), re(re), export_macro(export_macro),
         shared_export_macro(shared_export_macro),
         linkage_macro(linkage_macro),
@@ -45,7 +46,7 @@ public:
         fwd_declared_fqns(fwd_declared_fqns),
         same_module_free_fqns(same_module_free_fqns),
         library_headers(library_headers),
-        external_macro_mods(external_macro_mods) {}
+        external_macro_mods(external_macro_mods), gcc_modules(gcc_modules) {}
 
   void HandleTranslationUnit(clang::ASTContext &ctx) override {
     std::set<std::string> friend_extern_fqns;
@@ -62,7 +63,7 @@ public:
                           reachable_fqns, internal_fqns, no_internal_filter,
                           defined_fqns, extern_cxx, fwd_declared_fqns,
                           friend_extern_fqns, same_module_free_fqns,
-                          library_headers, external_macro_mods);
+                          library_headers, external_macro_mods, gcc_modules);
     visitor.TraverseDecl(ctx.getTranslationUnitDecl());
     if (used_headers) {
       UsedHeadersVisitor uv(ctx.getSourceManager(), *used_headers);
@@ -516,6 +517,7 @@ private:
   const std::set<std::string> &same_module_free_fqns;
   const std::set<std::string> *library_headers = nullptr;
   std::map<std::string, std::vector<ModPoint>> *external_macro_mods = nullptr;
+  bool gcc_modules = false;
 
   // Record the system-header files of declarations referenced by `qt` into
   // used_headers, so a tool-injected forward declaration whose signature uses

@@ -53,6 +53,10 @@ export struct RewriteOptions {
   // given C++ language linkage in the global module, which is what GCC's
   // modules need to link against implementations that are not module units.
   std::string extern_cxx_macro;
+  // --gcc-modules: gcc does not carry an exported using-directive to an
+  // importer, so under it the members are re-declared one by one instead. See
+  // compiler-bugs/gcc-exported-using-directive.
+  bool gcc_modules = false;
   std::vector<std::string> extra_args;
   bool no_internal_filter = false;
   bool import_std = false;
@@ -1152,7 +1156,7 @@ export HeaderRewriteResult rewrite_header(
             &used_headers, options.defined_fqns, &fwd_decls, options.extern_cxx,
             options.extern_cxx_macro, options.fwd_declared_fqns, options.same_module_free_fqns,
             options.library_headers.empty() ? nullptr : &options.library_headers,
-            &result.external_macro_mods);
+            &result.external_macro_mods, options.gcc_modules);
       });
   tool.run(&factory);
 
@@ -1187,6 +1191,25 @@ export HeaderRewriteResult rewrite_header(
       export_macros.push_back(std::move(m));
   }
 
+  // Source order, which is the order the macros file has to be written in: a
+  // macro used in a later conditional's `#if` must already be defined by an
+  // earlier one. The records do not arrive in it -- what the preprocessor
+  // reported and what the textual scan found are two passes, appended one
+  // after the other -- so gtest-port.h emits the chain that picks a mutex
+  // before the GTEST_HAS_PTHREAD it tests, every arm is then false, and the
+  // macro it was there to define never gets defined:
+  //
+  //   gmock-spec-builders.h:205: error: unknown type name
+  //     'GTEST_DECLARE_STATIC_MUTEX_'
+  //
+  // Stable, and records with no source offset keep the front: they are
+  // synthesized, not read from anywhere.
+  std::ranges::stable_sort(export_macros, [](const MacroRec &a,
+                                             const MacroRec &b) {
+    if ((a.start_off == 0) != (b.start_off == 0)) return a.start_off == 0;
+    return a.start_off < b.start_off;
+  });
+
   // An include the source wrote after a PRIVATE macro definition has to stay
   // where it is. A private macro is one the header `#undef`s before it ends,
   // so it never moves to the macros file — and hoisting the include to the
@@ -1201,6 +1224,15 @@ export HeaderRewriteResult rewrite_header(
   //
   // Standard-library headers are exempt for the same reason as in the GMF
   // ordering: they cannot depend on this library's macros.
+  // And the closing half of a macro bracket, wherever it sits: it takes back
+  // what the declarations above it were written in, so it belongs after them.
+  for (auto &inc : includes) {
+    if (inc.transitive || inc.skip_gmf) continue;
+    auto resolved = resolve_include(inc.path, header_path, options.extra_args);
+    if (!resolved.empty() && is_closing_bracket_half(read_file(resolved)))
+      inc.skip_gmf = true;
+  }
+
   {
     unsigned first_private_off = 0;
     for (auto &m : impl_macros)

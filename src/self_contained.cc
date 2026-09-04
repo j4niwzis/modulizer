@@ -2,7 +2,6 @@ module;
 
 export module modulizer.self_contained;
 import modulizer.include_analysis;
-import modulizer.rewrite_macros;
 import modulizer.util;
 import libtooling;
 import std;
@@ -86,10 +85,21 @@ bool is_bracket_half(const std::string &src) {
   //
   //   config_def_macros.h:16: error: you have nested config_def #inclusion.
   //
-  // The refusal is what marks it. A header that merely defines a flag is
-  // ordinary; one that treats reading it twice in a row as an error is written
-  // to be pasted around something, exactly like the pragma halves.
-  bool refuses_out_of_turn = false, pending_flag_test = false;
+  // The whole shape is what marks it: a bare test of ONE macro, an #error in
+  // one arm, and the same macro set or cleared in the other. A header that
+  // merely raises an #error about something it does not control is ordinary --
+  // gtest-port.h refuses C++ before 17 and refuses a libc++ without wide
+  // characters, and it is a header like any other.
+  std::string flag;              // the macro the open conditional tests
+  bool saw_error = false;        // and whether it refuses inside that test
+  bool saw_toggle = false;       // and sets or clears the same one
+  bool macro_bracket = false;
+  auto first_word = [](std::string_view a) {
+    auto b = a.find_first_not_of(" \t");
+    if (b == std::string_view::npos) return std::string_view();
+    auto e = a.find_first_of(" \t\r", b);
+    return a.substr(b, e == std::string_view::npos ? e : e - b);
+  };
   std::size_t pos = 0;
   while (pos < src.size()) {
     auto nl = src.find('\n', pos);
@@ -99,20 +109,28 @@ bool is_bracket_half(const std::string &src) {
     auto d = parse_directive(line, /*skip_hash_ws=*/true,
                              /*keyword_ends_crlf=*/true);
     if (!d) continue;
-    if (d->keyword == "ifdef" || d->keyword == "ifndef" ||
-        d->keyword == "if")
-      pending_flag_test = true;
-    else if (d->keyword == "error" && pending_flag_test)
-      refuses_out_of_turn = true;
-    else if (d->keyword == "endif")
-      pending_flag_test = false;
+    if (d->keyword == "ifdef" || d->keyword == "ifndef") {
+      flag = std::string(first_word(d->after));
+      saw_error = saw_toggle = false;
+    } else if (d->keyword == "if") {
+      flag.clear();  // a compound condition is not this shape
+    } else if (d->keyword == "error" && !flag.empty()) {
+      saw_error = true;
+    } else if ((d->keyword == "define" || d->keyword == "undef") &&
+               !flag.empty() && first_word(d->after) == flag) {
+      saw_toggle = true;
+    } else if (d->keyword == "endif") {
+      if (saw_error && saw_toggle) macro_bracket = true;
+      flag.clear();
+      saw_error = saw_toggle = false;
+    }
     if (d->keyword != "pragma") continue;
     // Only the state-stacking pragmas: `#pragma once` and
     // `#pragma warning(disable: …)` stack nothing.
     if (d->after.contains("push")) ++depth;
     if (d->after.contains("pop")) --depth;
   }
-  return depth != 0 || (refuses_out_of_turn && !header_guards_itself(src));
+  return depth != 0 || macro_bracket;
 }
 
 // One place a header is included from: which header does it, and what that

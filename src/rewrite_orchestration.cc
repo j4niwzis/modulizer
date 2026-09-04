@@ -326,6 +326,8 @@ export struct RewriteBatchConfig {
   // Name of the macro the extern "C++" wrapping is written behind, or empty
   // for an unconditional block. See RewriteOptions::extern_cxx_macro.
   std::string extern_cxx_macro;
+  // --gcc-modules. See RewriteOptions::gcc_modules.
+  bool gcc_modules = false;
   bool import_std = false;
   bool cc_only = false;
   bool wrapper_module = false;
@@ -361,6 +363,7 @@ RewriteOptions make_rewrite_options(const RewriteBatchConfig &cfg,
   o.reachable_fqns = reachable_fqns;
   o.extern_cxx = cfg.extern_cxx;
   o.extern_cxx_macro = cfg.extern_cxx_macro;
+  o.gcc_modules = cfg.gcc_modules;
   o.extra_args = extra_args;
   if (auto it = cfg.context_args.find(std::string(src));
       it != cfg.context_args.end())

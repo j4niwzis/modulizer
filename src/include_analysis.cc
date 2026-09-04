@@ -248,6 +248,36 @@ export std::vector<IncludeDirective> parse_includes(const std::string &src) {
   return includes;
 }
 
+// The closing half of a macro bracket: no include guard of its own, and every
+// directive in it takes a macro back. It is written to be read at one
+// particular point -- after the declarations spelled in the terms its partner
+// defined -- so it cannot be hoisted. Hoisted, it lands next to the half that
+// opened the bracket and the terms are gone before anything uses them:
+//
+//   iterator_concepts.hpp:51: error: a type specifier is required for all
+//     declarations, and: use of undeclared identifier 'ReadableIterator'
+//
+// The opening half is not like this: what it defines survives wherever it is
+// read, so hoisting it is fine and only the close has to stay put.
+export bool is_closing_bracket_half(const std::string &src) {
+  bool saw_undef = false;
+  std::size_t pos = 0;
+  while (pos < src.size()) {
+    auto nl = src.find('\n', pos);
+    if (nl == std::string::npos) nl = src.size();
+    auto line = std::string_view(src).substr(pos, nl - pos);
+    pos = nl + 1;
+    auto d = parse_directive(line, /*skip_hash_ws=*/true,
+                             /*keyword_ends_crlf=*/true);
+    if (!d) continue;
+    if (d->keyword == "undef") { saw_undef = true; continue; }
+    // Anything else -- a guard, a define, a conditional, an include -- means
+    // this is a header that happens to undefine something, not a bracket half.
+    return false;
+  }
+  return saw_undef;
+}
+
 export bool is_xmacro_include(const std::string &path) {
   return path.ends_with(".inc") || path.ends_with(".def");
 }

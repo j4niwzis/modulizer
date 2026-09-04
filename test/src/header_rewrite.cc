@@ -279,25 +279,45 @@ TEST(HeaderRewrite, ModuleReplacesCrossLibraryAddsImport) {
       << "the replaced header must not stay as a raw include";
 }
 
-TEST(HeaderRewrite, HoistsUsingNamespaceMembersAsDeclarations) {
+TEST(HeaderRewrite, ExportsTheUsingDirectiveItself) {
   // A namespace-scope `using namespace X;` makes X's members visible in the
   // enclosing namespace, and that is how consumers named `wraplib::Baz` (which
-  // lives in `wraplib::adl_guard`). Exporting the directive is well-formed —
-  // [module.interface]/2 makes it an exported declaration, and the example
-  // there says so — but gcc 15 does not carry it to an importer, in either
-  // -std=c++20 or -std=c++23, so the members are not there. A
-  // using-DECLARATION crosses on both compilers, so one per member is emitted
-  // after the directive, which stays for the header's own lookups.
+  // lives in `wraplib::adl_guard`). Exporting the directive carries that:
+  // [module.interface]/2 makes it an exported declaration and the example there
+  // says so, and it is what an ADL barrier needs — the members are reachable
+  // through it without being DECLARED in the enclosing namespace, so an
+  // unqualified call at the point of use still finds only what it should.
   auto r = rewrite_header(data_path("wraplib/producer.h"), "wraplib",
                           RewriteOptions{.cc_only = true});
+  EXPECT_NE(r.cc_content.find("WRAPLIB_EXPORT using namespace adl_guard;"),
+            std::string::npos)
+      << "the directive is what carries the members; got:\n"
+      << r.cc_content;
+  EXPECT_EQ(r.cc_content.find("WRAPLIB_EXPORT using adl_guard::Baz;"),
+            std::string::npos)
+      << "and re-declaring each one is not wanted here: it puts the name in "
+         "the enclosing namespace, which is what the barrier exists to avoid";
+}
+
+TEST(HeaderRewrite, ReDeclaresEachMemberForGccModules) {
+  // gcc does not carry an exported using-directive to an importer, in either
+  // -std=c++20 or -std=c++23, so the members are simply not there:
+  //
+  //   error: 'Baz' is not a member of 'wraplib'
+  //
+  // See compiler-bugs/gcc-exported-using-directive. Under --gcc-modules the
+  // members are re-declared one by one, which crosses on both compilers — at
+  // the cost of putting each name in the enclosing namespace, so it is not the
+  // default.
+  auto r = rewrite_header(
+      data_path("wraplib/producer.h"), "wraplib",
+      RewriteOptions{.gcc_modules = true, .cc_only = true});
   EXPECT_NE(r.cc_content.find("WRAPLIB_EXPORT using adl_guard::Baz;"),
             std::string::npos)
-      << "each member needs a declaration of its own to cross the boundary";
-  EXPECT_EQ(r.cc_content.find("WRAPLIB_EXPORT using namespace adl_guard;"),
-            std::string::npos)
-      << "and the directive itself is not what carries them";
+      << "each member needs a declaration of its own to cross on gcc; got:\n"
+      << r.cc_content;
   EXPECT_NE(r.cc_content.find("using namespace adl_guard;"), std::string::npos)
-      << "though it stays, for the header's own unqualified lookups";
+      << "and the directive stays, for the header's own unqualified lookups";
 }
 
 TEST(HeaderRewrite, InsertsLibraryExport) {
@@ -2133,14 +2153,26 @@ TEST(HeaderRewrite, ExportsTargetOfExportedUsingDeclaration) {
 
 TEST(HeaderRewrite, ExportsNamespaceUsingDirective) {
   // directive.h pulls `adl_guard` members into `usinglib` with a using-DIRECTIVE
-  // (`using namespace adl_guard;`, the ADL-suppression pattern). Consumers name
-  // `usinglib::pointer_thing`, which lives in `usinglib::adl_guard`, so each
-  // member gets an exported using-declaration: the directive alone declares no
-  // name and does not reach an importer.
+  // (`using namespace adl_guard;`, the ADL-suppression pattern). Exporting the
+  // directive is what carries them, and it leaves the members reachable THROUGH
+  // it rather than declared beside it, which is what the pattern is for.
   auto r = rewrite_header(data_path("usinglib/directive.h"), "usinglib.directive");
+  EXPECT_NE(r.h_content.find("USINGLIB_EXPORT using namespace adl_guard;"),
+            std::string::npos)
+      << "the directive is what an importer sees; got:\n"
+      << r.h_content;
+}
+
+TEST(HeaderRewrite, ExportsNamespaceUsingDirectiveMembersForGccModules) {
+  // gcc does not carry the directive (compiler-bugs/gcc-exported-using-directive),
+  // so under --gcc-modules each member gets a declaration of its own instead.
+  auto r = rewrite_header(data_path("usinglib/directive.h"),
+                          "usinglib.directive",
+                          RewriteOptions{.gcc_modules = true});
   EXPECT_NE(r.h_content.find("USINGLIB_EXPORT using adl_guard::pointer_thing;"),
             std::string::npos)
-      << "a using-declaration per member is what an importer can see";
+      << "a using-declaration per member is what gcc's importer can see; got:\n"
+      << r.h_content;
 }
 
 TEST(HeaderRewrite, DoesNotExternCxxFriendTemplateInsideClass) {
@@ -2965,6 +2997,27 @@ TEST(HeaderRewrite, DoesNotMarkIntoAMacroBodyAClassExpands) {
   EXPECT_EQ(body.find("_EXPORT"), std::string::npos)
       << "and neither can an export; got:\n"
       << body;
+  // But the namespace-scope expansion still needs one. Without it the entity
+  // is attached to the module and never exported, and an importer cannot find
+  // it by ADL:
+  //
+  //   stl_algobase.h:461: error: invalid operands to binary expression
+  //     ('counting_iterator<int>' and 'counting_iterator<int>')
+  //
+  // So the marker goes on the expansion instead of into the body.
+  EXPECT_NE(r.h_content.find("FRIENDMACRO_LIB_EXPORT FRIENDMACRO_PLUS_HEAD(inline,"),
+            std::string::npos)
+      << "the definition at namespace scope must be exported; got:\n"
+      << r.h_content;
+  // And exported alone. A linkage-specification would attach it to the global
+  // module, while the friend the class wrote is attached to this one:
+  //
+  //   iterator_facade.hpp:891: error: declaration of 'operator+' in the global
+  //     module follows declaration in module boost.iterator.iterator_facade
+  EXPECT_EQ(r.h_content.find("_EXPORT extern \"C++\" FRIENDMACRO_PLUS_HEAD"),
+            std::string::npos)
+      << "no linkage specification on it; got:\n"
+      << r.h_content;
 }
 
 TEST(HeaderRewrite, RecognisesAGuardSpelledWithATrailingUnderscore) {
@@ -2996,8 +3049,10 @@ TEST(HeaderRewrite, QualifiesAReExportForTheScopeItIsWrittenIn) {
   //
   //   advance.hpp:90:30: error: use of undeclared identifier
   //     'advance_adl_barrier'; did you mean 'iterators::advance_adl_barrier'?
-  auto r = rewrite_header(data_path("adlq/barrier.h"), "adlq_lib",
-                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto r = rewrite_header(
+      data_path("adlq/barrier.h"), "adlq_lib",
+      RewriteOptions{.gcc_modules = true,
+                     .extra_args = {"-I", gDataDir}});
   EXPECT_NE(r.h_content.find("using barrier::thing;"), std::string::npos)
       << "inside the namespace that contains it, the short name is right; "
          "got:\n"
@@ -3007,4 +3062,28 @@ TEST(HeaderRewrite, QualifiesAReExportForTheScopeItIsWrittenIn) {
       << "one scope further out it must be reached through the namespace that "
          "holds it; got:\n"
       << r.h_content;
+}
+
+TEST(HeaderRewrite, DoesNotHoistTheClosingHalfOfABracket) {
+  // A file with no include guard that does nothing but #undef is the closing
+  // half of a bracket: it is read at one particular point, after the
+  // declarations written in the terms its partner defined. Hoisted into the
+  // global module fragment it lands right after the opening half, and the
+  // terms are gone before the purview reads the header that needs them:
+  //
+  //   iterator_concepts.hpp:51:26: error: a type specifier is required for
+  //     all declarations
+  //   iterator_concepts.hpp:51:40: error: use of undeclared identifier
+  //     'ReadableIterator'
+  //
+  // The opening half may be hoisted — what it defines survives into the
+  // purview — but the closing half has to stay where it closes.
+  auto r = rewrite_header(data_path("undefhalf/api.hpp"), "undefhalf_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto purview = r.cc_content.find("export module");
+  ASSERT_NE(purview, std::string::npos) << r.cc_content;
+  auto close = r.cc_content.find("undefhalf/close.hpp");
+  EXPECT_TRUE(close == std::string::npos || close > purview)
+      << "the closing half must not be hoisted above the purview; got:\n"
+      << r.cc_content;
 }
