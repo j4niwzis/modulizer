@@ -493,6 +493,10 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     std::vector<ModPoint> &mods, const std::vector<MacroRec> &export_macros,
     const std::set<std::string> &block_defined_names,
     const std::vector<std::pair<unsigned, unsigned>> &block_ranges,
+    // Chains that choose between arms and are not emitted whole. Their
+    // definitions stay in the header, where the arm still selects them; the
+    // macros file gets the chain's directives instead.
+    const std::vector<std::pair<unsigned, unsigned>> &unemitted_arm_ranges,
     const std::string &original,
     // A header that is re-read at every inclusion computes its macros from the
     // state at that point, and a second copy of that machine left in the body
@@ -503,7 +507,9 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
   if (reincludable) {
     for (auto &m : export_macros) {
       if (m.end_off <= m.start_off) continue;
-      if (!m.name.empty() && inside_block(block_ranges, m)) continue;
+      if (!m.name.empty() &&
+          (inside_block(block_ranges, m) || inside_block(unemitted_arm_ranges, m)))
+        continue;
       ranges.push_back({m.start_off, m.end_off});
       mods.push_back({m.start_off, m.end_off - m.start_off, ""});
     }
@@ -519,6 +525,7 @@ std::vector<std::pair<unsigned, unsigned>> collect_stripped_ranges(
     // to retract and no definition after it, so the macro ends up undefined
     // for everyone who includes the header.
     if (inside_block(block_ranges, m)) continue;
+    if (inside_block(unemitted_arm_ranges, m)) continue;
     ranges.push_back({m.start_off, m.end_off});
     auto guard = override_guard_with_code(original, m.start_off, m.name);
     if (guard.active) {
@@ -1157,7 +1164,10 @@ export HeaderRewriteResult rewrite_header(
   // Textually extract ALL #define lines from the original header,
   // including those inside inactive #if blocks. These are needed so that
   // guard macros in the GMF resolve correctly on any platform.
-  extract_textual_macros(original, macros);
+  std::vector<std::pair<unsigned, unsigned>> unemitted_arm_ranges;
+  std::vector<std::pair<unsigned, unsigned>> rejection_ranges;
+  extract_textual_macros(original, macros, &unemitted_arm_ranges,
+                         &rejection_ranges);
 
   // A macro whose name is (re)defined inside an emitted conditional block must
   // not also be emitted as a bare unconditional #define from the active set:
@@ -1219,8 +1229,15 @@ export HeaderRewriteResult rewrite_header(
   // the macros file (applied by build_macros_file), never to the header body,
   // where the macro definition is stripped out entirely.
   auto stripped_macro_ranges = collect_stripped_ranges(
-      mods, export_macros, block_defined_names, block_ranges, original,
-      !header_guards_itself(original));
+      mods, export_macros, block_defined_names, block_ranges,
+      unemitted_arm_ranges, original, !header_guards_itself(original));
+
+  // A block that rejects one of this header's own macros as user input goes
+  // out whole. The header reads its generated macros file above that block, so
+  // what the rejection finds there is the library's own definition, and the
+  // header errors out on the first read of it.
+  for (auto [rs, re] : rejection_ranges)
+    mods.push_back({rs, re - rs, ""});
 
   // The header body keeps the raw macro invocation; the export markers the
   // visitor placed INSIDE a macro definition (spelling locations) belong to the
@@ -1362,7 +1379,7 @@ export HeaderRewriteResult rewrite_header(
     result.macros_content = build_macros_file(
         export_macros, extra_macro_includes, block_support_includes,
         block_defined_names, block_ranges, original, mods, export_include,
-        header_guards_itself(original));
+        header_guards_itself(original), unemitted_arm_ranges);
     result.macros_name = macros_name;
     // The macro definitions moved out of the header into the macros file, and
     // the body still uses them (`GTEST_INTERNAL_HAS_INCLUDE(<span>)`). The
@@ -1479,10 +1496,14 @@ export HeaderRewriteResult rewrite_header(
       std::set<std::string> errored;
       std::size_t pos = 0;
       std::string pending_cond;
-      while (pos < hdr.size()) {
-        auto nl = hdr.find('\n', pos);
-        if (nl == std::string::npos) nl = hdr.size();
-        auto line = std::string_view(hdr).substr(pos, nl - pos);
+      // The source, not the rewritten header: the check itself is cut out of
+      // the header (it judges a macro this file defines, and the macros file
+      // supplies that definition above it), and the names it named have to
+      // outlive it.
+      while (pos < original.size()) {
+        auto nl = original.find('\n', pos);
+        if (nl == std::string::npos) nl = original.size();
+        auto line = std::string_view(original).substr(pos, nl - pos);
         auto d = parse_directive(line);
         if (d && (d->keyword == "if" || d->keyword == "elif"))
           pending_cond = d->after;

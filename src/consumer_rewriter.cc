@@ -292,7 +292,7 @@ export std::string rewrite_consumer_source(
             kStdProvidedCHeaders.count(inc->path)) {
           pos = nl + 1;
           ++src_line;
-          if (insert_at) insert_at_src_line = src_line;
+          if (insert_at) out.push_back(std::format("#line {}\n", src_line));
           if (pos >= src.size()) break;
           continue;
         }
@@ -302,7 +302,10 @@ export std::string rewrite_consumer_source(
             inc->path != "climits") {
           pos = nl + 1;
           ++src_line;
-          if (insert_at) insert_at_src_line = src_line;
+          // Gone from the body, like the two above: the count is picked up
+          // here, where the gap is, and not at the end of a block that sits
+          // somewhere else entirely.
+          if (insert_at) out.push_back(std::format("#line {}\n", src_line));
           if (pos >= src.size()) break;
           continue;
         }
@@ -339,7 +342,11 @@ export std::string rewrite_consumer_source(
             hoisted_system_includes.push_back(line);
             pos = nl + 1;
             ++src_line;
-            insert_at_src_line = src_line;
+            // The line has left the body from BELOW the block, so the count
+            // has to be picked up again here rather than where the block
+            // ends: what follows is no longer the line after the one before
+            // it. One `#line` cannot say both.
+            out.push_back(std::format("#line {}\n", src_line));
             if (pos >= src.size()) break;
             continue;
           }
