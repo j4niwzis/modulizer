@@ -823,3 +823,85 @@ TEST(ConsumerRewrite, StillProvidesAReplacedHeaderTheSourceNeverIncluded) {
       << "and the include for the build that has not; got:\n"
       << out;
 }
+
+TEST(ConsumerRewrite, ReadsStringHAheadOfEverythingElseTheBlockBrings) {
+  // <string.h> is read for gcc's sake, and it has to be read before any
+  // import — that is the whole of what it is for. The block it sits in also
+  // carries other consumers' headers, and one of those imports std itself,
+  // so last in the block is still below an import:
+  //
+  //   string.h:105: error: redefinition of 'void* memchr(void*, int, size_t)'
+  //   note: 'void* memchr(void*, int, size_t)' previously defined here
+  //   ... of module std.compat, imported at <a header the block brought in>
+  //
+  // First in the block is the only place that holds.
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.is_header = false;
+  cfg.required_system_includes = {"outside/gadget.h"};
+  auto out = rewrite_consumer_source(
+      "#include \"peer.h\"\nint main() { return 0; }\n", cfg);
+  auto sh = out.find("#include <string.h>");
+  ASSERT_NE(sh, std::string::npos) << "not read at all; got:\n" << out;
+  auto other = out.find("#include <outside/gadget.h>");
+  ASSERT_NE(other, std::string::npos) << "got:\n" << out;
+  EXPECT_LT(sh, other) << "string.h must lead the block, since anything else "
+                          "in it may import std; got:\n"
+                       << out;
+}
+
+TEST(ConsumerRewrite, LiftsAStdProvidedCHeaderAboveTheBlocksOwnHeaders) {
+  // <time.h> and its kind declare what the std module also declares, so a
+  // translation unit that reads one after importing std defines those twice:
+  //
+  //   bits/types/struct_tm.h:7: error: redefinition of 'struct tm'
+  //   note: previous definition, of module std.compat, imported at
+  //         gmock-matchers_test.h:40
+  //
+  // The import is not in this file. The block hands over another consumer's
+  // header, that header imports std itself, and a C header written after it
+  // in the block is already too late. They go to the front of the block, as
+  // <string.h> does and for the same reason.
+  ConsumerRewriteOptions cfg;
+  cfg.import_std = true;
+  cfg.is_header = false;
+  // Sorted, so the peer header is handed over first and the C header second —
+  // which is the order that breaks.
+  cfg.required_system_includes = {"peer/other.h", "time.h"};
+  auto out = rewrite_consumer_source("int main() { return 0; }\n", cfg);
+  auto th = out.find("#include <time.h>");
+  auto peer = out.find("#include <peer/other.h>");
+  ASSERT_NE(th, std::string::npos) << "dropped altogether; got:\n" << out;
+  ASSERT_NE(peer, std::string::npos) << "got:\n" << out;
+  EXPECT_LT(th, peer)
+      << "a std-provided C header must lead the block, since anything else in "
+         "it may import std; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, LeavesAThirdPartyIncludeBelowTheImportItFollowed) {
+  // The block sits where the first replaced include stood, and system headers
+  // are lifted into it so none is read after an import. A third-party header
+  // is not one of those: lifting it moves it above the import it used to
+  // follow, and the library it belongs to is read in an order its own headers
+  // never arranged for —
+  //
+  //   boost/mpl/aux_/integral_wrapper.hpp:42: error: unknown type name
+  //                                          'AUX_WRAPPER_VALUE_TYPE'
+  //
+  // which is an x-macro header, read once per wrapper with the wrapper's
+  // macros defined around it. It keeps its place.
+  ConsumerRewriteOptions cfg;
+  cfg.include_to_module = {{"lib/thing.h", {"lib.thing", ""}}};
+  auto out = rewrite_consumer_source(
+      "#include <lib/thing.h>\n#include <other/aux.h>\nint main() { return 0; }\n",
+      cfg);
+  auto imp = out.find("import lib.thing;");
+  auto other = out.find("#include <other/aux.h>");
+  ASSERT_NE(imp, std::string::npos) << "got:\n" << out;
+  ASSERT_NE(other, std::string::npos) << "got:\n" << out;
+  EXPECT_LT(imp, other)
+      << "the import stands where the include it replaced stood, above what "
+         "followed it; got:\n"
+      << out;
+}

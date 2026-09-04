@@ -2757,3 +2757,50 @@ TEST(HeaderRewrite, GeneratedHeaderSkipsAReplacedIncludeWhereItIsAModule) {
       << "and stay inside the library's own guard; got:\n"
       << r.h_content;
 }
+
+TEST(HeaderRewrite, KeepsTheArmAMacroWasDefinedUnder) {
+  // A macro defined inside one arm of an #if/#elif chain is defined only for
+  // the compiler that arm is about. Hoisted into the macros file without it,
+  // the body is read by every compiler, and its inner conditions are written
+  // in the absent compiler's terms — undefined names, which the preprocessor
+  // reads as 0 and finds true:
+  //
+  //   #if _MSC_FULL_VER < 190024210   // 0 < 190024210, on clang
+  //   #  undef BOOST_MP11_CONSTEXPR
+  //   #  define BOOST_MP11_CONSTEXPR  // and now it is nothing
+  //
+  // Boost.Mp11 loses every constexpr that way, and the failure lands far from
+  // here, on the users of the macro:
+  //
+  //   error: constexpr variable 'r' must be initialized by a constant
+  //          expression
+  //   note: non-constexpr function 'construct_from_tuple<...>' cannot be used
+  //         in a constant expression
+  auto r = rewrite_header(data_path("branchmac/flavor.h"), "branchmac",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  // What the file leaves the macro AT, read here, on a compiler that is not
+  // the one the arm is about. Asking whether the arm's definition appears at
+  // all says nothing when it does not — the question is whether reading this
+  // file would take the width away, and the answer has to be no whether the
+  // arm was carried with its condition or left behind altogether.
+  auto last = r.macros_content.rfind("BRANCHMAC_WIDTH");
+  ASSERT_NE(last, std::string::npos)
+      << "no macros file to speak of; got:\n"
+      << r.macros_content;
+  auto eol = r.macros_content.find('\n', last);
+  auto line = r.macros_content.substr(
+      last, eol == std::string::npos ? std::string::npos : eol - last);
+  EXPECT_NE(line.find("64"), std::string::npos)
+      << "the arm's redefinition is the one left standing, so every compiler "
+         "reads the width the arm's own compiler wanted; got:\n"
+      << r.macros_content;
+  // And the arm's own name never arrives without the condition that selects
+  // it, whichever way the arm was handled.
+  auto at = r.macros_content.find("BRANCHMAC_WIDTH 32");
+  if (at != std::string::npos)
+    EXPECT_NE(r.macros_content.substr(0, at).find("_MSC_VER"),
+              std::string::npos)
+        << "carried out of its arm; got:\n"
+        << r.macros_content;
+}
+

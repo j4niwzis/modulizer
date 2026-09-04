@@ -168,6 +168,9 @@ export void extract_textual_macros(const std::string &original,
     bool is_zero;       // `#if 0` (dead on every platform)
     bool has_define;    // contains a non-guard #define (in any nested branch)
     bool has_code;      // contains a non-preprocessor (declaration) line
+    // Has `#elif`/`#else` arms, so what is inside it belongs to one arm and
+    // not to the block as a whole.
+    bool has_arms = false;
     // Conditionals closed while this one was open, as indices into `cands`.
     std::vector<std::size_t> children;
   };
@@ -181,6 +184,7 @@ export void extract_textual_macros(const std::string &original,
   struct Cand {
     std::size_t start, end;
     bool worth;
+    bool has_arms = false;
     std::vector<std::size_t> children;
   };
   std::vector<Cand> cands;
@@ -236,7 +240,7 @@ export void extract_textual_macros(const std::string &original,
           auto ns = rest.find_first_not_of(" \t");
           is_zero = ns != std::string_view::npos && rest[ns] == '0';
         }
-        blocks.push_back({pos, is_zero, false, false, {}});
+        blocks.push_back({pos, is_zero, false, false, false, {}});
       } else if (dir == "endif") {
         if (!blocks.empty()) {
           auto b = std::move(blocks.back());
@@ -249,7 +253,7 @@ export void extract_textual_macros(const std::string &original,
           // enclosing block that gets emitted — is settled after the scan.
           cands.push_back({b.start, nl + 1,
                            b.has_define && !b.has_code && !b.is_zero,
-                           std::move(b.children)});
+                           b.has_arms, std::move(b.children)});
           auto idx = cands.size() - 1;
           if (!blocks.empty())
             blocks.back().children.push_back(idx);
@@ -257,7 +261,10 @@ export void extract_textual_macros(const std::string &original,
             roots.push_back(idx);
         }
       } else if (dir == "else" || dir == "elif") {
-        // keep blocks unchanged
+        // keep blocks unchanged, but remember that this one chooses between
+        // arms: what is nested inside belongs to the arm it sits in, which is
+        // not something recorded here.
+        if (!blocks.empty()) blocks.back().has_arms = true;
       } else if (dir == "define" && !d->after.empty()) {
         if (blocks.empty()) {
           capture_macro(line, d->hash_pos, nl);
@@ -314,6 +321,35 @@ export void extract_textual_macros(const std::string &original,
                         (unsigned)c.start, (unsigned)c.end});
       return;
     }
+    // An unemitted block with arms takes what is inside it down too. A nested
+    // block means
+    // what its enclosing one says it means: emitted on its own it is read by
+    // every build, including the ones the enclosing condition was there to
+    // exclude —
+    //
+    //   #if defined(__clang__)
+    //   ...
+    //   #elif defined(_MSC_VER)
+    //   #  if _MSC_FULL_VER < 190024210
+    //   #    undef LIB_CONSTEXPR
+    //   #    define LIB_CONSTEXPR      // nothing, for a compiler this is not
+    //   #  endif
+    //   #endif
+    //
+    // and `_MSC_FULL_VER` is undefined elsewhere, which the preprocessor reads
+    // as 0 and finds true. Boost.Mp11 loses every constexpr that way.
+    //
+    // The arm cannot be carried along instead: the enclosing record spans the
+    // whole chain from `#if` to `#endif`, and which arm a nested block sits in
+    // is not something the scan keeps. What the active branch defines is
+    // captured macro by macro regardless, so what goes unemitted here is only
+    // what another platform would have defined — which is the part that must
+    // not be written unconditionally.
+    //
+    // Without arms there is nothing to be in the wrong one of, and descending
+    // is what a header whose include guard wraps the whole file needs: that
+    // guard holds code by definition, and everything real is nested in it.
+    if (c.has_arms) return;
     // Siblings are recorded as they close, which for siblings is source order —
     // and source order is what has to be kept, since a macro used in a later
     // conditional's `#if` must already be defined by an earlier one.
