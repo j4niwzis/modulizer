@@ -1,0 +1,5 @@
+# Reproducer build artifacts
+gcm.cache/
+*.pcm
+*.bmi
+*.o

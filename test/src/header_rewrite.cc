@@ -282,11 +282,12 @@ TEST(HeaderRewrite, ModuleReplacesCrossLibraryAddsImport) {
 TEST(HeaderRewrite, HoistsUsingNamespaceMembersAsDeclarations) {
   // A namespace-scope `using namespace X;` makes X's members visible in the
   // enclosing namespace, and that is how consumers named `wraplib::Baz` (which
-  // lives in `wraplib::adl_guard`). Exporting the directive does not carry it
-  // across a module boundary — a using-directive declares no name, so there is
-  // nothing for the export to apply to and an importer's lookup never sees the
-  // members. A using-DECLARATION does declare a name, so one per member is
-  // emitted after the directive, which stays for the header's own lookups.
+  // lives in `wraplib::adl_guard`). Exporting the directive is well-formed —
+  // [module.interface]/2 makes it an exported declaration, and the example
+  // there says so — but gcc 15 does not carry it to an importer, in either
+  // -std=c++20 or -std=c++23, so the members are not there. A
+  // using-DECLARATION crosses on both compilers, so one per member is emitted
+  // after the directive, which stays for the header's own lookups.
   auto r = rewrite_header(data_path("wraplib/producer.h"), "wraplib",
                           RewriteOptions{.cc_only = true});
   EXPECT_NE(r.cc_content.find("WRAPLIB_EXPORT using adl_guard::Baz;"),
