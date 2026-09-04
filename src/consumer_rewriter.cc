@@ -177,6 +177,7 @@ export std::string rewrite_consumer_source(
   // they stood. The block below leaves those alone; anything else a module
   // provides is still the block's to hand over, since the source never asked
   // for it and there is no pair in place to do it.
+  std::set<std::pair<std::string, std::string>> imported_guards;
   std::set<std::string> replaced_in_source;
   {
     std::size_t pos = 0;
@@ -218,6 +219,7 @@ export std::string rewrite_consumer_source(
             !options.include_to_module.count(inc->path)) {
           const auto &mod = rep->module;
           replaced_in_source.insert(inc->path);
+          imported_guards.insert({rep->guard, mod});
           out.push_back(std::format("#if defined({})\n", rep->guard));
           out.push_back(std::format("import {};\n", mod));
           if (rep->carries_macros_file) {
@@ -253,8 +255,10 @@ export std::string rewrite_consumer_source(
             // import is subject to the same condition and arrives at the same
             // point in the file.
             if (!insert_at) insert_at = outermost_cond_start;
-            if (!options.dual_macro.empty())
+            if (!options.dual_macro.empty()) {
+              imported_guards.insert({options.dual_macro, mod});
               out.push_back(std::format("#if defined({})\n", options.dual_macro));
+            }
             if (!have_import) out.push_back(std::format("import {};\n", mod));
             if (!have_macro)
               out.push_back(probed
@@ -443,6 +447,7 @@ export std::string rewrite_consumer_source(
     // reason the plain copy is refused above.
     if (auto *rep = find_replacement(inc, options.module_replacements);
         rep && !rep->guard.empty()) {
+      imported_guards.insert({rep->guard, rep->module});
       block += std::format("#if defined({})\n", rep->guard);
       block += std::format("import {};\n", rep->module);
       if (rep->carries_macros_file) {
@@ -461,6 +466,7 @@ export std::string rewrite_consumer_source(
   for (auto &r : options.required_module_includes) {
     for (auto &inc : r.headers) {
       if (already_above_block(inc)) continue;
+      imported_guards.insert({r.guard, r.module});
       block += std::format("#if defined({})\n", r.guard);
       block += std::format("import {};\n", r.module);
       if (r.carries_macros_file) {
@@ -522,6 +528,10 @@ export std::string rewrite_consumer_source(
   if (options.dual_macro.empty()) {
     block += modular;
   } else if (!modular.empty() || !replaced_includes.empty()) {
+    for (auto &m : pending_imports)
+      imported_guards.insert({options.dual_macro, m});
+    for (auto &m : options.traced_imports)
+      imported_guards.insert({options.dual_macro, m});
     block += std::format("#if defined({})\n", options.dual_macro);
     block += modular;
     block += "#else\n";
@@ -536,6 +546,25 @@ export std::string rewrite_consumer_source(
       out.insert(out.begin() + static_cast<std::ptrdiff_t>(*insert_at), block);
     else
       out.insert(out.begin(), block);
+  }
+
+  // What this unit imports, said once at the top, above every include. A
+  // header cannot see the imports below it, and the include that duplicates
+  // one is routinely above it anyway:
+  //
+  //   test:23  -> deps/boost/system/result.hpp   (never converted)
+  //            -> variant2's own variant.hpp, read textually
+  //   test:93  import boost.variant2.variant;
+  //
+  // Seventy lines apart, and the first is what the second collides with. So
+  // the flag goes where nothing can be read before it, and says what holds for
+  // the whole unit rather than for the point it is written at.
+  if (!imported_guards.empty()) {
+    std::string flags;
+    for (auto &[g, mod] : imported_guards)
+      flags += std::format("#if defined({})\n#define {} 1\n#endif\n", g,
+                           imported_flag(mod));
+    out.insert(out.begin(), flags);
   }
 
   std::string result;

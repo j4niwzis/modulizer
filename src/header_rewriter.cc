@@ -625,6 +625,31 @@ std::string assemble_interface_cc(
   if (!header_comment.empty()) cc += header_comment + "\n\n";
   cc += "module;\n";
 
+  // What this unit imports, said before the fragment reads anything. The
+  // imports themselves sit below the module declaration, where no include can
+  // see them, and a fragment include reaching a provider's header through some
+  // library nobody converted is exactly the include that must stand down here.
+  {
+    std::set<std::pair<std::string, std::string>> flags;
+    for (const auto &imp : purview_imports) {
+      auto at = imp.find("#if defined(");
+      if (at == std::string::npos) continue;
+      auto open = at + std::strlen("#if defined(");
+      auto close = imp.find(')', open);
+      if (close == std::string::npos) continue;
+      auto imp_at = imp.find("import ", close);
+      if (imp_at == std::string::npos) continue;
+      imp_at += std::strlen("import ");
+      auto semi = imp.find(';', imp_at);
+      if (semi == std::string::npos) continue;
+      flags.insert({imp.substr(open, close - open),
+                    imp.substr(imp_at, semi - imp_at)});
+    }
+    for (const auto &[g, mod] : flags)
+      cc += std::format("#if defined({})\n#define {} 1\n#endif\n", g,
+                        imported_flag(mod));
+  }
+
   auto [pre_macros, post_macros] =
       split_gmf_pre_post(gmf_incs, first_hoisted_macro_off);
   emit_gmf_blocks(cc, pre_macros);
@@ -977,16 +1002,40 @@ std::vector<std::string> macros_file_support_includes(
       if (conditional_depth_at(original, inc.offset) > 0) continue;
       if (auto_imports.count(inc.path)) continue;
       if (is_generated_macro_header(inc.path)) continue;
-      // Never another converted library's header. That one is a module, and a
-      // textual copy of it here is a second set of the same declarations,
-      // pulled in wherever this macros file is included:
+      // Another converted library's header is a module, and a textual copy of
+      // it here is a second set of the same declarations, pulled in wherever
+      // this macros file is included:
       //
       //   error: declaration 'mp_bool' attached to named module
       //          'boost.mp11.integral' cannot be attached to other modules
       //
-      // Its macros arrive from its own macros file, chained in beside the
-      // import that replaced it.
-      if (find_replacement(inc.path, options.module_replacements)) continue;
+      // Its macros arrive from its own macros file instead -- and they have to
+      // arrive, because the bodies here call them. Skipping the header without
+      // chaining that file leaves the macro undefined for anyone who reads
+      // this one without also, by luck, having asked for the provider:
+      //
+      //   lightweight_test_macros.h:22: error: use of undeclared identifier
+      //     'BOOST_CURRENT_FUNCTION'
+      //
+      // So the same pair a consumer would have been given: the macros file
+      // where the provider is a module, the header itself where it is not.
+      if (auto *rep = find_replacement(inc.path, options.module_replacements)) {
+        if (rep->guard.empty()) continue;
+        std::string pair = std::format("#if defined({})\n", rep->guard);
+        if (rep->carries_macros_file) {
+          auto mh = replacement_macros_header(inc.path, options.hyphen_macros);
+          pair += std::format("#if __has_include(\"{0}\")\n#include \"{0}\"\n#endif\n",
+                              mh);
+        }
+        pair += "#else\n";
+        pair += inc.is_quoted ? std::format("#include \"{}\"\n", inc.path)
+                              : std::format("#include <{}>\n", inc.path);
+        pair += "#endif\n";
+        if (std::ranges::find(block_support_includes, pair) ==
+            block_support_includes.end())
+          block_support_includes.push_back(std::move(pair));
+        continue;
+      }
       // Never a standard-library header. Nothing in `<string>` defines the
       // kind of function-like configuration macro a condition calls, and a
       // consumer of this macros file imports std — a textual copy of the
@@ -1335,7 +1384,8 @@ export HeaderRewriteResult rewrite_header(
   // USE_MODULES is always defined, so these includes are dropped entirely.
   hdr = wrap_includes_with_guard(std::move(hdr), includes, use_modules_macro,
                                  /*remove=*/options.cc_only,
-                                 options.module_replacements);
+                                 options.module_replacements,
+                                 options.include_to_module);
   hdr = export_body_read_includes(std::move(hdr), includes, use_modules_macro);
 
   auto prelude = std::format(

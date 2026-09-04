@@ -1008,3 +1008,55 @@ TEST(ConsumerRewrite, HalfABracketIsNotAHeaderAConsumerCanInclude) {
   EXPECT_TRUE(include_stands_alone("outside/gadget.h", {"-I", gDataDir}))
       << "an ordinary header is read twice without complaint";
 }
+
+TEST(ConsumerRewrite, SaysWhatItImportsAboveEveryInclude) {
+  // A header cannot see the imports below it, and the include that duplicates
+  // one is routinely above it anyway -- reached through a library nobody
+  // converted, long before the import that collides with it:
+  //
+  //   test:23  -> deps/boost/system/result.hpp   (never converted)
+  //            -> variant2's own variant.hpp, read textually
+  //   test:93  import boost.variant2.variant;
+  //
+  // So the unit says what it imports where nothing can be read before it.
+  ConsumerRewriteOptions cfg;
+  cfg.module_replacements = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES"}};
+  auto out = rewrite_consumer_source(
+      "#include <outside/gadget.h>\nint main() { return 0; }\n", cfg);
+  auto flag = out.find("#define OUTSIDE_GADGET_IMPORTED 1");
+  ASSERT_NE(flag, std::string::npos) << "got:\n" << out;
+  EXPECT_NE(out.rfind("#if defined(OUTSIDE_IMPORT_MODULES)", flag),
+            std::string::npos)
+      << "the flag holds only where the provider is a module; got:\n"
+      << out;
+  auto first_include = out.find("#include");
+  EXPECT_LT(flag, first_include)
+      << "and must be settled before anything is read; got:\n"
+      << out;
+}
+
+TEST(ConsumerRewrite, SaysWhatItImportsWhenTheSourceNeverIncludedIt) {
+  // The import a consumer is owed but never asked for -- the source includes
+  // nothing of the provider, and the pair is added on its behalf. That is
+  // still an import, and a header reading the same provider textually further
+  // down must know of it, or it hands over a second copy:
+  //
+  //   source_location.hpp:37: error: declaration of 'source_location' in the
+  //     global module follows declaration in module boost.assert.source_location
+  ConsumerRewriteOptions cfg;
+  cfg.module_replacements = {
+      ModuleReplacement{.module = "outside.gadget",
+                        .headers = {"outside/gadget.h"},
+                        .guard = "OUTSIDE_IMPORT_MODULES"}};
+  cfg.required_system_includes = {"outside/gadget.h"};
+  auto out = rewrite_consumer_source("int main() { return 0; }\n", cfg);
+  ASSERT_NE(out.find("import outside.gadget;"), std::string::npos)
+      << "got:\n" << out;
+  EXPECT_NE(out.find("#define OUTSIDE_GADGET_IMPORTED 1"), std::string::npos)
+      << "an import added on the consumer's behalf is still one it makes; "
+         "got:\n"
+      << out;
+}

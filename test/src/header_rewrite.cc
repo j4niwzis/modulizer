@@ -476,15 +476,22 @@ TEST(HeaderRewrite, WrapsAllIncludesWithGuard) {
   EXPECT_NE(ndef, std::string::npos);
   auto endf = r.h_content.find("#endif", ndef);
   EXPECT_NE(endf, std::string::npos);
-  auto block = r.h_content.substr(ndef, endf - ndef);
+  auto block = r.h_content.substr(ndef);
   EXPECT_NE(block.find("#include \"macro_test.h\""), std::string::npos);
   EXPECT_NE(block.find("#include <vector>"), std::string::npos);
-  // No extra #ifndef / #endif between them (merged)
+  // Both under the one guard: no second `#ifndef TEST_LIB_USE_MODULES` between
+  // them, which is what the merge is for.
   auto middle = r.h_content.substr(
       r.h_content.find("macro_test.h"),
       r.h_content.find("<vector>") - r.h_content.find("macro_test.h"));
-  EXPECT_EQ(middle.find("#endif"), std::string::npos);
-  EXPECT_EQ(middle.find("#ifndef"), std::string::npos);
+  EXPECT_EQ(middle.find("#ifndef TEST_LIB_USE_MODULES"), std::string::npos)
+      << "got:\n" << r.h_content;
+  // macro_test.h is a module of this library, so it carries a guard of its own
+  // inside that one -- for the reader that imported it and would otherwise be
+  // handed a second copy. <vector> is nobody's module and carries none.
+  EXPECT_NE(r.h_content.rfind("#if !defined(TEST_LIB_IMPORTED)", first_inc),
+            std::string::npos)
+      << "got:\n" << r.h_content;
 }
 
 TEST(HeaderRewrite, ExportsClassDefinedInsideMacro) {
@@ -613,11 +620,16 @@ TEST(HeaderRewrite, MultiFileDotsExample) {
   auto first_inc = rb.h_content.find("#include \"multi_a.h\"");
   ASSERT_NE(first_inc, std::string::npos);
   auto ndef = rb.h_content.rfind("#ifndef MY_LIB_USE_MODULES", first_inc);
-  auto endf = rb.h_content.find("#endif", ndef);
+  // To the end of the wrapper, not to the first `#endif`: multi_a.h is a
+  // module of this library and carries a guard of its own inside this one,
+  // for the reader that imported it.
+  auto endf = rb.h_content.find("#endif  // MY_LIB_USE_MODULES", ndef);
   auto block = rb.h_content.substr(ndef, endf - ndef);
   EXPECT_NE(block.find("#include \"multi_a.h\""), std::string::npos);
   EXPECT_NE(block.find("#include <string>"), std::string::npos);
   EXPECT_EQ(block.find("#ifndef MY_LIB_USE_MODULES", ndef + 1), std::string::npos);
+  EXPECT_NE(block.find("#if !defined(MY_LIB_A_IMPORTED)"), std::string::npos)
+      << "got:\n" << rb.h_content;
 
   // b.cc imports a.h module
   EXPECT_NE(rb.cc_content.find("export import my_lib.a;"), std::string::npos);
@@ -2054,8 +2066,7 @@ TEST(HeaderRewrite, DispatchHeaderImportsOneAlternative) {
                               "export import dispatch_lib.impl_a;\n#endif"),
             std::string::npos)
       << "and the other branch must carry its negation";
-  EXPECT_NE(r.h_content.find("#ifndef DISPATCH_LIB_USE_MODULES\n"
-                             "# include \"dispatch_lib/impl_a.h\"\n"),
+  EXPECT_NE(r.h_content.find("# include \"dispatch_lib/impl_a.h\"\n"),
             std::string::npos)
       << "an indented include is an include: the module build drops it like "
          "any other, and the classic build keeps it";
@@ -2753,28 +2764,21 @@ TEST(HeaderRewrite, DoesNotCarryTheStandardHeaderWhereStdIsImported) {
       << r.macros_content;
 }
 
-TEST(HeaderRewrite, GeneratedHeaderSkipsAReplacedIncludeWhereItIsAModule) {
-  // The generated header is read by consumers, and a consumer may already have
-  // imported the provider — the pair at the top of its own file said to. This
-  // header then including the provider textually declares a second time what
-  // the import gave it, and the two are not one entity:
+TEST(HeaderRewrite, GeneratedHeaderStandsAnIncludeDownOnlyForAReaderThatSaidSo) {
+  // The provider's own IMPORT_MODULES cannot decide this. It says the provider
+  // is a module SOMEWHERE in this build -- true of every unit in it, including
+  // the ones that import nothing and reach this header through a library
+  // nobody converted:
   //
-  //   assert/source_location.hpp:37: error: declaration of 'source_location'
-  //     in the global module follows declaration in module
-  //     boost.assert.source_location
-  //   assert/source_location.hpp:149: error: declaration of 'operator<<' in
-  //     the global module follows declaration in module
-  //     boost.assert.source_location
+  //   iterator/modules/iterator/function_input_iterator.cc:12
+  //     -> boost/optional/optional.hpp:52          (never converted)
+  //       -> throw_exception/include/boost/throw_exception.hpp:26
+  //         -> exception.hpp:262: error: no type named 'source_location'
+  //            in namespace 'boost'
   //
-  // So the include is left to the builds where the provider is not a module.
-  // Only the negation: the import belongs to the consumer's own pair, which
-  // put those declarations there to begin with, and a header — which may be
-  // read anywhere in a translation unit — is no place to write one.
-  //
-  // The library's own USE_MODULES guard does not answer this. It says whether
-  // this file is being read as its module's unit, which is a different
-  // question from whether the PROVIDER is a module here, and only the second
-  // decides whether the include duplicates an import.
+  // Nothing imported it there and nothing could. The flag is the reader's own
+  // word instead, written at the top of a unit that imports the provider and
+  // nowhere else, so the include stands for everyone who did not say it.
   auto r = rewrite_header(
       data_path("replaces_lib/use.hpp"), "replaces_lib",
       RewriteOptions{.extra_args = {"-I", gDataDir},
@@ -2784,13 +2788,41 @@ TEST(HeaderRewrite, GeneratedHeaderSkipsAReplacedIncludeWhereItIsAModule) {
                          .guard = "PROVIDER_IMPORT_MODULES"}}});
   auto inc = r.h_content.find("#include <provider/thing.hpp>");
   if (inc == std::string::npos) return;  // not included at all is also correct
-  auto guard = r.h_content.rfind("#if !defined(PROVIDER_IMPORT_MODULES)", inc);
+  auto guard = r.h_content.rfind("#if !defined(PROVIDER_THING_IMPORTED)", inc);
   EXPECT_NE(guard, std::string::npos)
-      << "the include must stand down where the provider is a module; got:\n"
+      << "the include stands down for a reader that imported the provider; "
+         "got:\n"
+      << r.h_content;
+  EXPECT_EQ(r.h_content.rfind("#if !defined(PROVIDER_IMPORT_MODULES)", inc),
+            std::string::npos)
+      << "and not for one that merely shares a build with it; got:\n"
       << r.h_content;
   EXPECT_LT(r.h_content.rfind("#ifndef REPLACES_LIB_USE_MODULES", inc), guard)
-      << "and stay inside the library's own guard; got:\n"
+      << "and stays inside the library's own guard; got:\n"
       << r.h_content;
+}
+
+TEST(HeaderRewrite, StandsDownForAReaderThatImportedThisLibrarysOwnModule) {
+  // A library's own headers answer to its own switch. The umbrella header
+  // includes what it gathers, and a consumer that imported one of those
+  // modules and reaches the umbrella -- through some library nobody converted,
+  // as ever -- is handed a second copy of it:
+  //
+  //   variant.hpp:61: error: declaration of 'bad_variant_access' in the global
+  //     module follows declaration in module boost.variant2.variant
+  //
+  // The reader says it under this library's own name, and the include stands
+  // down for that, exactly as it does for a stranger's.
+  auto r = rewrite_header(
+      data_path("umbrella_lib/all.hpp"), "umbrella_lib",
+      RewriteOptions{.include_to_module = {{"umbrella_lib/part.hpp",
+                                            "umbrella_lib.part"}},
+                     .extra_args = {"-I", gDataDir}});
+  auto inc = r.h_content.find("#include <umbrella_lib/part.hpp>");
+  if (inc == std::string::npos) return;  // not included at all is also correct
+  EXPECT_NE(r.h_content.rfind("#if !defined(UMBRELLA_LIB_PART_IMPORTED)", inc),
+            std::string::npos)
+      << "got:\n" << r.h_content;
 }
 
 TEST(HeaderRewrite, KeepsTheArmAMacroWasDefinedUnder) {
@@ -3086,4 +3118,55 @@ TEST(HeaderRewrite, DoesNotHoistTheClosingHalfOfABracket) {
   EXPECT_TRUE(close == std::string::npos || close > purview)
       << "the closing half must not be hoisted above the purview; got:\n"
       << r.cc_content;
+}
+
+TEST(HeaderRewrite, RecognisesAGuardWhateverItIsCalled) {
+  // Boost.ThrowException spells this header's guard as a UUID, which no test
+  // on the shape of the name recognises. Taken for a macro the library
+  // exports, it is carried off to the macros file and taken out of the header,
+  // which then has nothing left to stop a second reading of itself:
+  //
+  //   exception.hpp:55: error: redefinition of 'refcount_ptr'
+  //
+  // Its place is what marks it: the `#ifndef` is the first directive in the
+  // file, so nothing was read before it.
+  auto r = rewrite_header(data_path("guarduuid.h"), "guarduuid_lib",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  EXPECT_EQ(r.macros_content.find("#define GUARDUUID_274DA"), std::string::npos)
+      << "the guard must not be exported as a macro; got:\n"
+      << r.macros_content;
+  EXPECT_NE(r.h_content.find("#ifndef GUARDUUID_274DA"), std::string::npos)
+      << "and it must stay in the header, where it does its work; got:\n"
+      << r.h_content;
+}
+
+TEST(HeaderRewrite, MacrosFileBringsTheProviderMacrosItsBodiesCall) {
+  // The provider's header is a module, so no textual copy of it belongs here.
+  // Its macros still do: the bodies in this file call them, and a consumer
+  // reading this file has no other way to them --
+  //
+  //   lightweight_test_macros.h:22: error: use of undeclared identifier
+  //     'BOOST_CURRENT_FUNCTION'
+  //
+  // -- so the same pair a consumer would be given goes in instead of nothing:
+  // the provider's macros file where it is a module, its header where it
+  // is not.
+  auto r = rewrite_header(
+      data_path("macrodep_lib/uses_macro.h"), "macrodep_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir},
+                     .module_replacements = {ModuleReplacement{
+                         .module = "provider.thing",
+                         .headers = {"provider/thing.hpp"},
+                         .guard = "PROVIDER_IMPORT_MODULES",
+                         .carries_macros_file = true}}});
+  ASSERT_NE(r.macros_content.find("MACRODEP_CHECK"), std::string::npos)
+      << "the macro must reach the macros file at all; got:\n"
+      << r.macros_content;
+  EXPECT_NE(r.macros_content.find("provider/thing_macros.h"), std::string::npos)
+      << "the provider's macros file, where the provider is a module; got:\n"
+      << r.macros_content;
+  EXPECT_NE(r.macros_content.find("#include <provider/thing.hpp>"),
+            std::string::npos)
+      << "and its header where it is not; got:\n"
+      << r.macros_content;
 }

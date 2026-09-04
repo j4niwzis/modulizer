@@ -148,3 +148,20 @@ export std::string derive_module_name(llvm::StringRef header_path,
   }
   return mod;
 }
+
+// The macro a translation unit defines to say that IT imports this module.
+// Distinct from the provider's `_IMPORT_MODULES`, which says only that the
+// provider is a module somewhere in this build -- true of every unit in it,
+// including the ones that import nothing and read the header textually.
+//
+// Named for the module and not the library, because a library is many modules
+// and importing one of them says nothing about the rest. Guarding a library's
+// headers under a single name would take an include away from a unit that
+// imported some other part of the same library and still needs this one.
+export std::string imported_flag(std::string_view module_name) {
+  std::string flag;
+  flag.reserve(module_name.size() + 9);
+  for (char c : module_name)
+    flag += c == '.' ? '_' : static_cast<char>(std::toupper(c));
+  return flag + "_IMPORTED";
+}
