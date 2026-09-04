@@ -315,7 +315,27 @@ export std::string rewrite_consumer_source(
           // already provided:
           //   error: redefinition of 'ssize_t read(int, void*, size_t)'
           // Only unguarded ones: a platform-guarded include keeps its guard.
-          if (insert_at && cond_depth == 0) {
+          // Only a header of the standard library's. The block stands where
+          // the first replaced include stood, so lifting one into it puts it
+          // above the imports — right for a C header, which must not be read
+          // after an import, and wrong for anyone else's: it moves the header
+          // above the import it used to follow, and a library read in an order
+          // its own headers never arranged for says so from the inside —
+          //
+          //   boost/mpl/aux_/integral_wrapper.hpp:42: error: unknown type
+          //          name 'AUX_WRAPPER_VALUE_TYPE'
+          //
+          // that one being read once per wrapper with the wrapper's macros
+          // defined around it. Where it stands is where it belongs.
+          //
+          // Which headers are the system's is not guessed from the shape of
+          // the name -- <sys/types.h> has a slash and <boost/mpl/at.hpp> has
+          // one too. It is what the trace already found the consumer taking
+          // from the system, plus the standard headers named above.
+          bool std_header = kStdHeaders.count(inc->path) ||
+                            kStdProvidedCHeaders.count(inc->path) ||
+                            options.required_system_includes.count(inc->path);
+          if (insert_at && cond_depth == 0 && std_header) {
             hoisted_system_includes.push_back(line);
             pos = nl + 1;
             ++src_line;
@@ -388,7 +408,25 @@ export std::string rewrite_consumer_source(
   std::set<std::string> provided_by_module;
   for (auto &r : options.required_module_includes)
     provided_by_module.insert(r.headers.begin(), r.headers.end());
+  // The C headers the std module also declares go first, ahead of everything
+  // else the block hands over. The block carries other consumers' headers too,
+  // and a consumer header of this same conversion imports std itself — so one
+  // of these written after it is read after an import, and the declarations
+  // they share are then made twice:
+  //
+  //   bits/types/struct_tm.h:7: error: redefinition of 'struct tm'
+  //   string.h:105: error: redefinition of 'void* memchr(void*, int, size_t)'
+  //
+  // Reading them first is the whole of what they are here for.
   for (auto &inc : options.required_system_includes) {
+    if (already_above_block(inc) || provided_by_module.count(inc)) continue;
+    if (replaced_in_source.count(inc)) continue;
+    if (!kStdProvidedCHeaders.count(inc)) continue;
+    if (find_replacement(inc, options.module_replacements)) continue;
+    block += std::format("#include <{}>\n", inc);
+  }
+  for (auto &inc : options.required_system_includes) {
+    if (kStdProvidedCHeaders.count(inc)) continue;  // already above
     if (already_above_block(inc) || provided_by_module.count(inc)) continue;
     // Replaced where the source includes it: the pair is already in place and
     // a plain copy here would arrive above it, textually, and win.
@@ -433,9 +471,18 @@ export std::string rewrite_consumer_source(
   //   internal compiler error: in nonnull_arg_p, at tree.cc
   // Reading the header first is what avoids it. A header must not do this (it
   // would land below the includer's import), which is why this is .cc only.
+  //
+  // First in the block, not last. The block carries other consumers' headers
+  // too, and a consumer header of this same conversion imports std itself, so
+  // anything written after one is written after an import:
+  //
+  //   string.h:105: error: redefinition of
+  //                 'void* memchr(void*, int, size_t)'
+  //   note: previously defined here, of module std.compat, imported at
+  //         googletest-param-test-test.h:35
   if (options.import_std && !options.is_header &&
       !already_above_block("string.h"))
-    block += "#include <string.h>\n";
+    block.insert(0, "#include <string.h>\n");
 
   if (options.import_std) {
     // std.compat (rather than std) also provides the C library's global names
