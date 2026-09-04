@@ -686,16 +686,22 @@ public:
     // visible in the enclosing namespace, and consumers resolved names like
     // `lib::Foo` (which lives in `lib::detail`) through it.
     //
-    // Exporting the directive does not carry that across a module boundary: a
-    // using-directive declares no name, so there is nothing for the export to
-    // apply to, and an importer's lookup never sees the members —
+    // Exporting the directive is well-formed -- a using-directive is a
+    // block-declaration, so [module.interface]/2 makes one at namespace scope
+    // inside an export-declaration an exported declaration, and the example
+    // there marks `export using namespace N;` OK. (C++20 read the other way,
+    // marking it "error: does not declare a name"; the requirement went in
+    // C++23.) It still cannot be relied on: gcc 15 does not carry it to an
+    // importer, in either -std=c++20 or -std=c++23, and the members are simply
+    // not there --
     //
     //   error: 'Foo' is not a member of 'lib'
     //
-    // (one implementation honours it anyway, which is why this went unnoticed).
-    // A using-DECLARATION does declare a name and does cross the boundary, so
-    // the directive stays for the library's own unqualified lookups and one
-    // exported declaration per name is emitted after it.
+    // -- while clang honours it in both, which is why this went unnoticed. A
+    // using-DECLARATION crosses on both, so the directive stays for the
+    // library's own unqualified lookups and one exported declaration per name
+    // is emitted after it. Only the second half of that is a workaround; it
+    // can go when gcc carries the directive.
     if (!udd || udd->isImplicit() || !isMainFile(udd)) return true;
     if (llvm::isa<clang::CXXRecordDecl>(udd->getDeclContext())) return true;
     if (llvm::isa<clang::FunctionDecl>(udd->getDeclContext())) return true;
