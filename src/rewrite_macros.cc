@@ -155,6 +155,69 @@ std::string strip_block_includes(std::string full) {
   return cleaned;
 }
 
+// A header whose guarded body is nothing but directives -- it defines the
+// macros an include fragment is read under, includes it, and takes them back
+// -- has no code inside its guard to disqualify the guard from being emitted
+// whole. Emitted whole, the guard's own `#define` reaches the macros file, and
+// the header reads that file ABOVE its guard: the guard is already defined,
+// the body never runs, and what it was there to do never happens.
+//
+//   cstdio_test.cpp:86: error: no type named 'utf8_codecvt_facet' in
+//     namespace 'boost::filesystem::detail'
+//
+// The macros file carries `#pragma once` and has no use for a guard of its
+// own, so the guard's three lines come out and what they held stays.
+std::string strip_include_guard(std::string block) {
+  std::vector<std::string_view> lines;
+  std::string_view v(block);
+  for (std::size_t p = 0; p <= v.size();) {
+    auto nl = v.find('\n', p);
+    if (nl == std::string_view::npos) {
+      if (p < v.size()) lines.push_back(v.substr(p));
+      break;
+    }
+    lines.push_back(v.substr(p, nl - p));
+    p = nl + 1;
+  }
+  if (lines.empty()) return block;
+  // The guard opens the block, but the block can open with the file's
+  // copyright banner: the guard is the first DIRECTIVE, not the first line.
+  std::size_t guard_at = 0;
+  std::optional<DirectiveParts> d;
+  for (; guard_at < lines.size(); ++guard_at)
+    if ((d = parse_directive(lines[guard_at], true, true))) break;
+  if (!d || d->keyword != "ifndef") return block;
+  auto after = d->after;
+  auto ns = after.find_first_not_of(" \t");
+  if (ns == std::string_view::npos) return block;
+  auto ne = after.find_first_of(" \t", ns);
+  auto name = after.substr(ns, ne == std::string_view::npos ? ne : ne - ns);
+  if (!looks_like_guard_name(name)) return block;
+  // Its `#define`, and the `#endif` that closes the block.
+  std::size_t def_at = lines.size(), endif_at = lines.size();
+  for (std::size_t i = guard_at + 1; i < lines.size(); ++i) {
+    auto ld = parse_directive(lines[i], true, true);
+    if (!ld) continue;
+    if (def_at == lines.size() && ld->keyword == "define") {
+      auto a = ld->after;
+      auto s0 = a.find_first_not_of(" \t");
+      if (s0 == std::string_view::npos) continue;
+      auto e0 = a.find_first_of("( \t", s0);
+      if (a.substr(s0, e0 == std::string_view::npos ? e0 : e0 - s0) == name)
+        def_at = i;
+    }
+    if (ld->keyword == "endif") endif_at = i;
+  }
+  if (def_at == lines.size()) return block;
+  std::string out;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    if (i == guard_at || i == def_at || i == endif_at) continue;
+    out += lines[i];
+    out += '\n';
+  }
+  return out;
+}
+
 export void extract_textual_macros(
     const std::string &original, std::vector<MacroRec> &macros,
     // Conditionals that choose between arms and are NOT emitted verbatim.
@@ -350,7 +413,8 @@ export void extract_textual_macros(
   auto emit = [&](auto &&self, std::size_t idx) -> void {
     auto &c = cands[idx];
     if (c.worth) {
-      auto full = std::string(src.substr(c.start, c.end - c.start));
+      auto full = strip_include_guard(
+          std::string(src.substr(c.start, c.end - c.start)));
       macros.push_back({"", strip_block_includes(std::move(full)),
                         (unsigned)c.start, (unsigned)c.end});
       return;
@@ -772,7 +836,11 @@ export std::string build_macros_file(
           mout += std::move(marked);
           continue;
         }
-        auto stripped = strip_block_includes(std::move(marked));
+        // The record's body had the guard taken out of it; the slice must
+        // lose it too, or they differ for that reason alone and this reads a
+        // marker that was never applied -- putting the guard back.
+        auto stripped =
+            strip_block_includes(strip_include_guard(std::move(marked)));
         if (stripped != m.body) {
           has_marked_macros = true;
           mout += std::move(stripped);

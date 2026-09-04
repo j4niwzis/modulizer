@@ -959,3 +959,52 @@ TEST(ConsumerRewrite, KeepsEveryLineWhereItWasWhenIncludesFollowTheLibrarysOwn) 
       << "the marker has to still report line 11; got:\n"
       << out;
 }
+
+TEST(ConsumerRewrite, DoesNotNameAGuardedFragmentAConsumerCannotIncludeAlone) {
+  // A guard says "read me once", not "read me alone". A fragment can carry one
+  // and still name terms only its includer defines, so included on its own it
+  // does not parse:
+  //
+  //   detail/utf8_codecvt_facet.hpp:99: error: unknown type name
+  //     'BOOST_UTF8_BEGIN_NAMESPACE'
+  //
+  // The walk out of a fragment stops at the first file that guards itself,
+  // which is this one — and what it names is then written into every consumer
+  // that reached a declaration through it.
+  auto use = data_path("outsidelib/gxmac/use_gxmac.cc");
+  auto lib = data_path("outsidelib/api.h");
+  auto needed = trace_consumer_outside_includes({use}, {lib}, {"-I", gDataDir});
+  auto it = needed.find(use);
+  ASSERT_NE(it, needed.end())
+      << "the consumer reaches an outside declaration, so something is owed";
+  ASSERT_NE(it->second.count("outside/gadget.h"), 0u)
+      << "the outside header it reaches through the library is still owed, so "
+         "what follows is a judgement about the fragment and not an empty set";
+  EXPECT_EQ(it->second.count("outsidelib/gxmac/body.hpp"), 0u)
+      << "a fragment that cannot be included alone must not be named; got:\n"
+      << [&] {
+           std::string s;
+           for (auto &n : it->second) s += "  " + n + "\n";
+           return s;
+         }();
+}
+
+TEST(ConsumerRewrite, HalfABracketIsNotAHeaderAConsumerCanInclude) {
+  // A bracket half opens state its partner closes. It compiles on its own, so
+  // asking only whether it parses says yes — and a consumer handed it then
+  // fails where its build reads the header again for the next thing:
+  //
+  //   config/abi_prefix.hpp:12: error: double inclusion of header
+  //     boost/config/abi_prefix.hpp is an error
+  //
+  // Its partner takes the guard back and does not survive being read first at
+  // all. Neither is something a consumer can be given.
+  EXPECT_FALSE(include_stands_alone("outsidelib/bracket/prefix.hpp",
+                                    {"-I", gDataDir}))
+      << "the half that opens says so itself when read twice";
+  EXPECT_FALSE(include_stands_alone("outsidelib/bracket/suffix.hpp",
+                                    {"-I", gDataDir}))
+      << "the half that closes has nothing to close when read first";
+  EXPECT_TRUE(include_stands_alone("outside/gadget.h", {"-I", gDataDir}))
+      << "an ordinary header is read twice without complaint";
+}

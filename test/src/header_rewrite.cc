@@ -2852,3 +2852,83 @@ TEST(HeaderRewrite, MacroSelfCheckDoesNotOutliveItsDefinition) {
          "got:\n"
       << r.h_content;
 }
+
+TEST(HeaderRewrite, MacrosFileDoesNotClaimTheHeaderSOwnGuard) {
+  // A header whose guarded body is nothing but directives — it defines the
+  // namespace macros an include fragment is read under, includes it, and
+  // takes them back — has no code to disqualify its include guard from being
+  // emitted whole. Emitted whole, the guard's own `#define` goes with it, and
+  // the header reads that macros file ABOVE its guard:
+  //
+  //   #include "boost/filesystem/detail/utf8_codecvt_facet_macros.h"
+  //   ...
+  //   #ifndef BOOST_FILESYSTEM_UTF8_CODECVT_FACET_HPP   <-- already defined
+  //
+  // so the body never runs, the fragment is never read, and what it declares
+  // is missing from every build:
+  //
+  //   cstdio_test.cpp:86: error: no type named 'utf8_codecvt_facet' in
+  //     namespace 'boost::filesystem::detail'
+  auto r = rewrite_header(
+      data_path("fragguard/facet.h"), "fragguard_lib",
+      RewriteOptions{.extra_args = {"-I", gDataDir}});
+  ASSERT_NE(r.macros_content.find("#define FRAGGUARD_BEGIN_NAMESPACE"),
+            std::string::npos)
+      << "the fragment's namespace macros must reach the macros file; got:\n"
+      << r.macros_content;
+  EXPECT_EQ(r.macros_content.find("#define FRAGGUARD_FACET_HPP"),
+            std::string::npos)
+      << "but not the guard the header tests to decide whether to run; got:\n"
+      << r.macros_content;
+}
+
+TEST(HeaderRewrite, PutsAFragmentsIncludesInTheGlobalModuleFragment) {
+  // A header that reads an include fragment reads it in the module unit's
+  // PURVIEW: the fragment is not a module, and the terms it is read between
+  // are defined around it there. Whatever the fragment includes is read there
+  // too, and a standard header read in the purview attaches what it declares
+  // to this module, against the copy the global module already has:
+  //
+  //   bits/move.h:227: error: declaration of 'swap' in module
+  //     boost.filesystem.detail.utf8_codecvt_facet follows declaration in the
+  //     global module
+  //
+  // So it belongs above `export module`, with the rest of what the unit reads
+  // textually.
+  auto r = rewrite_header(data_path("fragstd/facet.hpp"), "fragstd.facet",
+                          RewriteOptions{.extra_args = {"-I", gDataDir}});
+  auto purview = r.cc_content.find("export module");
+  ASSERT_NE(purview, std::string::npos) << r.cc_content;
+  auto at = r.cc_content.find("#include <bitset>");
+  ASSERT_NE(at, std::string::npos)
+      << "the fragment's own include must be somewhere; got:\n"
+      << r.cc_content;
+  EXPECT_LT(at, purview)
+      << "it must be read before the purview opens, not inside it; got:\n"
+      << r.cc_content;
+  // Only the standard ones. The condition a fragment reads a platform header
+  // under is the fragment's own and does not travel with the include, so
+  // hoisting one would write it for every platform:
+  //
+  //   utf8_codecvt_facet.cc:30: fatal error: 'cygwin/version.h' file not found
+  EXPECT_EQ(r.cc_content.find("fragstd_platform/only_there.h"),
+            std::string::npos)
+      << "a header the fragment reads under a condition of its own must stay "
+         "where that condition is; got:\n"
+      << r.cc_content;
+  // And what the fragment declares has to be exported. Nothing in it carries
+  // the marker -- it belongs to another project and is not rewritten -- so
+  // attached to this module and unexported, a consumer that imports cannot
+  // see it:
+  //
+  //   cstdio_test.cpp:86: error: missing '#include
+  //     "boost/detail/utf8_codecvt_facet.hpp"'; 'utf8_codecvt_facet' must be
+  //     declared before it is used
+  auto inc_at = r.h_content.find("#include <outside/fragstd_body.hpp>");
+  ASSERT_NE(inc_at, std::string::npos)
+      << "the fragment must still be read by the header; got:\n"
+      << r.h_content;
+  EXPECT_NE(r.h_content.rfind("export {", inc_at), std::string::npos)
+      << "what it declares must be exported where it is read; got:\n"
+      << r.h_content;
+}

@@ -360,6 +360,45 @@ export void emit_gmf_blocks(std::string &cc,
 
 // Wrap include directives in hdr with #ifndef USE_MODULES.
 // Skip includes that are inside #ifdef blocks (they keep original guards).
+// An include the body keeps (see skip_gmf) is read in the module purview, and
+// what it declares is attached to this module. Nothing in it carries the export
+// marker: it belongs to another project, and the conversion does not rewrite
+// it. Attached but unexported, a consumer that imports the module cannot see
+// what it declared --
+//
+//   cstdio_test.cpp:86: error: missing '#include
+//     "boost/detail/utf8_codecvt_facet.hpp"'; 'utf8_codecvt_facet' must be
+//     declared before it is used
+//
+// -- so the whole of what it brings is exported at the point it is read. Only
+// under the module build: read classically the same lines are an ordinary
+// include, and `export` is not a word that means anything there.
+export std::string export_body_read_includes(
+    std::string hdr, const std::vector<IncludeDirective> &includes,
+    const std::string &use_modules_macro) {
+  std::set<std::string> kept;
+  for (const auto &inc : includes)
+    if (inc.skip_gmf && !inc.transitive) kept.insert(inc.path);
+  if (kept.empty()) return hdr;
+  std::string out;
+  std::size_t pos = 0;
+  while (pos < hdr.size()) {
+    auto nl = hdr.find('\n', pos);
+    if (nl == std::string::npos) nl = hdr.size() - 1;
+    auto line = std::string_view(hdr).substr(pos, nl - pos + 1);
+    auto inc = parse_include_line(line, /*skip_hash_ws=*/true);
+    if (inc && kept.count(inc->path)) {
+      out += std::format("#ifdef {}\nexport {{\n#endif\n", use_modules_macro);
+      out += line;
+      out += std::format("#ifdef {}\n}}\n#endif\n", use_modules_macro);
+    } else {
+      out += line;
+    }
+    pos = nl + 1;
+  }
+  return out;
+}
+
 export std::string wrap_includes_with_guard(
     std::string hdr, const std::vector<IncludeDirective> &includes,
     const std::string &use_modules_macro, bool remove = false,
