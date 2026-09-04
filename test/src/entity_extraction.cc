@@ -249,6 +249,28 @@ TEST(SelfContained, BracketHalvesAreFragmentsNotModules) {
       << "an ordinary header is unaffected";
 }
 
+TEST(SelfContained, AMacroBracketIsAFragmentToo) {
+  // A bracket does not have to be made of pragmas. Boost.Iterator's
+  // config_def.hpp sets a flag config_undef.hpp clears, and each errors if it
+  // is read out of turn -- so a macros file that replays the flag makes the
+  // next legitimate reading of the header a nested one:
+  //
+  //   config_def_macros.h:16: error: you have nested config_def #inclusion.
+  //
+  // The header says what it is at the top: "no include guard multiple
+  // inclusion intended". Neither half is a module.
+  std::vector<std::string> headers = {data_path("needctx_lib/macro_def.h"),
+                                      data_path("needctx_lib/macro_undef.h"),
+                                      data_path("needctx_lib/thing.h")};
+  auto found = discover_header_contexts(headers, {"-I", gDataDir});
+  EXPECT_TRUE(found.fragments.count(data_path("needctx_lib/macro_def.h")))
+      << "the half that sets the flag errors when read again";
+  EXPECT_TRUE(found.fragments.count(data_path("needctx_lib/macro_undef.h")))
+      << "the half that clears it has nothing to clear when read first";
+  EXPECT_FALSE(found.fragments.count(data_path("needctx_lib/thing.h")))
+      << "an ordinary header is unaffected";
+}
+
 TEST(SelfContained, ContextArgsAreIncludeFlags) {
   auto args = context_args({{"a.h", {"/x/one.h", "/x/two.h"}}});
   ASSERT_TRUE(args.count("a.h"));

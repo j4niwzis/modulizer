@@ -100,9 +100,16 @@ export bool looks_like_guard_name(llvm::StringRef name) {
   //
   // Invisible while only module units are built — each includes its header
   // exactly once — and immediate in a classic build.
+  // Boost.Iterator spells the same idea with a trailing underscore
+  // (BOOST_ITERATOR_DETAIL_EVAL_IF_DEFAULT_HPP_INCLUDED_), and unrecognised it
+  // is carried off to the macros file and taken out of the header, which then
+  // has nothing left to stop a second reading:
+  //
+  //   eval_if_default.hpp:40:8: error: redefinition of 'eval_if_default'
   return name.starts_with("_") || name.ends_with("_H") ||
          name.ends_with("_H_") || name.ends_with("_HPP") ||
-         name.ends_with("_INCLUDED");
+         name.ends_with("_HPP_") || name.ends_with("_INCLUDED") ||
+         name.ends_with("_INCLUDED_");
 }
 
 export bool is_include_guard_define(llvm::StringRef buf, unsigned hash_off,
